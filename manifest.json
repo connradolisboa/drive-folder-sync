@@ -1,0 +1,10 @@
+{
+  "id": "drive-folder-sync",
+  "name": "Drive Folder Sync",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "One-way sync from a Google Drive folder to your vault.",
+  "author": "connrado",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}
