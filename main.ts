@@ -7,6 +7,7 @@ import { Scheduler } from "./sync/Scheduler";
 import { SyncManifestStore } from "./sync/SyncManifest";
 import { CompanionNoteManager } from "./sync/CompanionNoteManager";
 import { DriveSyncSettingTab } from "./settings/SettingsTab";
+import { AutomationEngine } from "./automation/AutomationEngine";
 import { DEFAULT_SETTINGS, PluginSettings, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
@@ -18,6 +19,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	private driveSync: DriveSync;
 	private manifestStore: SyncManifestStore;
 	private companionManager: CompanionNoteManager;
+	private automationEngine: AutomationEngine;
 	private syncing = false;
 
 	async onload() {
@@ -34,6 +36,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 
 		this.manifestStore = new SyncManifestStore(this.app);
 		this.companionManager = new CompanionNoteManager(this.app, this.settings);
+		this.automationEngine = new AutomationEngine(this.app, this.settings);
 
 		const downloader = new DownloadManager(this.app);
 		this.auth = new GoogleAuth(this.app, this.settings);
@@ -43,7 +46,8 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			this.settings,
 			this.app,
 			this.manifestStore,
-			this.companionManager
+			this.companionManager,
+			this.automationEngine
 		);
 		this.scheduler = new Scheduler();
 
@@ -122,6 +126,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 		if (this.auth) this.auth.updateSettings(this.settings);
 		if (this.companionManager) this.companionManager.updateSettings(this.settings);
+		if (this.automationEngine) this.automationEngine.updateSettings(this.settings);
 		if (this.driveSync) {
 			const downloader = new DownloadManager(this.app);
 			this.driveSync = new DriveSync(
@@ -130,7 +135,8 @@ export default class DriveFolderSyncPlugin extends Plugin {
 				this.settings,
 				this.app,
 				this.manifestStore,
-				this.companionManager
+				this.companionManager,
+				this.automationEngine
 			);
 		}
 	}

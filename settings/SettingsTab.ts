@@ -1,6 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
-import { SyncPair } from "../types";
+import { Automation, SyncPair } from "../types";
 
 export class DriveSyncSettingTab extends PluginSettingTab {
 	constructor(app: App, private plugin: DriveFolderSyncPlugin) {
@@ -239,6 +239,35 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			this.plugin.settings.companionNotesEnabled
 		);
 
+		// ── Automations ───────────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Automations" });
+		containerEl.createEl("p", {
+			text:
+				"Run actions automatically after a PDF is downloaded. " +
+				"Each automation matches a vault folder path and performs an action on the file.",
+			cls: "setting-item-description",
+		});
+
+		const automationsContainer = containerEl.createDiv();
+		this.renderAutomations(automationsContainer);
+
+		new Setting(containerEl).addButton((btn) =>
+			btn
+				.setButtonText("+ Add automation")
+				.setCta()
+				.onClick(async () => {
+					this.plugin.settings.automations.push({
+						id: this.generateId(),
+						name: `Automation ${this.plugin.settings.automations.length + 1}`,
+						enabled: true,
+						triggerFolderPath: "",
+						action: { type: "embed_to_daily_note", insertPosition: "bottom", dailyNoteNamePattern: "" },
+					});
+					await this.plugin.saveSettings();
+					this.display();
+				})
+		);
+
 		// ── Manual sync ───────────────────────────────────────────────────
 		containerEl.createEl("h3", { text: "Manual sync" });
 
@@ -334,6 +363,128 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.onChange(async (val) => {
 							this.plugin.settings.syncPairs[i].vaultDestFolder =
 								val.trim() || "Drive Sync";
+							await this.plugin.saveSettings();
+						})
+				);
+		});
+	}
+
+	private renderAutomations(container: HTMLElement): void {
+		container.empty();
+
+		if (this.plugin.settings.automations.length === 0) {
+			container.createEl("p", {
+				text: 'No automations configured. Click "+ Add automation" to get started.',
+				cls: "setting-item-description",
+			});
+			return;
+		}
+
+		const TOKEN_HINT =
+			"Supports date tokens from the PDF filename: " +
+			"YYYY (year), MM (month), DD (day), Q (quarter), " +
+			"ddd / dddd (weekday), MMM / MMMM (month name). " +
+			"Wrap literal text in brackets, e.g. [Q]Q → Q1.";
+
+		this.plugin.settings.automations.forEach((automation, i) => {
+			const card = container.createDiv();
+			card.style.cssText =
+				"border: 1px solid var(--background-modifier-border); " +
+				"border-radius: 6px; padding: 4px 12px 4px; margin-bottom: 12px;";
+
+			// Header: name + enabled toggle + delete
+			new Setting(card)
+				.setName(`Automation ${i + 1}`)
+				.addText((text) =>
+					text
+						.setPlaceholder("Name (e.g. Embed daily PDFs)")
+						.setValue(automation.name)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].name = val;
+							await this.plugin.saveSettings();
+						})
+				)
+				.addToggle((toggle) =>
+					toggle.setValue(automation.enabled).onChange(async (val) => {
+						this.plugin.settings.automations[i].enabled = val;
+						await this.plugin.saveSettings();
+					})
+				)
+				.addExtraButton((btn) =>
+					btn
+						.setIcon("trash")
+						.setTooltip("Delete this automation")
+						.onClick(async () => {
+							this.plugin.settings.automations.splice(i, 1);
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			new Setting(card)
+				.setName("Trigger folder")
+				.setDesc(
+					"Vault path prefix to watch. Date tokens are resolved from the PDF filename. " +
+					TOKEN_HINT +
+					" Example: Onyx/Notebooks/Daily/YYYY/[Q]Q"
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Onyx/Notebooks/Daily/YYYY/[Q]Q")
+						.setValue(automation.triggerFolderPath)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].triggerFolderPath = val.trim();
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(card)
+				.setName("Action")
+				.setDesc(
+					"Embed to daily note: finds the daily note whose filename matches the " +
+					"date extracted from the PDF, then inserts an embed link."
+				)
+				.addDropdown((drop) =>
+					drop
+						.addOption("embed_to_daily_note", "Embed to daily note")
+						.setValue(automation.action.type)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.type =
+								val as Automation["action"]["type"];
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(card)
+				.setName("Daily note name pattern")
+				.setDesc(
+					"Moment.js format for the daily note filename (without .md extension). " +
+					TOKEN_HINT +
+					" Example: YYYY-MM-DD → matches 2026-03-18.md. " +
+					"Leave empty to search by frontmatter (date: YYYY-MM-DD + tag: periodic/daily)."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("YYYY-MM-DD")
+						.setValue(automation.action.dailyNoteNamePattern)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.dailyNoteNamePattern =
+								val.trim();
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(card)
+				.setName("Insert position")
+				.setDesc("Where in the daily note to insert the embed.")
+				.addDropdown((drop) =>
+					drop
+						.addOption("bottom", "Bottom of note")
+						.addOption("top", "Top (after frontmatter)")
+						.setValue(automation.action.insertPosition)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.insertPosition =
+								val as "top" | "bottom";
 							await this.plugin.saveSettings();
 						})
 				);

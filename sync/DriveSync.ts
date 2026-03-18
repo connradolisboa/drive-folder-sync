@@ -3,6 +3,7 @@ import { GoogleAuth } from "../auth/GoogleAuth";
 import { DownloadManager } from "./DownloadManager";
 import { SyncManifestStore } from "./SyncManifest";
 import { CompanionNoteManager } from "./CompanionNoteManager";
+import { AutomationEngine } from "../automation/AutomationEngine";
 import {
 	DriveFile,
 	DriveFileEntry,
@@ -23,7 +24,8 @@ export class DriveSync {
 		private settings: PluginSettings,
 		private app: App,
 		private manifest: SyncManifestStore,
-		private companion: CompanionNoteManager
+		private companion: CompanionNoteManager,
+		private automationEngine?: AutomationEngine
 	) {}
 
 	async sync(): Promise<SyncResult> {
@@ -129,6 +131,11 @@ export class DriveSync {
 						driveModifiedTime: entry.file.modifiedTime,
 						pairId: pair.id,
 					});
+
+					// Run automations for newly downloaded/updated file
+					if (this.automationEngine) {
+						await this.automationEngine.runForFile(vaultPath);
+					}
 
 					console.log(`${LOG} Downloaded: ${displayPath}`);
 					result.downloaded++;

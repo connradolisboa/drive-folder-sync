@@ -50,6 +50,9 @@ export interface PluginSettings {
 	deletionBehavior: DeletionBehavior;
 	archiveFolder: string;
 
+	// Automations
+	automations: Automation[];
+
 	// Companion notes (global)
 	companionNotesEnabled: boolean;
 	companionNotesFolder: string;      // empty = alongside PDF
@@ -63,12 +66,37 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	driveFolderId: "",
 	vaultDestFolder: "",
 	syncIntervalMinutes: 30,
+	automations: [],
 	deletionBehavior: "keep",
 	archiveFolder: "Drive Sync Archive",
 	companionNotesEnabled: false,
 	companionNotesFolder: "",
 	companionNoteTemplatePath: "",
 };
+
+// ── Automations ───────────────────────────────────────────────────────────────
+
+export type AutomationActionType = "embed_to_daily_note";
+
+export interface AutomationAction {
+	type: AutomationActionType;
+	insertPosition: "top" | "bottom"; // top = after frontmatter, bottom = end of note
+	/**
+	 * Moment.js format pattern used to find the daily note by filename.
+	 * e.g. "YYYY-MM-DD" matches "2026-03-18.md".
+	 * Leave empty to fall back to frontmatter (date: YYYY-MM-DD + periodic/daily tag).
+	 */
+	dailyNoteNamePattern: string;
+}
+
+export interface Automation {
+	id: string;
+	name: string;
+	enabled: boolean;
+	/** Vault folder path prefix that triggers this automation, e.g. "Onyx/Notebooks/Daily" */
+	triggerFolderPath: string;
+	action: AutomationAction;
+}
 
 export interface SyncResult {
 	downloaded: number;
