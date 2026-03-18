@@ -6,12 +6,16 @@ const LOG = "[DriveSync/Download]";
 export class DownloadManager {
 	constructor(private app: App) {}
 
+	/**
+	 * Downloads a Drive file to the vault.
+	 * Returns the vault-relative path where the file was written.
+	 */
 	async download(
 		file: DriveFile,
 		token: string,
 		destFolder: string,
 		relPath: string
-	): Promise<void> {
+	): Promise<string> {
 		const folderPath = relPath ? `${destFolder}/${relPath}` : destFolder;
 		await this.ensureFolder(folderPath);
 
@@ -30,7 +34,8 @@ export class DownloadManager {
 		if (!resp.ok) {
 			const body = await resp.text();
 			console.error(
-				`${LOG} Download failed for "${file.name}" — status ${resp.status}:`, body
+				`${LOG} Download failed for "${file.name}" — status ${resp.status}:`,
+				body
 			);
 			throw new Error(`Download failed for "${file.name}": HTTP ${resp.status}`);
 		}
@@ -48,6 +53,7 @@ export class DownloadManager {
 		}
 
 		console.log(`${LOG} Write complete: ${localPath}`);
+		return localPath;
 	}
 
 	private async ensureFolder(folderPath: string): Promise<void> {
@@ -63,7 +69,7 @@ export class DownloadManager {
 		}
 	}
 
-	private sanitizeFilename(name: string): string {
+	sanitizeFilename(name: string): string {
 		return name.replace(/[/\\:*?"<>|]/g, "_");
 	}
 }

@@ -1,5 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
+import { SyncPair } from "../types";
 
 export class DriveSyncSettingTab extends PluginSettingTab {
 	constructor(app: App, private plugin: DriveFolderSyncPlugin) {
@@ -32,7 +33,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Client Secret")
-			.setDesc("OAuth2 Client Secret from the same Google Cloud Console project")
+			.setDesc("OAuth2 Client Secret from the same project")
 			.addText((text) => {
 				text.inputEl.type = "password";
 				text
@@ -44,7 +45,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					});
 			});
 
-		// ── Google account connection ─────────────────────────────────────
+		// ── Google account ────────────────────────────────────────────────
 		containerEl.createEl("h3", { text: "Google account" });
 
 		new Setting(containerEl)
@@ -59,9 +60,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						!this.plugin.settings.clientId ||
 						!this.plugin.settings.clientSecret
 					) {
-						new Notice(
-							"Please enter your Client ID and Client Secret first."
-						);
+						new Notice("Please enter your Client ID and Client Secret first.");
 						return;
 					}
 					try {
@@ -69,7 +68,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						await this.plugin.auth.authorize();
 						new Notice("Google Drive connected successfully!");
 					} catch (e) {
-						new Notice(`Authorization failed: ${e.message}`);
+						new Notice(`Authorization failed: ${(e as Error).message}`);
 					} finally {
 						btn.setButtonText("Connect").setDisabled(false);
 					}
@@ -85,43 +84,39 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
-		// ── Sync settings ─────────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Sync settings" });
+		// ── Sync pairs ────────────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Sync folders" });
+		containerEl.createEl("p", {
+			text: "Each entry maps a Google Drive folder to a vault folder.",
+			cls: "setting-item-description",
+		});
 
-		new Setting(containerEl)
-			.setName("Drive folder ID")
-			.setDesc(
-				"The ID at the end of the Drive folder URL: " +
-				"drive.google.com/drive/folders/FOLDER_ID_HERE"
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("1aBcDeFgHiJkLmNo…")
-					.setValue(this.plugin.settings.driveFolderId)
-					.onChange(async (val) => {
-						this.plugin.settings.driveFolderId = val.trim();
-						await this.plugin.saveSettings();
-					})
-			);
+		const pairsContainer = containerEl.createDiv({ cls: "drive-sync-pairs" });
+		this.renderPairs(pairsContainer);
 
-		new Setting(containerEl)
-			.setName("Vault destination folder")
-			.setDesc(
-				"Folder inside your vault where synced files will appear. Created automatically if missing."
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("Drive Sync")
-					.setValue(this.plugin.settings.vaultDestFolder)
-					.onChange(async (val) => {
-						this.plugin.settings.vaultDestFolder = val.trim() || "Drive Sync";
-						await this.plugin.saveSettings();
-					})
-			);
+		new Setting(containerEl).addButton((btn) =>
+			btn
+				.setButtonText("+ Add folder pair")
+				.setCta()
+				.onClick(async () => {
+					this.plugin.settings.syncPairs.push({
+						id: this.generateId(),
+						label: `Pair ${this.plugin.settings.syncPairs.length + 1}`,
+						driveFolderId: "",
+						vaultDestFolder: "Drive Sync",
+						enabled: true,
+					});
+					await this.plugin.saveSettings();
+					this.display();
+				})
+		);
+
+		// ── Sync schedule ─────────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Sync schedule" });
 
 		new Setting(containerEl)
 			.setName("Sync interval (minutes)")
-			.setDesc("How often to automatically sync. Set to 0 to disable automatic sync.")
+			.setDesc("How often to automatically sync. Set to 0 to disable.")
 			.addText((text) =>
 				text
 					.setPlaceholder("30")
@@ -158,30 +153,90 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 							| "delete"
 							| "archive";
 						await this.plugin.saveSettings();
-						// Show/hide archive folder setting
 						archiveSetting.settingEl.toggle(val === "archive");
 					});
 			});
 
 		archiveSetting = new Setting(containerEl)
 			.setName("Archive folder")
-			.setDesc(
-				"Vault folder to move removed files into. Subfolder structure is preserved."
-			)
+			.setDesc("Vault folder to move removed files into. Subfolder structure is preserved.")
 			.addText((text) =>
 				text
 					.setPlaceholder("Drive Sync Archive")
 					.setValue(this.plugin.settings.archiveFolder)
 					.onChange(async (val) => {
-						this.plugin.settings.archiveFolder =
-							val.trim() || "Drive Sync Archive";
+						this.plugin.settings.archiveFolder = val.trim() || "Drive Sync Archive";
 						await this.plugin.saveSettings();
 					})
 			);
 
-		// Only show archive folder input when "archive" is selected
 		archiveSetting.settingEl.toggle(
 			this.plugin.settings.deletionBehavior === "archive"
+		);
+
+		// ── Companion notes ───────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Companion notes" });
+		containerEl.createEl("p", {
+			text:
+				"For each PDF, automatically create a Markdown note with frontmatter " +
+				"(processed, lastUpdate, syncDate, driveFileId). " +
+				"The processed property resets to false whenever the PDF is updated.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(containerEl)
+			.setName("Enable companion notes")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.companionNotesEnabled)
+					.onChange(async (val) => {
+						this.plugin.settings.companionNotesEnabled = val;
+						await this.plugin.saveSettings();
+						companionFolderSetting.settingEl.toggle(val);
+						companionTemplateSetting.settingEl.toggle(val);
+					})
+			);
+
+		const companionFolderSetting = new Setting(containerEl)
+			.setName("Companion notes folder")
+			.setDesc(
+				"Root vault folder for companion notes. " +
+				"Leave empty to place notes alongside their PDF. " +
+				"With multiple sync pairs, notes are grouped under <folder>/<pair label>/."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("(empty = alongside PDF)")
+					.setValue(this.plugin.settings.companionNotesFolder)
+					.onChange(async (val) => {
+						this.plugin.settings.companionNotesFolder = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		const companionTemplateSetting = new Setting(containerEl)
+			.setName("Template file path")
+			.setDesc(
+				"Vault path to a .md file to use as the companion note template. " +
+				"Leave empty to use the built-in default. " +
+				"Available placeholders: {{title}}, {{fileName}}, {{fileLink}}, " +
+				"{{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}"
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("Templates/drive-sync-note.md")
+					.setValue(this.plugin.settings.companionNoteTemplatePath)
+					.onChange(async (val) => {
+						this.plugin.settings.companionNoteTemplatePath = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		companionFolderSetting.settingEl.toggle(
+			this.plugin.settings.companionNotesEnabled
+		);
+		companionTemplateSetting.settingEl.toggle(
+			this.plugin.settings.companionNotesEnabled
 		);
 
 		// ── Manual sync ───────────────────────────────────────────────────
@@ -202,11 +257,90 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 							(result.errors > 0 ? `, ${result.errors} errors` : "")
 						);
 					} catch (e) {
-						new Notice(`Sync failed: ${e.message}`);
+						new Notice(`Sync failed: ${(e as Error).message}`);
 					} finally {
 						btn.setButtonText("Sync now").setDisabled(false);
 					}
 				})
 			);
+	}
+
+	private renderPairs(container: HTMLElement): void {
+		container.empty();
+
+		if (this.plugin.settings.syncPairs.length === 0) {
+			container.createEl("p", {
+				text: "No sync folders configured. Click \"+ Add folder pair\" to get started.",
+				cls: "setting-item-description",
+			});
+			return;
+		}
+
+		this.plugin.settings.syncPairs.forEach((pair, i) => {
+			const card = container.createDiv({ cls: "drive-sync-pair-card" });
+			card.style.cssText =
+				"border: 1px solid var(--background-modifier-border); " +
+				"border-radius: 6px; padding: 4px 12px 4px; margin-bottom: 12px;";
+
+			// Header row: label + enabled toggle + delete
+			new Setting(card)
+				.setName(`Pair ${i + 1}`)
+				.addText((text) =>
+					text
+						.setPlaceholder("Label (e.g. Boox Notes)")
+						.setValue(pair.label)
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].label = val;
+							await this.plugin.saveSettings();
+						})
+				)
+				.addToggle((toggle) =>
+					toggle.setValue(pair.enabled).onChange(async (val) => {
+						this.plugin.settings.syncPairs[i].enabled = val;
+						await this.plugin.saveSettings();
+					})
+				)
+				.addExtraButton((btn) =>
+					btn
+						.setIcon("trash")
+						.setTooltip("Delete this pair")
+						.onClick(async () => {
+							this.plugin.settings.syncPairs.splice(i, 1);
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			new Setting(card)
+				.setName("Drive folder ID")
+				.setDesc("The ID from the folder URL: drive.google.com/drive/folders/FOLDER_ID")
+				.addText((text) =>
+					text
+						.setPlaceholder("1aBcDeFgHiJkLmNo…")
+						.setValue(pair.driveFolderId)
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].driveFolderId = val.trim();
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(card)
+				.setName("Vault destination")
+				.setDesc("Folder in your vault where PDFs will appear. Created if missing.")
+				.addText((text) =>
+					text
+						.setPlaceholder("Drive Sync")
+						.setValue(pair.vaultDestFolder)
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].vaultDestFolder =
+								val.trim() || "Drive Sync";
+							await this.plugin.saveSettings();
+						})
+				);
+		});
+	}
+
+	private generateId(): string {
+		return Math.random().toString(36).slice(2) + Date.now().toString(36);
 	}
 }

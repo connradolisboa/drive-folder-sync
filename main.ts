@@ -1,8 +1,11 @@
 import { Notice, Plugin } from "obsidian";
+import * as crypto from "crypto";
 import { GoogleAuth } from "./auth/GoogleAuth";
 import { DriveSync } from "./sync/DriveSync";
 import { DownloadManager } from "./sync/DownloadManager";
 import { Scheduler } from "./sync/Scheduler";
+import { SyncManifestStore } from "./sync/SyncManifest";
+import { CompanionNoteManager } from "./sync/CompanionNoteManager";
 import { DriveSyncSettingTab } from "./settings/SettingsTab";
 import { DEFAULT_SETTINGS, PluginSettings, SyncResult } from "./types";
 
@@ -13,19 +16,24 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	auth: GoogleAuth;
 	scheduler: Scheduler;
 	private driveSync: DriveSync;
+	private manifestStore: SyncManifestStore;
+	private companionManager: CompanionNoteManager;
 	private syncing = false;
 
 	async onload() {
 		console.log(`${LOG} Loading plugin`);
 		await this.loadSettings();
 		console.log(`${LOG} Settings loaded:`, {
-			driveFolderId: this.settings.driveFolderId,
-			vaultDestFolder: this.settings.vaultDestFolder,
+			syncPairs: this.settings.syncPairs.length,
 			syncIntervalMinutes: this.settings.syncIntervalMinutes,
 			deletionBehavior: this.settings.deletionBehavior,
+			companionNotesEnabled: this.settings.companionNotesEnabled,
 			hasClientId: !!this.settings.clientId,
 			hasClientSecret: !!this.settings.clientSecret,
 		});
+
+		this.manifestStore = new SyncManifestStore(this.app);
+		this.companionManager = new CompanionNoteManager(this.app, this.settings);
 
 		const downloader = new DownloadManager(this.app);
 		this.auth = new GoogleAuth(this.app, this.settings);
@@ -33,7 +41,9 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			this.auth,
 			downloader,
 			this.settings,
-			this.app
+			this.app,
+			this.manifestStore,
+			this.companionManager
 		);
 		this.scheduler = new Scheduler();
 
@@ -46,11 +56,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			console.log(`${LOG} Manual sync triggered via ribbon`);
 			try {
 				const result = await this.runSync();
-				const msg =
-					`Drive sync complete — ${result.downloaded} downloaded, ` +
-					`${result.skipped} up to date` +
-					(result.removed > 0 ? `, ${result.removed} removed` : "") +
-					(result.errors > 0 ? `, ${result.errors} errors` : "");
+				const msg = this.formatResult(result);
 				console.log(`${LOG}`, msg);
 				new Notice(msg);
 			} catch (e) {
@@ -62,7 +68,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		this.addSettingTab(new DriveSyncSettingTab(this.app, this));
 
 		const isAuthorized = await this.auth.isAuthorized();
-		console.log(`${LOG} Authorized:`, isAuthorized);
+		console.log(`${LOG} Authorized: ${isAuthorized}`);
 
 		if (isAuthorized) {
 			console.log(
@@ -108,20 +114,56 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			DEFAULT_SETTINGS,
 			await this.loadData()
 		);
+		this.migrateLegacySettings();
 	}
 
 	async saveSettings() {
 		console.log(`${LOG} Saving settings`);
 		await this.saveData(this.settings);
 		if (this.auth) this.auth.updateSettings(this.settings);
+		if (this.companionManager) this.companionManager.updateSettings(this.settings);
 		if (this.driveSync) {
 			const downloader = new DownloadManager(this.app);
 			this.driveSync = new DriveSync(
 				this.auth,
 				downloader,
 				this.settings,
-				this.app
+				this.app,
+				this.manifestStore,
+				this.companionManager
 			);
 		}
+	}
+
+	private migrateLegacySettings(): void {
+		// Migrate from the old single-pair settings to the new syncPairs array
+		const legacyId = (this.settings as PluginSettings & { driveFolderId?: string }).driveFolderId;
+		if (legacyId && this.settings.syncPairs.length === 0) {
+			console.log(`${LOG} Migrating legacy single-pair settings to syncPairs`);
+			this.settings.syncPairs = [
+				{
+					id: crypto.randomBytes(8).toString("hex"),
+					label: "Drive Sync",
+					driveFolderId: legacyId,
+					vaultDestFolder: this.settings.vaultDestFolder || "Drive Sync",
+					enabled: true,
+				},
+			];
+			this.settings.driveFolderId = "";
+			this.settings.vaultDestFolder = "";
+			// Persist the migration immediately
+			this.saveData(this.settings).catch((e) =>
+				console.error(`${LOG} Failed to persist migration:`, e)
+			);
+		}
+	}
+
+	private formatResult(result: SyncResult): string {
+		return (
+			`Drive sync complete — ${result.downloaded} downloaded, ` +
+			`${result.skipped} up to date` +
+			(result.removed > 0 ? `, ${result.removed} removed` : "") +
+			(result.errors > 0 ? `, ${result.errors} errors` : "")
+		);
 	}
 }
