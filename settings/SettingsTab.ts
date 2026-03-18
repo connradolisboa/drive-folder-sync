@@ -1,6 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
-import { Automation, SyncPair } from "../types";
+import { Automation, DeletionBehavior, SyncPair } from "../types";
 
 export class DriveSyncSettingTab extends PluginSettingTab {
 	constructor(app: App, private plugin: DriveFolderSyncPlugin) {
@@ -145,6 +145,20 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
+		new Setting(containerEl)
+			.setName("Download concurrency")
+			.setDesc("Number of files to download in parallel (1–10). Higher = faster for large syncs.")
+			.addSlider((slider) =>
+				slider
+					.setLimits(1, 10, 1)
+					.setValue(this.plugin.settings.downloadConcurrency ?? 5)
+					.setDynamicTooltip()
+					.onChange(async (val) => {
+						this.plugin.settings.downloadConcurrency = val;
+						await this.plugin.saveSettings();
+					})
+			);
+
 		// ── Deletion behavior ─────────────────────────────────────────────
 		containerEl.createEl("h3", { text: "Deletion behavior" });
 
@@ -280,6 +294,37 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				})
 		);
 
+		// ── Sync log ──────────────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Sync log" });
+
+		new Setting(containerEl)
+			.setName("Enable sync log")
+			.setDesc("Append a row to a Markdown table after each sync run.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.syncLogEnabled)
+					.onChange(async (val) => {
+						this.plugin.settings.syncLogEnabled = val;
+						await this.plugin.saveSettings();
+						syncLogPathSetting.settingEl.toggle(val);
+					})
+			);
+
+		const syncLogPathSetting = new Setting(containerEl)
+			.setName("Log file path")
+			.setDesc("Vault path to the log file. Created automatically if missing.")
+			.addText((text) =>
+				text
+					.setPlaceholder("Drive Sync/.sync-log.md")
+					.setValue(this.plugin.settings.syncLogPath)
+					.onChange(async (val) => {
+						this.plugin.settings.syncLogPath = val.trim() || "Drive Sync/.sync-log.md";
+						await this.plugin.saveSettings();
+					})
+			);
+
+		syncLogPathSetting.settingEl.toggle(this.plugin.settings.syncLogEnabled);
+
 		// ── Manual sync ───────────────────────────────────────────────────
 		containerEl.createEl("h3", { text: "Manual sync" });
 
@@ -323,7 +368,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				"border: 1px solid var(--background-modifier-border); " +
 				"border-radius: 6px; padding: 4px 12px 4px; margin-bottom: 12px;";
 
-			// Header row: label + enabled toggle + delete
+			// Ensure defaults for fields added after initial creation
+			if (!pair.excludedSubfolders) pair.excludedSubfolders = [];
+
+			// Header row: label + enabled toggle + sync now + delete
 			new Setting(card)
 				.setName(`Pair ${i + 1}`)
 				.addText((text) =>
@@ -340,6 +388,27 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						this.plugin.settings.syncPairs[i].enabled = val;
 						await this.plugin.saveSettings();
 					})
+				)
+				.addExtraButton((btn) =>
+					btn
+						.setIcon("refresh-cw")
+						.setTooltip("Sync this pair now")
+						.onClick(async () => {
+							btn.setDisabled(true);
+							try {
+								const result = await this.plugin.runSyncForPair(pair.id);
+								new Notice(
+									`"${pair.label}" — ${result.downloaded} downloaded, ` +
+									`${result.skipped} up to date` +
+									(result.removed > 0 ? `, ${result.removed} removed` : "") +
+									(result.errors > 0 ? `, ${result.errors} errors` : "")
+								);
+							} catch (e) {
+								new Notice(`Sync failed: ${(e as Error).message}`);
+							} finally {
+								btn.setDisabled(false);
+							}
+						})
 				)
 				.addExtraButton((btn) =>
 					btn
@@ -378,6 +447,85 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.onChange(async (val) => {
 							this.plugin.settings.syncPairs[i].vaultDestFolder =
 								val.trim() || "Drive Sync";
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(card)
+				.setName("Excluded subfolders")
+				.setDesc("Comma-separated subfolder names or paths to skip during sync (e.g. Archive, Old/2023).")
+				.addText((text) =>
+					text
+						.setPlaceholder("Archive, Old/2023")
+						.setValue((pair.excludedSubfolders ?? []).join(", "))
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].excludedSubfolders = val
+								.split(",")
+								.map((s) => s.trim())
+								.filter(Boolean);
+							await this.plugin.saveSettings();
+						})
+				);
+
+			// Advanced overrides (collapsible)
+			const advancedEl = card.createDiv();
+			advancedEl.style.display = "none";
+
+			const advancedToggle = new Setting(card)
+				.setName("Advanced overrides")
+				.setDesc("Override global deletion and companion note settings for this pair only.")
+				.addToggle((toggle) =>
+					toggle.setValue(false).onChange((val) => {
+						advancedEl.style.display = val ? "block" : "none";
+					})
+				);
+			// Move the toggle before the advanced block
+			card.insertBefore(advancedToggle.settingEl, advancedEl);
+
+			const pairArchiveSetting = new Setting(advancedEl)
+				.setName("Deletion behavior (override)")
+				.setDesc("Leave unset to use the global setting.")
+				.addDropdown((drop) => {
+					drop
+						.addOption("", "— use global —")
+						.addOption("keep", "Keep in vault")
+						.addOption("delete", "Move to system trash")
+						.addOption("archive", "Move to archive folder")
+						.setValue(pair.deletionBehavior ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].deletionBehavior =
+								val ? val as DeletionBehavior : undefined;
+							await this.plugin.saveSettings();
+							pairArchivePathSetting.settingEl.toggle(val === "archive");
+						});
+				});
+
+			const pairArchivePathSetting = new Setting(advancedEl)
+				.setName("Archive folder (override)")
+				.setDesc("Vault folder to archive removed files into for this pair.")
+				.addText((text) =>
+					text
+						.setPlaceholder(this.plugin.settings.archiveFolder)
+						.setValue(pair.archiveFolder ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].archiveFolder = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+			pairArchivePathSetting.settingEl.toggle(pair.deletionBehavior === "archive");
+
+			new Setting(advancedEl)
+				.setName("Companion notes (override)")
+				.setDesc("Leave unset to use the global setting.")
+				.addDropdown((drop) =>
+					drop
+						.addOption("", "— use global —")
+						.addOption("true", "Enabled")
+						.addOption("false", "Disabled")
+						.setValue(pair.companionNotesEnabled === undefined ? "" : String(pair.companionNotesEnabled))
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].companionNotesEnabled =
+								val === "" ? undefined : val === "true";
 							await this.plugin.saveSettings();
 						})
 				);

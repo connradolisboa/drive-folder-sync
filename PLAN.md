@@ -81,11 +81,11 @@ Check the box when the feature is merged.
 - `settings/SettingsTab.ts` — add a multi-value text input (comma-separated) per pair card
 
 **Checklist:**
-- [ ] Add `excludedSubfolders: string[]` to `SyncPair` (default `[]`)
-- [ ] In `DriveSync.collectFiles()`, before recursing into a subfolder, check if `folder.name` or the full `childRelPath` matches any entry in `pair.excludedSubfolders`; skip if matched
-- [ ] Pass `pair` (or the exclusion list) down through `collectFiles()` calls
-- [ ] Add a text input to each pair card in `SettingsTab.renderPairs()` for comma-separated subfolder names to exclude
-- [ ] Parse the comma-separated input into an array on save; display the array joined back as comma-separated on load
+- [x] Add `excludedSubfolders: string[]` to `SyncPair` (default `[]`)
+- [x] In `DriveSync.collectFiles()`, before recursing into a subfolder, check if `folder.name` or the full `childRelPath` matches any entry in `pair.excludedSubfolders`; skip if matched
+- [x] Pass `pair` (or the exclusion list) down through `collectFiles()` calls
+- [x] Add a text input to each pair card in `SettingsTab.renderPairs()` for comma-separated subfolder names to exclude
+- [x] Parse the comma-separated input into an array on save; display the array joined back as comma-separated on load
 
 ---
 
@@ -99,10 +99,10 @@ Check the box when the feature is merged.
 - `settings/SettingsTab.ts` — add override controls inside each pair card
 
 **Checklist:**
-- [ ] Add to `SyncPair`: `deletionBehavior?: DeletionBehavior`, `archiveFolder?: string`, `companionNotesEnabled?: boolean`
-- [ ] In `DriveSync.syncPair()`, resolve effective deletion/companion settings: use pair override if set, else fall back to global
-- [ ] In `SettingsTab.renderPairs()`, add an "Advanced" toggle per card that reveals the override dropdowns/toggles
-- [ ] Ensure migration doesn't break existing pairs (all override fields undefined = use global)
+- [x] Add to `SyncPair`: `deletionBehavior?: DeletionBehavior`, `archiveFolder?: string`, `companionNotesEnabled?: boolean`
+- [x] In `DriveSync.syncPair()`, resolve effective deletion/companion settings: use pair override if set, else fall back to global
+- [x] In `SettingsTab.renderPairs()`, add an "Advanced" toggle per card that reveals the override dropdowns/toggles
+- [x] Ensure migration doesn't break existing pairs (all override fields undefined = use global)
 
 ---
 
@@ -116,11 +116,11 @@ Check the box when the feature is merged.
 - `settings/SettingsTab.ts` — add concurrency input under "Sync schedule"
 
 **Checklist:**
-- [ ] Add `downloadConcurrency: number` to `PluginSettings` (default `5`, range 1–10)
-- [ ] Add concurrency number input to settings UI under "Sync schedule"
-- [ ] Refactor the per-entry download block in `syncPair()` into a standalone `processEntry()` method
-- [ ] Use a concurrency-limited runner (simple semaphore or chunked `Promise.allSettled`) to call `processEntry()` in parallel
-- [ ] Ensure `result.downloaded/skipped/errors` counters are updated safely (use returned values, not shared mutation)
+- [x] Add `downloadConcurrency: number` to `PluginSettings` (default `5`, range 1–10)
+- [x] Add concurrency number input to settings UI under "Sync schedule"
+- [x] Refactor the per-entry download block in `syncPair()` into a standalone `processEntry()` method
+- [x] Use a concurrency-limited runner (simple semaphore or chunked `Promise.allSettled`) to call `processEntry()` in parallel
+- [x] Ensure `result.downloaded/skipped/errors` counters are updated safely (use returned values, not shared mutation)
 
 ---
 
@@ -138,10 +138,10 @@ Check the box when the feature is merged.
 - `settings/SettingsTab.ts` — add toggle + path input
 
 **Checklist:**
-- [ ] Add `syncLogEnabled: boolean` (default `false`) and `syncLogPath: string` (default `Drive Sync/.sync-log.md`) to `PluginSettings`
-- [ ] Create `sync/SyncLogger.ts` with `append(result: SyncResult): Promise<void>` — creates the file if missing, appends a `| timestamp | downloaded | skipped | removed | errors |` table row
-- [ ] Call `SyncLogger.append()` in `main.ts` after successful `runSync()`
-- [ ] Add toggle + file path input to settings UI under a new "Sync log" section
+- [x] Add `syncLogEnabled: boolean` (default `false`) and `syncLogPath: string` (default `Drive Sync/.sync-log.md`) to `PluginSettings`
+- [x] Create `sync/SyncLogger.ts` with `append(result: SyncResult): Promise<void>` — creates the file if missing, appends a `| timestamp | downloaded | skipped | removed | errors |` table row
+- [x] Call `SyncLogger.append()` in `main.ts` after successful `runSync()`
+- [x] Add toggle + file path input to settings UI under a new "Sync log" section
 
 ---
 
@@ -155,10 +155,10 @@ Check the box when the feature is merged.
 - `settings/SettingsTab.ts` — add button to each pair card header
 
 **Checklist:**
-- [ ] Add `syncSinglePair(pairId: string)` to `DriveSync` (loads manifest, gets token, runs `syncPair` for matching pair, saves manifest)
-- [ ] Expose `runSyncForPair(pairId)` in `main.ts` with the same `syncing` guard
-- [ ] Add an extra button (icon `refresh-cw` or text "Sync") to each pair card in `SettingsTab.renderPairs()`
-- [ ] Show a `Notice` with the result when done
+- [x] Add `syncSinglePair(pairId: string)` to `DriveSync` (loads manifest, gets token, runs `syncPair` for matching pair, saves manifest)
+- [x] Expose `runSyncForPair(pairId)` in `main.ts` with the same `syncing` guard
+- [x] Add an extra button (icon `refresh-cw` or text "Sync") to each pair card in `SettingsTab.renderPairs()`
+- [x] Show a `Notice` with the result when done
 
 ---
 
@@ -172,12 +172,12 @@ Check the box when the feature is merged.
 - `types.ts` — extend `SyncResult` to include `timestamp` and per-pair breakdown
 
 **Checklist:**
-- [ ] Add `timestamp: number` and `pairs: Record<string, SyncResult>` to `SyncResult`
-- [ ] Create `ui/SyncStatusView.ts` implementing `ItemView` (leaf type `drive-sync-status`)
-- [ ] Register view in `main.ts` `onload()`
-- [ ] Add ribbon icon to open the view (or reuse existing, secondary click)
-- [ ] After each `runSync()`, push result into view and re-render
-- [ ] Show per-pair rows: pair label, downloaded, skipped, removed, errors, last sync time
+- [x] Add `timestamp: number` and `pairs: Record<string, SyncResult>` to `SyncResult`
+- [x] Create `ui/SyncStatusView.ts` implementing `ItemView` (leaf type `drive-sync-status`)
+- [x] Register view in `main.ts` `onload()`
+- [x] Add ribbon icon to open the view (or reuse existing, secondary click)
+- [x] After each `runSync()`, push result into view and re-render
+- [x] Show per-pair rows: pair label, downloaded, skipped, removed, errors, last sync time
 
 ---
 

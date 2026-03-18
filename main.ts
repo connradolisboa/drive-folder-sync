@@ -6,8 +6,10 @@ import { DownloadManager } from "./sync/DownloadManager";
 import { Scheduler } from "./sync/Scheduler";
 import { SyncManifestStore } from "./sync/SyncManifest";
 import { CompanionNoteManager } from "./sync/CompanionNoteManager";
+import { SyncLogger } from "./sync/SyncLogger";
 import { DriveSyncSettingTab } from "./settings/SettingsTab";
 import { AutomationEngine } from "./automation/AutomationEngine";
+import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from "./ui/SyncStatusView";
 import { DEFAULT_SETTINGS, PluginSettings, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
@@ -16,10 +18,12 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	settings: PluginSettings;
 	auth: GoogleAuth;
 	scheduler: Scheduler;
+	lastSyncResult: SyncResult | null = null;
 	private driveSync: DriveSync;
 	private manifestStore: SyncManifestStore;
 	private companionManager: CompanionNoteManager;
 	private automationEngine: AutomationEngine;
+	private syncLogger: SyncLogger;
 	private syncing = false;
 
 	async onload() {
@@ -37,6 +41,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		this.manifestStore = new SyncManifestStore(this.app);
 		this.companionManager = new CompanionNoteManager(this.app, this.settings);
 		this.automationEngine = new AutomationEngine(this.app, this.settings);
+		this.syncLogger = new SyncLogger(this.app, this.settings);
 
 		const downloader = new DownloadManager(this.app);
 		this.auth = new GoogleAuth(this.app, this.settings);
@@ -50,6 +55,8 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			this.automationEngine
 		);
 		this.scheduler = new Scheduler();
+
+		this.registerView(SYNC_STATUS_VIEW_TYPE, (leaf) => new SyncStatusView(leaf, this));
 
 		this.addRibbonIcon("refresh-cw", "Sync Drive folder", async () => {
 			if (this.syncing) {
@@ -67,6 +74,10 @@ export default class DriveFolderSyncPlugin extends Plugin {
 				console.error(`${LOG} Sync failed:`, e);
 				new Notice(`Drive sync failed: ${(e as Error).message}`);
 			}
+		});
+
+		this.addRibbonIcon("layout-dashboard", "Drive Sync Status", () => {
+			this.activateStatusView();
 		});
 
 		this.addSettingTab(new DriveSyncSettingTab(this.app, this));
@@ -109,12 +120,56 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		try {
 			const result = await this.driveSync.sync();
 			console.log(`${LOG} Sync finished:`, result);
+			this.lastSyncResult = result;
+			this.pushResultToStatusView(result);
+			await this.syncLogger.append(result);
 			return result;
 		} catch (e) {
 			console.error(`${LOG} Sync threw an unhandled error:`, e);
 			throw e;
 		} finally {
 			this.syncing = false;
+		}
+	}
+
+	async runSyncForPair(pairId: string): Promise<SyncResult> {
+		if (this.syncing) {
+			console.log(`${LOG} runSyncForPair called while already syncing — skipped`);
+			return { downloaded: 0, skipped: 0, errors: 0, removed: 0 };
+		}
+		this.syncing = true;
+		console.log(`${LOG} Single-pair sync started: ${pairId}`);
+		try {
+			const result = await this.driveSync.syncSinglePair(pairId);
+			console.log(`${LOG} Single-pair sync finished:`, result);
+			await this.syncLogger.append(result);
+			return result;
+		} catch (e) {
+			console.error(`${LOG} Single-pair sync threw an unhandled error:`, e);
+			throw e;
+		} finally {
+			this.syncing = false;
+		}
+	}
+
+	private pushResultToStatusView(result: SyncResult): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE)) {
+			if (leaf.view instanceof SyncStatusView) {
+				leaf.view.updateResult(result);
+			}
+		}
+	}
+
+	private async activateStatusView(): Promise<void> {
+		const existing = this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE);
+		if (existing.length > 0) {
+			this.app.workspace.revealLeaf(existing[0]);
+			return;
+		}
+		const leaf = this.app.workspace.getRightLeaf(false);
+		if (leaf) {
+			await leaf.setViewState({ type: SYNC_STATUS_VIEW_TYPE, active: true });
+			this.app.workspace.revealLeaf(leaf);
 		}
 	}
 
@@ -134,6 +189,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		if (this.companionManager) this.companionManager.updateSettings(this.settings);
 		if (this.automationEngine) this.automationEngine.updateSettings(this.settings);
 		if (this.driveSync) this.driveSync.updateSettings(this.settings);
+		if (this.syncLogger) this.syncLogger.updateSettings(this.settings);
 	}
 
 	private migrateLegacySettings(): void {

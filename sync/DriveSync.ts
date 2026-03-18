@@ -5,6 +5,7 @@ import { SyncManifestStore } from "./SyncManifest";
 import { CompanionNoteManager } from "./CompanionNoteManager";
 import { AutomationEngine } from "../automation/AutomationEngine";
 import {
+	DeletionBehavior,
 	DriveFile,
 	DriveFileEntry,
 	DriveFolder,
@@ -43,6 +44,8 @@ export class DriveSync {
 			skipped: 0,
 			errors: 0,
 			removed: 0,
+			timestamp: Date.now(),
+			pairs: {},
 		};
 
 		const activePairs = this.settings.syncPairs.filter(
@@ -53,10 +56,16 @@ export class DriveSync {
 		for (const pair of activePairs) {
 			console.log(`${LOG} Processing pair "${pair.label}" → "${pair.vaultDestFolder}"`);
 			try {
-				await this.syncPair(pair, token, result);
+				const pairResult = await this.syncPair(pair, token);
+				result.downloaded += pairResult.downloaded;
+				result.skipped += pairResult.skipped;
+				result.errors += pairResult.errors;
+				result.removed += pairResult.removed;
+				result.pairs![pair.id] = pairResult;
 			} catch (e) {
 				console.error(`${LOG} Pair "${pair.label}" failed:`, e);
 				result.errors++;
+				result.pairs![pair.id] = { downloaded: 0, skipped: 0, errors: 1, removed: 0 };
 			}
 		}
 
@@ -64,106 +73,64 @@ export class DriveSync {
 		return result;
 	}
 
-	private async syncPair(
-		pair: SyncPair,
-		token: string,
-		result: SyncResult
-	): Promise<void> {
+	async syncSinglePair(pairId: string): Promise<SyncResult> {
+		await this.manifest.load();
+
+		console.log(`${LOG} Fetching access token for single-pair sync`);
+		const token = await this.auth.getValidAccessToken();
+
+		const pair = this.settings.syncPairs.find((p) => p.id === pairId);
+		if (!pair) throw new Error(`Sync pair not found: ${pairId}`);
+
+		console.log(`${LOG} Single-pair sync: "${pair.label}"`);
+		const result = await this.syncPair(pair, token);
+
+		await this.manifest.save();
+		return { ...result, timestamp: Date.now() };
+	}
+
+	private async syncPair(pair: SyncPair, token: string): Promise<SyncResult> {
+		const result: SyncResult = { downloaded: 0, skipped: 0, errors: 0, removed: 0 };
+
+		// Resolve effective settings — pair override takes precedence over global
+		const effectiveDeletionBehavior = pair.deletionBehavior ?? this.settings.deletionBehavior;
+		const effectiveArchiveFolder = pair.archiveFolder ?? this.settings.archiveFolder;
+		const effectiveCompanionEnabled = pair.companionNotesEnabled ?? this.settings.companionNotesEnabled;
+
 		console.log(`${LOG} Collecting files from Drive folder: ${pair.driveFolderId}`);
-		const driveEntries = await this.collectFiles(pair.driveFolderId, "", token);
+		const driveEntries = await this.collectFiles(pair.driveFolderId, "", token, pair.excludedSubfolders ?? []);
 		console.log(`${LOG} Found ${driveEntries.length} PDF(s) in Drive for pair "${pair.label}"`);
 
 		const seenIds = new Set<string>();
+		// Collect seen IDs up-front so the deletion pass is correct even when downloads run in parallel
+		for (const entry of driveEntries) seenIds.add(entry.file.id);
 
-		for (const entry of driveEntries) {
-			seenIds.add(entry.file.id);
-			const displayPath = entry.relPath
-				? `${entry.relPath}/${entry.file.name}`
-				: entry.file.name;
+		const concurrency = Math.max(1, Math.min(this.settings.downloadConcurrency ?? 5, 10));
+		console.log(`${LOG} Processing ${driveEntries.length} file(s) with concurrency=${concurrency}`);
 
-			try {
-				// Compute expected vault path for this file
-				const expectedVaultPath = this.computeVaultPath(
-					pair.vaultDestFolder,
-					entry.relPath,
-					entry.file.name
-				);
+		const entryResults = await this.runConcurrent(
+			driveEntries,
+			concurrency,
+			(entry) => this.processEntry(entry, pair, token, effectiveCompanionEnabled)
+		);
 
-				// Check manifest for rename detection
-				const existing = this.manifest.get(entry.file.id);
-				if (existing && existing.vaultPath !== expectedVaultPath) {
-					console.log(
-						`${LOG} Rename detected: "${existing.vaultPath}" → "${expectedVaultPath}"`
-					);
-					await this.handleRename(existing, entry, pair, expectedVaultPath);
-				}
-
-				// Download check: no manifest entry, or Drive has newer modifiedTime
-				const needsDownload =
-					!existing ||
-					entry.file.modifiedTime !== existing.driveModifiedTime;
-
-				if (needsDownload) {
-					console.log(`${LOG} Downloading: ${displayPath}`);
-					const vaultPath = await this.downloader.download(
-						entry.file,
-						token,
-						pair.vaultDestFolder,
-						entry.relPath
-					);
-
-					// Companion note
-					let companionPath: string | null = null;
-					if (this.settings.companionNotesEnabled) {
-						const currentCompanionPath = existing?.companionPath ?? null;
-						if (currentCompanionPath) {
-							await this.companion.update(currentCompanionPath, entry.file, pair);
-							companionPath = currentCompanionPath;
-						} else {
-							companionPath = await this.companion.create(
-								entry.file,
-								pair,
-								entry.relPath,
-								vaultPath
-							);
-						}
-					}
-
-					this.manifest.set(entry.file.id, {
-						vaultPath,
-						companionPath,
-						driveModifiedTime: entry.file.modifiedTime,
-						pairId: pair.id,
-					});
-
-					// Run automations for newly downloaded/updated file
-					if (this.automationEngine) {
-						await this.automationEngine.runForFile(vaultPath);
-					}
-
-					console.log(`${LOG} Downloaded: ${displayPath}`);
-					result.downloaded++;
-				} else {
-					console.log(`${LOG} Up to date, skipping: ${displayPath}`);
-					result.skipped++;
-				}
-			} catch (e) {
-				console.error(`${LOG} Failed to sync "${displayPath}":`, e);
-				result.errors++;
-			}
+		for (const r of entryResults) {
+			result.downloaded += r.downloaded;
+			result.skipped += r.skipped;
+			result.errors += r.errors;
 		}
 
 		// Deletion pass — manifest-driven
-		if (this.settings.deletionBehavior !== "keep") {
+		if (effectiveDeletionBehavior !== "keep") {
 			console.log(
-				`${LOG} Running deletion pass for pair "${pair.label}" (behavior: ${this.settings.deletionBehavior})`
+				`${LOG} Running deletion pass for pair "${pair.label}" (behavior: ${effectiveDeletionBehavior})`
 			);
 			const pairEntries = this.manifest.allForPair(pair.id);
 			for (const [driveId, entry] of pairEntries) {
 				if (!seenIds.has(driveId)) {
 					console.log(`${LOG} No longer in Drive — removing: ${entry.vaultPath}`);
 					try {
-						await this.removeEntry(entry, pair);
+						await this.removeEntry(entry, pair, effectiveDeletionBehavior, effectiveArchiveFolder);
 						this.manifest.delete(driveId);
 						result.removed++;
 					} catch (e) {
@@ -172,13 +139,112 @@ export class DriveSync {
 				}
 			}
 		}
+
+		return result;
+	}
+
+	private async runConcurrent<T, R>(
+		items: T[],
+		concurrency: number,
+		fn: (item: T) => Promise<R>
+	): Promise<R[]> {
+		const results: R[] = [];
+		let index = 0;
+
+		async function worker() {
+			while (index < items.length) {
+				const i = index++;
+				results[i] = await fn(items[i]);
+			}
+		}
+
+		const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+		await Promise.all(workers);
+		return results;
+	}
+
+	private async processEntry(
+		entry: DriveFileEntry,
+		pair: SyncPair,
+		token: string,
+		companionEnabled: boolean
+	): Promise<SyncResult> {
+		const r: SyncResult = { downloaded: 0, skipped: 0, errors: 0, removed: 0 };
+		const displayPath = entry.relPath
+			? `${entry.relPath}/${entry.file.name}`
+			: entry.file.name;
+
+		try {
+			const expectedVaultPath = this.computeVaultPath(
+				pair.vaultDestFolder,
+				entry.relPath,
+				entry.file.name
+			);
+
+			const existing = this.manifest.get(entry.file.id);
+			if (existing && existing.vaultPath !== expectedVaultPath) {
+				console.log(`${LOG} Rename detected: "${existing.vaultPath}" → "${expectedVaultPath}"`);
+				await this.handleRename(existing, entry, pair, expectedVaultPath, companionEnabled);
+			}
+
+			const needsDownload = !existing || entry.file.modifiedTime !== existing.driveModifiedTime;
+
+			if (needsDownload) {
+				console.log(`${LOG} Downloading: ${displayPath}`);
+				const vaultPath = await this.downloader.download(
+					entry.file,
+					token,
+					pair.vaultDestFolder,
+					entry.relPath
+				);
+
+				let companionPath: string | null = null;
+				if (companionEnabled) {
+					const currentCompanionPath = existing?.companionPath ?? null;
+					if (currentCompanionPath) {
+						await this.companion.update(currentCompanionPath, entry.file, pair);
+						companionPath = currentCompanionPath;
+					} else {
+						companionPath = await this.companion.create(
+							entry.file,
+							pair,
+							entry.relPath,
+							vaultPath
+						);
+					}
+				}
+
+				this.manifest.set(entry.file.id, {
+					vaultPath,
+					companionPath,
+					driveModifiedTime: entry.file.modifiedTime,
+					pairId: pair.id,
+				});
+
+				if (this.automationEngine) {
+					await this.automationEngine.runForFile(vaultPath);
+				}
+
+				console.log(`${LOG} Downloaded: ${displayPath}`);
+				r.downloaded++;
+			} else {
+				console.log(`${LOG} Up to date, skipping: ${displayPath}`);
+				r.skipped++;
+			}
+		} catch (e) {
+			console.error(`${LOG} Failed to sync "${displayPath}":`, e);
+			r.errors++;
+		}
+
+		return r;
 	}
 
 	private async handleRename(
 		existing: ManifestEntry,
 		entry: DriveFileEntry,
 		pair: SyncPair,
-		newVaultPath: string
+		newVaultPath: string,
+		companionEnabled: boolean
 	): Promise<void> {
 		// Rename the PDF — Obsidian updates all backlinks automatically
 		const oldTFile = this.app.vault.getAbstractFileByPath(existing.vaultPath);
@@ -190,7 +256,7 @@ export class DriveSync {
 		}
 
 		// Rename companion note if it exists
-		if (existing.companionPath && this.settings.companionNotesEnabled) {
+		if (existing.companionPath && companionEnabled) {
 			const newCompanionPath = this.companion.companionPath(
 				pair,
 				entry.relPath,
@@ -216,12 +282,14 @@ export class DriveSync {
 
 	private async removeEntry(
 		entry: ManifestEntry,
-		pair: SyncPair
+		pair: SyncPair,
+		deletionBehavior: DeletionBehavior,
+		archiveFolder: string
 	): Promise<void> {
 		// Remove PDF
 		const pdfFile = this.app.vault.getAbstractFileByPath(entry.vaultPath);
 		if (pdfFile instanceof TFile) {
-			await this.removeFile(pdfFile, entry.vaultPath, pair);
+			await this.removeFile(pdfFile, entry.vaultPath, pair, deletionBehavior, archiveFolder);
 		} else {
 			console.warn(`${LOG} File not found in vault — skipping remove: ${entry.vaultPath}`);
 		}
@@ -230,7 +298,7 @@ export class DriveSync {
 		if (entry.companionPath) {
 			const compFile = this.app.vault.getAbstractFileByPath(entry.companionPath);
 			if (compFile instanceof TFile) {
-				await this.removeFile(compFile, entry.companionPath, pair);
+				await this.removeFile(compFile, entry.companionPath, pair, deletionBehavior, archiveFolder);
 			} else {
 				console.warn(
 					`${LOG} Companion note not found — skipping remove: ${entry.companionPath}`
@@ -242,14 +310,16 @@ export class DriveSync {
 	private async removeFile(
 		file: TFile,
 		filePath: string,
-		pair: SyncPair
+		pair: SyncPair,
+		deletionBehavior: DeletionBehavior,
+		archiveFolder: string
 	): Promise<void> {
-		if (this.settings.deletionBehavior === "delete") {
+		if (deletionBehavior === "delete") {
 			console.log(`${LOG} Trashing: ${filePath}`);
 			await this.app.vault.trash(file, true);
-		} else if (this.settings.deletionBehavior === "archive") {
+		} else if (deletionBehavior === "archive") {
 			const relToRoot = filePath.slice(pair.vaultDestFolder.length);
-			const archivePath = `${this.settings.archiveFolder}${relToRoot}`;
+			const archivePath = `${archiveFolder}${relToRoot}`;
 			const archiveDir = archivePath.substring(0, archivePath.lastIndexOf("/"));
 
 			console.log(`${LOG} Archiving ${filePath} → ${archivePath}`);
@@ -271,7 +341,8 @@ export class DriveSync {
 	private async collectFiles(
 		folderId: string,
 		relPath: string,
-		token: string
+		token: string,
+		excludedSubfolders: string[] = []
 	): Promise<DriveFileEntry[]> {
 		console.log(`${LOG} Listing folder id=${folderId} relPath="${relPath}"`);
 
@@ -296,8 +367,12 @@ export class DriveSync {
 
 		for (const folder of subfolders) {
 			const childRelPath = relPath ? `${relPath}/${folder.name}` : folder.name;
+			if (excludedSubfolders.includes(folder.name) || excludedSubfolders.includes(childRelPath)) {
+				console.log(`${LOG} Skipping excluded subfolder: ${childRelPath}`);
+				continue;
+			}
 			console.log(`${LOG} Descending into subfolder: ${childRelPath}`);
-			const childEntries = await this.collectFiles(folder.id, childRelPath, token);
+			const childEntries = await this.collectFiles(folder.id, childRelPath, token, excludedSubfolders);
 			entries.push(...childEntries);
 		}
 

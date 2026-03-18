@@ -24,6 +24,11 @@ export interface SyncPair {
 	driveFolderId: string;
 	vaultDestFolder: string;
 	enabled: boolean;
+	excludedSubfolders?: string[];
+	// Per-pair overrides (undefined = fall back to global setting)
+	deletionBehavior?: DeletionBehavior;
+	archiveFolder?: string;
+	companionNotesEnabled?: boolean;
 }
 
 export interface ManifestEntry {
@@ -48,8 +53,13 @@ export interface PluginSettings {
 
 	syncIntervalMinutes: number;
 	syncOnStartup: boolean;
+	downloadConcurrency: number;
 	deletionBehavior: DeletionBehavior;
 	archiveFolder: string;
+
+	// Sync log
+	syncLogEnabled: boolean;
+	syncLogPath: string;
 
 	// Automations
 	automations: Automation[];
@@ -68,9 +78,12 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	vaultDestFolder: "",
 	syncIntervalMinutes: 30,
 	syncOnStartup: false,
+	downloadConcurrency: 5,
 	automations: [],
 	deletionBehavior: "keep",
 	archiveFolder: "Drive Sync Archive",
+	syncLogEnabled: false,
+	syncLogPath: "Drive Sync/.sync-log.md",
 	companionNotesEnabled: false,
 	companionNotesFolder: "",
 	companionNoteTemplatePath: "",
@@ -105,6 +118,8 @@ export interface SyncResult {
 	skipped: number;
 	errors: number;
 	removed: number;
+	timestamp?: number;
+	pairs?: Record<string, SyncResult>;
 }
 
 export interface DriveFileEntry {
