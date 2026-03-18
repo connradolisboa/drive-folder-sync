@@ -8,6 +8,7 @@ processed: false
 lastUpdate: "{{lastUpdate}}"
 syncDate: "{{syncDate}}"
 driveFileId: "{{driveFileId}}"
+pairLabel: "{{pairLabel}}"
 ---
 
 # {{title}}
@@ -84,9 +85,9 @@ export class CompanionNoteManager {
 
 	/**
 	 * Update frontmatter of an existing companion note when its PDF is re-downloaded.
-	 * Only touches processed, lastUpdate, and syncDate — preserves the rest of the note.
+	 * Only touches processed, lastUpdate, syncDate, and pairLabel — preserves the rest of the note.
 	 */
-	async update(companionNotePath: string, file: DriveFile): Promise<void> {
+	async update(companionNotePath: string, file: DriveFile, pair: SyncPair): Promise<void> {
 		console.log(`${LOG} Updating companion note frontmatter: ${companionNotePath}`);
 
 		const tFile = this.app.vault.getAbstractFileByPath(companionNotePath);
@@ -99,6 +100,7 @@ export class CompanionNoteManager {
 			fm["processed"] = false;
 			fm["lastUpdate"] = file.modifiedTime;
 			fm["syncDate"] = new Date().toISOString();
+			fm["pairLabel"] = pair.label;
 		});
 
 		console.log(`${LOG} Companion note frontmatter updated: ${companionNotePath}`);
@@ -144,7 +146,7 @@ export class CompanionNoteManager {
 	private renderTemplate(
 		template: string,
 		file: DriveFile,
-		_pair: SyncPair,
+		pair: SyncPair,
 		relPath: string,
 		_pdfVaultPath: string
 	): string {
@@ -158,7 +160,8 @@ export class CompanionNoteManager {
 			.replaceAll("{{lastUpdate}}", file.modifiedTime)
 			.replaceAll("{{syncDate}}", syncDate)
 			.replaceAll("{{driveFileId}}", file.id)
-			.replaceAll("{{relativePath}}", relPath);
+			.replaceAll("{{relativePath}}", relPath)
+			.replaceAll("{{pairLabel}}", pair.label);
 	}
 
 	private async ensureFolder(filePath: string): Promise<void> {

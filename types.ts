@@ -47,6 +47,7 @@ export interface PluginSettings {
 	vaultDestFolder: string;
 
 	syncIntervalMinutes: number;
+	syncOnStartup: boolean;
 	deletionBehavior: DeletionBehavior;
 	archiveFolder: string;
 
@@ -66,6 +67,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	driveFolderId: "",
 	vaultDestFolder: "",
 	syncIntervalMinutes: 30,
+	syncOnStartup: false,
 	automations: [],
 	deletionBehavior: "keep",
 	archiveFolder: "Drive Sync Archive",

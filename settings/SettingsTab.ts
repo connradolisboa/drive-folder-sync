@@ -133,6 +133,18 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
+		new Setting(containerEl)
+			.setName("Sync on startup")
+			.setDesc("Run a sync immediately when the vault opens (requires Google Drive to be connected).")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.syncOnStartup)
+					.onChange(async (val) => {
+						this.plugin.settings.syncOnStartup = val;
+						await this.plugin.saveSettings();
+					})
+			);
+
 		// ── Deletion behavior ─────────────────────────────────────────────
 		containerEl.createEl("h3", { text: "Deletion behavior" });
 
@@ -220,7 +232,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				"Vault path to a .md file to use as the companion note template. " +
 				"Leave empty to use the built-in default. " +
 				"Available placeholders: {{title}}, {{fileName}}, {{fileLink}}, " +
-				"{{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}"
+				"{{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}, {{pairLabel}}"
 			)
 			.addText((text) =>
 				text
@@ -342,13 +354,16 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 
 			new Setting(card)
 				.setName("Drive folder ID")
-				.setDesc("The ID from the folder URL: drive.google.com/drive/folders/FOLDER_ID")
+				.setDesc("The ID from the folder URL: drive.google.com/drive/folders/FOLDER_ID — you can paste the full URL here.")
 				.addText((text) =>
 					text
-						.setPlaceholder("1aBcDeFgHiJkLmNo…")
+						.setPlaceholder("1aBcDeFgHiJkLmNo… or paste full URL")
 						.setValue(pair.driveFolderId)
 						.onChange(async (val) => {
-							this.plugin.settings.syncPairs[i].driveFolderId = val.trim();
+							const match = val.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+							const id = match ? match[1] : val.trim();
+							if (match) text.setValue(id);
+							this.plugin.settings.syncPairs[i].driveFolderId = id;
 							await this.plugin.saveSettings();
 						})
 				);

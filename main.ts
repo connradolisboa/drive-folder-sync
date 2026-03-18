@@ -81,6 +81,12 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			this.scheduler.start(this.settings.syncIntervalMinutes, () =>
 				this.runSync()
 			);
+			if (this.settings.syncOnStartup) {
+				console.log(`${LOG} syncOnStartup enabled — running initial sync`);
+				this.runSync().catch((e) =>
+					console.error(`${LOG} Startup sync failed:`, e)
+				);
+			}
 		} else {
 			console.log(`${LOG} Not authorized — scheduler not started`);
 		}
@@ -127,18 +133,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		if (this.auth) this.auth.updateSettings(this.settings);
 		if (this.companionManager) this.companionManager.updateSettings(this.settings);
 		if (this.automationEngine) this.automationEngine.updateSettings(this.settings);
-		if (this.driveSync) {
-			const downloader = new DownloadManager(this.app);
-			this.driveSync = new DriveSync(
-				this.auth,
-				downloader,
-				this.settings,
-				this.app,
-				this.manifestStore,
-				this.companionManager,
-				this.automationEngine
-			);
-		}
+		if (this.driveSync) this.driveSync.updateSettings(this.settings);
 	}
 
 	private migrateLegacySettings(): void {

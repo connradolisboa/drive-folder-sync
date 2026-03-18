@@ -28,6 +28,10 @@ export class DriveSync {
 		private automationEngine?: AutomationEngine
 	) {}
 
+	updateSettings(settings: PluginSettings): void {
+		this.settings = settings;
+	}
+
 	async sync(): Promise<SyncResult> {
 		await this.manifest.load();
 
@@ -113,7 +117,7 @@ export class DriveSync {
 					if (this.settings.companionNotesEnabled) {
 						const currentCompanionPath = existing?.companionPath ?? null;
 						if (currentCompanionPath) {
-							await this.companion.update(currentCompanionPath, entry.file);
+							await this.companion.update(currentCompanionPath, entry.file, pair);
 							companionPath = currentCompanionPath;
 						} else {
 							companionPath = await this.companion.create(
