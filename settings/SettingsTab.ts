@@ -219,6 +219,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						this.plugin.settings.companionNotesEnabled = val;
 						await this.plugin.saveSettings();
 						companionFolderSetting.settingEl.toggle(val);
+						companionTitleSetting.settingEl.toggle(val);
 						companionTemplateSetting.settingEl.toggle(val);
 					})
 			);
@@ -228,14 +229,34 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			.setDesc(
 				"Root vault folder for companion notes. " +
 				"Leave empty to place notes alongside their PDF. " +
-				"With multiple sync pairs, notes are grouped under <folder>/<pair label>/."
+				"Use \"/\" to place notes in the vault root. " +
+				"With multiple sync pairs, notes are grouped under <folder>/<pair label>/. " +
+				"Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}."
 			)
 			.addText((text) =>
 				text
-					.setPlaceholder("(empty = alongside PDF)")
+					.setPlaceholder("(empty = alongside PDF, / = vault root)")
 					.setValue(this.plugin.settings.companionNotesFolder)
 					.onChange(async (val) => {
 						this.plugin.settings.companionNotesFolder = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		const companionTitleSetting = new Setting(containerEl)
+			.setName("Companion note title")
+			.setDesc(
+				"Template for the note title (H1 heading and {{title}} in templates). " +
+				"Leave empty to use the PDF filename without extension. " +
+				"Supports: {{title}} (PDF stem), {{fileName}}, {{pairLabel}}, {{relativePath}}. " +
+				"Example: \"Reading: {{title}}\""
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("(empty = PDF filename)")
+					.setValue(this.plugin.settings.companionNoteTitle)
+					.onChange(async (val) => {
+						this.plugin.settings.companionNoteTitle = val.trim();
 						await this.plugin.saveSettings();
 					})
 			);
@@ -259,6 +280,9 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			);
 
 		companionFolderSetting.settingEl.toggle(
+			this.plugin.settings.companionNotesEnabled
+		);
+		companionTitleSetting.settingEl.toggle(
 			this.plugin.settings.companionNotesEnabled
 		);
 		companionTemplateSetting.settingEl.toggle(
@@ -604,6 +628,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				.setDesc(
 					"Override the global companion notes folder for this pair. " +
 					"Leave empty to use the global setting. " +
+					"Use \"/\" to place notes in the vault root. " +
 					"Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}. " +
 					"Example: Notes/{{RootFolder}}/{{folderL1}}"
 				)
@@ -613,6 +638,24 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.setValue(pair.companionNotesFolder ?? "")
 						.onChange(async (val) => {
 							this.plugin.settings.syncPairs[i].companionNotesFolder =
+								val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(advancedEl)
+				.setName("Companion note title (override)")
+				.setDesc(
+					"Override the global title template for companion notes in this pair. " +
+					"Leave empty to use the global setting. " +
+					"Supports: {{title}} (PDF stem), {{fileName}}, {{pairLabel}}, {{relativePath}}."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("(empty = use global setting)")
+						.setValue(pair.companionNoteTitle ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].companionNoteTitle =
 								val.trim() || undefined;
 							await this.plugin.saveSettings();
 						})

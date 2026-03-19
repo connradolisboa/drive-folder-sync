@@ -38,6 +38,8 @@ export interface SyncPair {
 	companionNotesFolder?: string;
 	/** Override global companionNoteTemplatePath for this pair. */
 	companionNoteTemplatePath?: string;
+	/** Override global companionNoteTitle for this pair. Supports {{title}}, {{fileName}}, {{pairLabel}}, {{relativePath}}. */
+	companionNoteTitle?: string;
 }
 
 export interface ManifestEntry {
@@ -85,8 +87,9 @@ export interface PluginSettings {
 
 	// Companion notes (global)
 	companionNotesEnabled: boolean;
-	companionNotesFolder: string;      // empty = alongside PDF; supports {{RootFolder}}, {{folderL1}}, {{folderL2}}
+	companionNotesFolder: string;      // empty = alongside PDF; "/" = vault root; supports {{RootFolder}}, {{folderL1}}, {{folderL2}}
 	companionNoteTemplatePath: string; // vault path to .md template; empty = built-in default
+	companionNoteTitle: string;        // title template; empty = PDF stem; supports {{title}}, {{fileName}}, {{pairLabel}}, {{relativePath}}
 
 	// Periodic notes paths (used by embed_to_weekly_note etc.)
 	periodicNotesPaths: PeriodicNotesPaths;
@@ -109,6 +112,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	companionNotesEnabled: false,
 	companionNotesFolder: "",
 	companionNoteTemplatePath: "",
+	companionNoteTitle: "",
 	periodicNotesPaths: {
 		daily: "",
 		weekly: "",

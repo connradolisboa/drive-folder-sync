@@ -58,6 +58,11 @@ export class CompanionNoteManager {
 				: this.settings.companionNotesFolder
 		).trim();
 
+		if (effectiveFolder === "/") {
+			// Vault root sentinel — place note directly in the root
+			return `${stem}.md`;
+		}
+
 		if (effectiveFolder) {
 			if (effectiveFolder.includes("{{")) {
 				// Token mode — resolve tokens and use folder as the full base path
@@ -208,6 +213,23 @@ export class CompanionNoteManager {
 		}
 	}
 
+	private resolveTitle(file: DriveFile, pair: SyncPair, relPath: string): string {
+		const stem = file.name.replace(/\.pdf$/i, "");
+		const titleTemplate = (
+			pair.companionNoteTitle !== undefined
+				? pair.companionNoteTitle
+				: this.settings.companionNoteTitle
+		).trim();
+
+		if (!titleTemplate) return stem;
+
+		return titleTemplate
+			.replaceAll("{{title}}", stem)
+			.replaceAll("{{fileName}}", file.name)
+			.replaceAll("{{pairLabel}}", pair.label)
+			.replaceAll("{{relativePath}}", relPath);
+	}
+
 	private renderTemplate(
 		template: string,
 		file: DriveFile,
@@ -217,9 +239,10 @@ export class CompanionNoteManager {
 	): string {
 		const stem = file.name.replace(/\.pdf$/i, "");
 		const syncDate = new Date().toISOString();
+		const title = this.resolveTitle(file, pair, relPath);
 
 		return template
-			.replaceAll("{{title}}", stem)
+			.replaceAll("{{title}}", title)
 			.replaceAll("{{fileName}}", file.name)
 			.replaceAll("{{fileLink}}", `[[${stem}]]`)
 			.replaceAll("{{lastUpdate}}", file.modifiedTime)
