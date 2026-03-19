@@ -2,7 +2,12 @@ import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
 import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, SyncPair } from "../types";
 
+type TabId = "account" | "sync" | "notes" | "automations";
+
 export class DriveSyncSettingTab extends PluginSettingTab {
+	private activeTab: TabId = "account";
+	private openCards = new Set<string>();
+
 	constructor(app: App, private plugin: DriveFolderSyncPlugin) {
 		super(app, plugin);
 	}
@@ -10,13 +15,207 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
+		this.injectStyles(containerEl);
 
 		containerEl.createEl("h2", { text: "Drive Folder Sync" });
 
-		// ── Google Cloud credentials ──────────────────────────────────────
-		containerEl.createEl("h3", { text: "Google Cloud credentials" });
+		const nav = containerEl.createEl("nav", { cls: "drive-sync-tabs" });
+		const tabs: { id: TabId; label: string }[] = [
+			{ id: "account", label: "Account" },
+			{ id: "sync", label: "Sync" },
+			{ id: "notes", label: "Notes" },
+			{ id: "automations", label: "Automations" },
+		];
 
-		new Setting(containerEl)
+		const panes: Partial<Record<TabId, HTMLElement>> = {};
+		const btnEls: Partial<Record<TabId, HTMLButtonElement>> = {};
+
+		const switchTab = (id: TabId) => {
+			this.activeTab = id;
+			for (const t of tabs) {
+				btnEls[t.id]?.toggleClass("is-active", t.id === id);
+				if (panes[t.id]) panes[t.id]!.style.display = t.id === id ? "" : "none";
+			}
+		};
+
+		for (const tab of tabs) {
+			const btn = nav.createEl("button", {
+				text: tab.label,
+				cls: "drive-sync-tab-btn",
+			});
+			btnEls[tab.id] = btn;
+			btn.addEventListener("click", () => switchTab(tab.id));
+
+			const pane = containerEl.createDiv({ cls: "drive-sync-tab-pane" });
+			panes[tab.id] = pane;
+
+			if (tab.id === "account") this.renderAccountTab(pane);
+			else if (tab.id === "sync") this.renderSyncTab(pane);
+			else if (tab.id === "notes") this.renderNotesTab(pane);
+			else if (tab.id === "automations") this.renderAutomationsTab(pane);
+		}
+
+		switchTab(this.activeTab);
+	}
+
+	private injectStyles(containerEl: HTMLElement): void {
+		const style = containerEl.createEl("style");
+		style.textContent = `
+			.drive-sync-tabs {
+				display: flex;
+				gap: 2px;
+				border-bottom: 1px solid var(--background-modifier-border);
+				margin-bottom: 20px;
+			}
+			.drive-sync-tab-btn {
+				padding: 6px 16px;
+				border: none;
+				background: transparent;
+				cursor: pointer;
+				color: var(--text-muted);
+				font-size: var(--font-ui-small);
+				border-bottom: 2px solid transparent;
+				margin-bottom: -1px;
+				border-radius: 4px 4px 0 0;
+				transition: color 0.1s;
+			}
+			.drive-sync-tab-btn:hover {
+				color: var(--text-normal);
+				background: var(--background-modifier-hover);
+			}
+			.drive-sync-tab-btn.is-active {
+				color: var(--text-accent);
+				border-bottom-color: var(--interactive-accent);
+				font-weight: 600;
+			}
+			.drive-sync-card {
+				border: 1px solid var(--background-modifier-border);
+				border-radius: 6px;
+				margin-bottom: 10px;
+				overflow: hidden;
+			}
+			.drive-sync-card-header {
+				display: flex;
+				align-items: center;
+				padding: 8px 12px;
+				cursor: pointer;
+				user-select: none;
+				gap: 8px;
+				background: var(--background-secondary);
+			}
+			.drive-sync-card-header:hover {
+				background: var(--background-modifier-hover);
+			}
+			.drive-sync-card-chevron {
+				color: var(--text-muted);
+				flex-shrink: 0;
+				display: flex;
+				align-items: center;
+				transition: transform 0.15s ease;
+			}
+			.drive-sync-card.is-open .drive-sync-card-chevron {
+				transform: rotate(90deg);
+			}
+			.drive-sync-card-title {
+				flex: 1;
+				font-weight: 600;
+				font-size: var(--font-ui-small);
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				color: var(--text-normal);
+			}
+			.drive-sync-card-controls {
+				display: flex;
+				align-items: center;
+				gap: 2px;
+				flex-shrink: 0;
+			}
+			.drive-sync-header-setting {
+				border: none !important;
+				padding: 0 !important;
+				margin: 0 !important;
+				background: none !important;
+				box-shadow: none !important;
+			}
+			.drive-sync-card-body {
+				padding: 4px 12px 4px;
+				display: none;
+			}
+			.drive-sync-card.is-open .drive-sync-card-body {
+				display: block;
+			}
+		`;
+	}
+
+	private createCard(
+		container: HTMLElement,
+		cardId: string,
+		title: string,
+	): { cardEl: HTMLElement; bodyEl: HTMLElement; controlsEl: HTMLElement } {
+		const isOpen = this.openCards.has(cardId);
+		const cardEl = container.createDiv({ cls: "drive-sync-card" + (isOpen ? " is-open" : "") });
+
+		const headerEl = cardEl.createDiv({ cls: "drive-sync-card-header" });
+
+		const chevron = headerEl.createDiv({ cls: "drive-sync-card-chevron" });
+		chevron.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>`;
+
+		headerEl.createDiv({ cls: "drive-sync-card-title", text: title });
+
+		const controlsEl = headerEl.createDiv({ cls: "drive-sync-card-controls" });
+
+		const bodyEl = cardEl.createDiv({ cls: "drive-sync-card-body" });
+
+		headerEl.addEventListener("click", (e) => {
+			if ((e.target as HTMLElement).closest(".drive-sync-card-controls")) return;
+			const opening = !cardEl.hasClass("is-open");
+			cardEl.toggleClass("is-open", opening);
+			if (opening) this.openCards.add(cardId);
+			else this.openCards.delete(cardId);
+		});
+
+		return { cardEl, bodyEl, controlsEl };
+	}
+
+	/** Add an enabled toggle to a card's controls area. */
+	private addCardToggle(
+		controlsEl: HTMLElement,
+		value: boolean,
+		onChange: (val: boolean) => void,
+	): void {
+		const wrapper = controlsEl.createDiv();
+		wrapper.addEventListener("click", (e) => e.stopPropagation());
+		const s = new Setting(wrapper);
+		s.settingEl.addClass("drive-sync-header-setting");
+		s.nameEl.style.display = "none";
+		s.infoEl.style.display = "none";
+		s.addToggle((t) => t.setValue(value).onChange(onChange));
+	}
+
+	/** Add an icon button to a card's controls area. */
+	private addCardButton(
+		controlsEl: HTMLElement,
+		svgPath: string,
+		tooltip: string,
+		onClick: (e: MouseEvent) => void,
+	): HTMLButtonElement {
+		const btn = controlsEl.createEl("button", { cls: "clickable-icon" });
+		btn.innerHTML = svgPath;
+		btn.title = tooltip;
+		btn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			onClick(e);
+		});
+		return btn;
+	}
+
+	// ── Tab renderers ────────────────────────────────────────────────────────
+
+	private renderAccountTab(el: HTMLElement): void {
+		el.createEl("h3", { text: "Google Cloud credentials" });
+
+		new Setting(el)
 			.setName("Client ID")
 			.setDesc(
 				"OAuth2 Client ID from your Google Cloud Console project (Desktop app type)"
@@ -31,7 +230,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl)
+		new Setting(el)
 			.setName("Client Secret")
 			.setDesc("OAuth2 Client Secret from the same project")
 			.addText((text) => {
@@ -45,10 +244,9 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					});
 			});
 
-		// ── Google account ────────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Google account" });
+		el.createEl("h3", { text: "Google account" });
 
-		new Setting(containerEl)
+		new Setting(el)
 			.setName("Connect Google Drive")
 			.setDesc(
 				"Authorize access to Google Drive. You only need to do this once. " +
@@ -83,38 +281,42 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						new Notice("Google Drive disconnected.");
 					})
 			);
+	}
 
-		// ── Sync pairs ────────────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Sync folders" });
-		containerEl.createEl("p", {
+	private renderSyncTab(el: HTMLElement): void {
+		// ── Sync folders ──────────────────────────────────────────────────
+		el.createEl("h3", { text: "Sync folders" });
+		el.createEl("p", {
 			text: "Each entry maps a Google Drive folder to a vault folder.",
 			cls: "setting-item-description",
 		});
 
-		const pairsContainer = containerEl.createDiv({ cls: "drive-sync-pairs" });
+		const pairsContainer = el.createDiv({ cls: "drive-sync-pairs" });
 		this.renderPairs(pairsContainer);
 
-		new Setting(containerEl).addButton((btn) =>
+		new Setting(el).addButton((btn) =>
 			btn
 				.setButtonText("+ Add folder pair")
 				.setCta()
 				.onClick(async () => {
+					const id = this.generateId();
 					this.plugin.settings.syncPairs.push({
-						id: this.generateId(),
+						id,
 						label: `Pair ${this.plugin.settings.syncPairs.length + 1}`,
 						driveFolderId: "",
 						vaultDestFolder: "Drive Sync",
 						enabled: true,
 					});
+					this.openCards.add(`pair-${id}`);
 					await this.plugin.saveSettings();
 					this.display();
 				})
 		);
 
 		// ── Sync schedule ─────────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Sync schedule" });
+		el.createEl("h3", { text: "Sync schedule" });
 
-		new Setting(containerEl)
+		new Setting(el)
 			.setName("Sync interval (minutes)")
 			.setDesc("How often to automatically sync. Set to 0 to disable.")
 			.addText((text) =>
@@ -133,7 +335,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl)
+		new Setting(el)
 			.setName("Sync on startup")
 			.setDesc("Run a sync immediately when the vault opens (requires Google Drive to be connected).")
 			.addToggle((toggle) =>
@@ -145,7 +347,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl)
+		new Setting(el)
 			.setName("Download concurrency")
 			.setDesc("Number of files to download in parallel (1–10). Higher = faster for large syncs.")
 			.addSlider((slider) =>
@@ -160,11 +362,11 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			);
 
 		// ── Deletion behavior ─────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Deletion behavior" });
+		el.createEl("h3", { text: "Deletion behavior" });
 
 		let archiveSetting: Setting;
 
-		new Setting(containerEl)
+		new Setting(el)
 			.setName("When a file is removed from Drive")
 			.setDesc("What to do with vault files that no longer exist in the Drive folder.")
 			.addDropdown((drop) => {
@@ -182,7 +384,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					});
 			});
 
-		archiveSetting = new Setting(containerEl)
+		archiveSetting = new Setting(el)
 			.setName("Archive folder")
 			.setDesc("Vault folder to move removed files into. Subfolder structure is preserved.")
 			.addText((text) =>
@@ -200,161 +402,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			this.plugin.settings.deletionBehavior === "archive_keep_companion"
 		);
 
-		// ── Companion notes ───────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Companion notes" });
-		containerEl.createEl("p", {
-			text:
-				"For each PDF, automatically create a Markdown note with frontmatter " +
-				"(processed, lastUpdate, syncDate, driveFileId). " +
-				"The processed property resets to false whenever the PDF is updated.",
-			cls: "setting-item-description",
-		});
-
-		new Setting(containerEl)
-			.setName("Enable companion notes")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.companionNotesEnabled)
-					.onChange(async (val) => {
-						this.plugin.settings.companionNotesEnabled = val;
-						await this.plugin.saveSettings();
-						companionFolderSetting.settingEl.toggle(val);
-						companionTitleSetting.settingEl.toggle(val);
-						companionTemplateSetting.settingEl.toggle(val);
-					})
-			);
-
-		const companionFolderSetting = new Setting(containerEl)
-			.setName("Companion notes folder")
-			.setDesc(
-				"Root vault folder for companion notes. " +
-				"Leave empty to place notes alongside their PDF. " +
-				"Use \"/\" to place notes in the vault root. " +
-				"With multiple sync pairs, notes are grouped under <folder>/<pair label>/. " +
-				"Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}."
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("(empty = alongside PDF, / = vault root)")
-					.setValue(this.plugin.settings.companionNotesFolder)
-					.onChange(async (val) => {
-						this.plugin.settings.companionNotesFolder = val.trim();
-						await this.plugin.saveSettings();
-					})
-			);
-
-		const companionTitleSetting = new Setting(containerEl)
-			.setName("Companion note title")
-			.setDesc(
-				"Template for the note title (H1 heading and {{title}} in templates). " +
-				"Leave empty to use the PDF filename without extension. " +
-				"Supports: {{title}} (PDF stem), {{fileName}}, {{pairLabel}}, {{relativePath}}. " +
-				"Example: \"Reading: {{title}}\""
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("(empty = PDF filename)")
-					.setValue(this.plugin.settings.companionNoteTitle)
-					.onChange(async (val) => {
-						this.plugin.settings.companionNoteTitle = val.trim();
-						await this.plugin.saveSettings();
-					})
-			);
-
-		const companionTemplateSetting = new Setting(containerEl)
-			.setName("Template file path")
-			.setDesc(
-				"Vault path to a .md file to use as the companion note template. " +
-				"Leave empty to use the built-in default. " +
-				"Available placeholders: {{title}}, {{fileName}}, {{fileLink}}, " +
-				"{{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}, {{pairLabel}}"
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("Templates/drive-sync-note.md")
-					.setValue(this.plugin.settings.companionNoteTemplatePath)
-					.onChange(async (val) => {
-						this.plugin.settings.companionNoteTemplatePath = val.trim();
-						await this.plugin.saveSettings();
-					})
-			);
-
-		companionFolderSetting.settingEl.toggle(
-			this.plugin.settings.companionNotesEnabled
-		);
-		companionTitleSetting.settingEl.toggle(
-			this.plugin.settings.companionNotesEnabled
-		);
-		companionTemplateSetting.settingEl.toggle(
-			this.plugin.settings.companionNotesEnabled
-		);
-
-		// ── Periodic Notes ────────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Periodic Notes" });
-		containerEl.createEl("p", {
-			text:
-				"Configure vault path templates for each periodic note type. " +
-				"Used by the \"Embed to weekly/monthly/…\" automation actions to locate the target note. " +
-				"Supports moment.js tokens wrapped in {{}}: {{YYYY}}, {{MM}}, {{DD}}, {{[W]WW}}, {{Q}}.",
-			cls: "setting-item-description",
-		});
-
-		const periodicFields: { key: keyof PeriodicNotesPaths; label: string; placeholder: string }[] = [
-			{ key: "daily",     label: "Daily note path",     placeholder: "Journal/Daily/{{YYYY}}-{{MM}}-{{DD}}" },
-			{ key: "weekly",    label: "Weekly note path",    placeholder: "Journal/Weekly/{{YYYY}}-{{[W]WW}}" },
-			{ key: "monthly",   label: "Monthly note path",   placeholder: "Journal/Monthly/{{YYYY}}-{{MM}}" },
-			{ key: "quarterly", label: "Quarterly note path", placeholder: "Journal/Quarterly/{{YYYY}}-Q{{Q}}" },
-			{ key: "yearly",    label: "Yearly note path",    placeholder: "Journal/Yearly/{{YYYY}}" },
-		];
-
-		for (const { key, label, placeholder } of periodicFields) {
-			new Setting(containerEl)
-				.setName(label)
-				.setDesc("Path template — do not include .md extension.")
-				.addText((text) =>
-					text
-						.setPlaceholder(placeholder)
-						.setValue(this.plugin.settings.periodicNotesPaths[key])
-						.onChange(async (val) => {
-							this.plugin.settings.periodicNotesPaths[key] = val.trim();
-							await this.plugin.saveSettings();
-						})
-				);
-		}
-
-		// ── Automations ───────────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Automations" });
-		containerEl.createEl("p", {
-			text:
-				"Run actions automatically after a PDF is downloaded. " +
-				"Each automation matches a vault folder path and performs an action on the file.",
-			cls: "setting-item-description",
-		});
-
-		const automationsContainer = containerEl.createDiv();
-		this.renderAutomations(automationsContainer);
-
-		new Setting(containerEl).addButton((btn) =>
-			btn
-				.setButtonText("+ Add automation")
-				.setCta()
-				.onClick(async () => {
-					this.plugin.settings.automations.push({
-						id: this.generateId(),
-						name: `Automation ${this.plugin.settings.automations.length + 1}`,
-						enabled: true,
-						triggerFolderPath: "",
-						action: { type: "embed_to_daily_note", insertPosition: "bottom", dailyNoteNamePattern: "" },
-					});
-					await this.plugin.saveSettings();
-					this.display();
-				})
-		);
-
 		// ── Sync log ──────────────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Sync log" });
+		el.createEl("h3", { text: "Sync log" });
 
-		new Setting(containerEl)
+		new Setting(el)
 			.setName("Enable sync log")
 			.setDesc("Append a row to a Markdown table after each sync run.")
 			.addToggle((toggle) =>
@@ -367,7 +418,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
-		const syncLogPathSetting = new Setting(containerEl)
+		const syncLogPathSetting = new Setting(el)
 			.setName("Log file path")
 			.setDesc("Vault path to the log file. Created automatically if missing.")
 			.addText((text) =>
@@ -383,9 +434,9 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 		syncLogPathSetting.settingEl.toggle(this.plugin.settings.syncLogEnabled);
 
 		// ── Manual sync ───────────────────────────────────────────────────
-		containerEl.createEl("h3", { text: "Manual sync" });
+		el.createEl("h3", { text: "Manual sync" });
 
-		new Setting(containerEl)
+		new Setting(el)
 			.setName("Sync now")
 			.setDesc("Trigger a one-off sync immediately.")
 			.addButton((btn) =>
@@ -420,6 +471,158 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			);
 	}
 
+	private renderNotesTab(el: HTMLElement): void {
+		// ── Companion notes ───────────────────────────────────────────────
+		el.createEl("h3", { text: "Companion notes" });
+		el.createEl("p", {
+			text:
+				"For each PDF, automatically create a Markdown note with frontmatter " +
+				"(processed, lastUpdate, syncDate, driveFileId). " +
+				"The processed property resets to false whenever the PDF is updated.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(el)
+			.setName("Enable companion notes")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.companionNotesEnabled)
+					.onChange(async (val) => {
+						this.plugin.settings.companionNotesEnabled = val;
+						await this.plugin.saveSettings();
+						companionFolderSetting.settingEl.toggle(val);
+						companionTitleSetting.settingEl.toggle(val);
+						companionTemplateSetting.settingEl.toggle(val);
+					})
+			);
+
+		const companionFolderSetting = new Setting(el)
+			.setName("Companion notes folder")
+			.setDesc(
+				"Root vault folder for companion notes. " +
+				"Leave empty to place notes alongside their PDF. " +
+				"Use \"/\" to place notes in the vault root. " +
+				"With multiple sync pairs, notes are grouped under <folder>/<pair label>/. " +
+				"Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("(empty = alongside PDF, / = vault root)")
+					.setValue(this.plugin.settings.companionNotesFolder)
+					.onChange(async (val) => {
+						this.plugin.settings.companionNotesFolder = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		const companionTitleSetting = new Setting(el)
+			.setName("Companion note title")
+			.setDesc(
+				"Template for the note title (H1 heading and {{title}} in templates). " +
+				"Leave empty to use the PDF filename without extension. " +
+				"Supports: {{title}} (PDF stem), {{fileName}}, {{pairLabel}}, {{relativePath}}. " +
+				"Example: \"Reading: {{title}}\""
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("(empty = PDF filename)")
+					.setValue(this.plugin.settings.companionNoteTitle)
+					.onChange(async (val) => {
+						this.plugin.settings.companionNoteTitle = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		const companionTemplateSetting = new Setting(el)
+			.setName("Template file path")
+			.setDesc(
+				"Vault path to a .md file to use as the companion note template. " +
+				"Leave empty to use the built-in default. " +
+				"Available placeholders: {{title}}, {{fileName}}, {{fileLink}}, " +
+				"{{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}, {{pairLabel}}"
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("Templates/drive-sync-note.md")
+					.setValue(this.plugin.settings.companionNoteTemplatePath)
+					.onChange(async (val) => {
+						this.plugin.settings.companionNoteTemplatePath = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		companionFolderSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
+		companionTitleSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
+		companionTemplateSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
+
+		// ── Periodic Notes ────────────────────────────────────────────────
+		el.createEl("h3", { text: "Periodic Notes" });
+		el.createEl("p", {
+			text:
+				"Configure vault path templates for each periodic note type. " +
+				"Used by the \"Embed to weekly/monthly/…\" automation actions to locate the target note. " +
+				"Supports moment.js tokens wrapped in {{}}: {{YYYY}}, {{MM}}, {{DD}}, {{[W]WW}}, {{Q}}.",
+			cls: "setting-item-description",
+		});
+
+		const periodicFields: { key: keyof PeriodicNotesPaths; label: string; placeholder: string }[] = [
+			{ key: "daily",     label: "Daily note path",     placeholder: "Journal/Daily/{{YYYY}}-{{MM}}-{{DD}}" },
+			{ key: "weekly",    label: "Weekly note path",    placeholder: "Journal/Weekly/{{YYYY}}-{{[W]WW}}" },
+			{ key: "monthly",   label: "Monthly note path",   placeholder: "Journal/Monthly/{{YYYY}}-{{MM}}" },
+			{ key: "quarterly", label: "Quarterly note path", placeholder: "Journal/Quarterly/{{YYYY}}-Q{{Q}}" },
+			{ key: "yearly",    label: "Yearly note path",    placeholder: "Journal/Yearly/{{YYYY}}" },
+		];
+
+		for (const { key, label, placeholder } of periodicFields) {
+			new Setting(el)
+				.setName(label)
+				.setDesc("Path template — do not include .md extension.")
+				.addText((text) =>
+					text
+						.setPlaceholder(placeholder)
+						.setValue(this.plugin.settings.periodicNotesPaths[key])
+						.onChange(async (val) => {
+							this.plugin.settings.periodicNotesPaths[key] = val.trim();
+							await this.plugin.saveSettings();
+						})
+				);
+		}
+	}
+
+	private renderAutomationsTab(el: HTMLElement): void {
+		el.createEl("h3", { text: "Automations" });
+		el.createEl("p", {
+			text:
+				"Run actions automatically after a PDF is downloaded. " +
+				"Each automation matches a vault folder path and performs an action on the file.",
+			cls: "setting-item-description",
+		});
+
+		const automationsContainer = el.createDiv();
+		this.renderAutomations(automationsContainer);
+
+		new Setting(el).addButton((btn) =>
+			btn
+				.setButtonText("+ Add automation")
+				.setCta()
+				.onClick(async () => {
+					const id = this.generateId();
+					this.plugin.settings.automations.push({
+						id,
+						name: `Automation ${this.plugin.settings.automations.length + 1}`,
+						enabled: true,
+						triggerFolderPath: "",
+						action: { type: "embed_to_daily_note", insertPosition: "bottom", dailyNoteNamePattern: "" },
+					});
+					this.openCards.add(`automation-${id}`);
+					await this.plugin.saveSettings();
+					this.display();
+				})
+		);
+	}
+
+	// ── Card renderers ───────────────────────────────────────────────────────
+
 	private renderPairs(container: HTMLElement): void {
 		container.empty();
 
@@ -431,66 +634,68 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			return;
 		}
 
-		this.plugin.settings.syncPairs.forEach((pair, i) => {
-			const card = container.createDiv({ cls: "drive-sync-pair-card" });
-			card.style.cssText =
-				"border: 1px solid var(--background-modifier-border); " +
-				"border-radius: 6px; padding: 4px 12px 4px; margin-bottom: 12px;";
+		const SYNC_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>`;
+		const TRASH_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`;
 
-			// Ensure defaults for fields added after initial creation
+		this.plugin.settings.syncPairs.forEach((pair, i) => {
 			if (!pair.excludedSubfolders) pair.excludedSubfolders = [];
 
-			// Header row: label + enabled toggle + sync now + delete
-			new Setting(card)
-				.setName(`Pair ${i + 1}`)
+			const cardId = `pair-${pair.id}`;
+			const { cardEl, bodyEl, controlsEl } = this.createCard(
+				container,
+				cardId,
+				pair.label || `Pair ${i + 1}`,
+			);
+
+			// Enabled toggle
+			this.addCardToggle(controlsEl, pair.enabled, async (val) => {
+				this.plugin.settings.syncPairs[i].enabled = val;
+				await this.plugin.saveSettings();
+			});
+
+			// Sync now button
+			const syncBtn = this.addCardButton(controlsEl, SYNC_ICON, "Sync this pair now", async () => {
+				syncBtn.setAttr("disabled", "");
+				try {
+					const result = await this.plugin.runSyncForPair(pair.id);
+					new Notice(
+						`"${pair.label}" — ${result.downloaded} downloaded, ` +
+						`${result.skipped} up to date` +
+						(result.removed > 0 ? `, ${result.removed} removed` : "") +
+						(result.errors > 0 ? `, ${result.errors} errors` : "")
+					);
+				} catch (e) {
+					new Notice(`Sync failed: ${(e as Error).message}`);
+				} finally {
+					syncBtn.removeAttribute("disabled");
+				}
+			});
+
+			// Delete button
+			this.addCardButton(controlsEl, TRASH_ICON, "Delete this pair", async () => {
+				this.plugin.settings.syncPairs.splice(i, 1);
+				await this.plugin.saveSettings();
+				this.display();
+			});
+
+			// ── Body ──────────────────────────────────────────────────────
+
+			new Setting(bodyEl)
+				.setName("Label")
+				.setDesc("A friendly name for this sync pair.")
 				.addText((text) =>
 					text
-						.setPlaceholder("Label (e.g. Boox Notes)")
+						.setPlaceholder("e.g. Boox Notes")
 						.setValue(pair.label)
 						.onChange(async (val) => {
 							this.plugin.settings.syncPairs[i].label = val;
+							const titleEl = cardEl.querySelector(".drive-sync-card-title");
+							if (titleEl) titleEl.textContent = val || `Pair ${i + 1}`;
 							await this.plugin.saveSettings();
-						})
-				)
-				.addToggle((toggle) =>
-					toggle.setValue(pair.enabled).onChange(async (val) => {
-						this.plugin.settings.syncPairs[i].enabled = val;
-						await this.plugin.saveSettings();
-					})
-				)
-				.addExtraButton((btn) =>
-					btn
-						.setIcon("refresh-cw")
-						.setTooltip("Sync this pair now")
-						.onClick(async () => {
-							btn.setDisabled(true);
-							try {
-								const result = await this.plugin.runSyncForPair(pair.id);
-								new Notice(
-									`"${pair.label}" — ${result.downloaded} downloaded, ` +
-									`${result.skipped} up to date` +
-									(result.removed > 0 ? `, ${result.removed} removed` : "") +
-									(result.errors > 0 ? `, ${result.errors} errors` : "")
-								);
-							} catch (e) {
-								new Notice(`Sync failed: ${(e as Error).message}`);
-							} finally {
-								btn.setDisabled(false);
-							}
-						})
-				)
-				.addExtraButton((btn) =>
-					btn
-						.setIcon("trash")
-						.setTooltip("Delete this pair")
-						.onClick(async () => {
-							this.plugin.settings.syncPairs.splice(i, 1);
-							await this.plugin.saveSettings();
-							this.display();
 						})
 				);
 
-			new Setting(card)
+			new Setting(bodyEl)
 				.setName("Drive folder ID")
 				.setDesc("The ID from the folder URL: drive.google.com/drive/folders/FOLDER_ID — you can paste the full URL here.")
 				.addText((text) =>
@@ -506,7 +711,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			new Setting(card)
+			new Setting(bodyEl)
 				.setName("Vault destination")
 				.setDesc("Folder in your vault where PDFs will appear. Created if missing.")
 				.addText((text) =>
@@ -520,7 +725,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			new Setting(card)
+			new Setting(bodyEl)
 				.setName("Excluded subfolders")
 				.setDesc("Comma-separated subfolder names or paths to skip during sync (e.g. Archive, Old/2023).")
 				.addText((text) =>
@@ -536,7 +741,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			new Setting(card)
+			new Setting(bodyEl)
 				.setName("Skip root-level files")
 				.setDesc("Ignore files sitting directly inside this Drive folder — only sync files found inside subfolders.")
 				.addToggle((toggle) =>
@@ -548,7 +753,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			new Setting(card)
+			new Setting(bodyEl)
 				.setName("Root files only")
 				.setDesc("Only sync files directly inside this Drive folder — ignore all subfolders.")
 				.addToggle((toggle) =>
@@ -561,10 +766,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				);
 
 			// Advanced overrides (collapsible)
-			const advancedEl = card.createDiv();
+			const advancedEl = bodyEl.createDiv();
 			advancedEl.style.display = "none";
 
-			const advancedToggle = new Setting(card)
+			const advancedToggle = new Setting(bodyEl)
 				.setName("Advanced overrides")
 				.setDesc("Override global deletion and companion note settings for this pair only.")
 				.addToggle((toggle) =>
@@ -572,8 +777,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						advancedEl.style.display = val ? "block" : "none";
 					})
 				);
-			// Move the toggle before the advanced block
-			card.insertBefore(advancedToggle.settingEl, advancedEl);
+			bodyEl.insertBefore(advancedToggle.settingEl, advancedEl);
 
 			const pairArchiveSetting = new Setting(advancedEl)
 				.setName("Deletion behavior (override)")
@@ -695,47 +899,52 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			return;
 		}
 
+		const TRASH_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`;
+
 		const TOKEN_HINT =
 			"Supports date tokens from the PDF filename: " +
 			"{{YYYY}} (year), {{MM}} (month), {{DD}} (day), {{Q}} (quarter), " +
 			"{{ddd}} / {{dddd}} (weekday), {{MMM}} / {{MMMM}} (month name).";
 
 		this.plugin.settings.automations.forEach((automation, i) => {
-			const card = container.createDiv();
-			card.style.cssText =
-				"border: 1px solid var(--background-modifier-border); " +
-				"border-radius: 6px; padding: 4px 12px 4px; margin-bottom: 12px;";
+			const cardId = `automation-${automation.id}`;
+			const { cardEl, bodyEl, controlsEl } = this.createCard(
+				container,
+				cardId,
+				automation.name || `Automation ${i + 1}`,
+			);
 
-			// Header: name + enabled toggle + delete
-			new Setting(card)
-				.setName(`Automation ${i + 1}`)
+			// Enabled toggle
+			this.addCardToggle(controlsEl, automation.enabled, async (val) => {
+				this.plugin.settings.automations[i].enabled = val;
+				await this.plugin.saveSettings();
+			});
+
+			// Delete button
+			this.addCardButton(controlsEl, TRASH_ICON, "Delete this automation", async () => {
+				this.plugin.settings.automations.splice(i, 1);
+				await this.plugin.saveSettings();
+				this.display();
+			});
+
+			// ── Body ──────────────────────────────────────────────────────
+
+			new Setting(bodyEl)
+				.setName("Name")
+				.setDesc("A descriptive name for this automation.")
 				.addText((text) =>
 					text
-						.setPlaceholder("Name (e.g. Embed daily PDFs)")
+						.setPlaceholder("e.g. Embed daily PDFs")
 						.setValue(automation.name)
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].name = val;
+							const titleEl = cardEl.querySelector(".drive-sync-card-title");
+							if (titleEl) titleEl.textContent = val || `Automation ${i + 1}`;
 							await this.plugin.saveSettings();
-						})
-				)
-				.addToggle((toggle) =>
-					toggle.setValue(automation.enabled).onChange(async (val) => {
-						this.plugin.settings.automations[i].enabled = val;
-						await this.plugin.saveSettings();
-					})
-				)
-				.addExtraButton((btn) =>
-					btn
-						.setIcon("trash")
-						.setTooltip("Delete this automation")
-						.onClick(async () => {
-							this.plugin.settings.automations.splice(i, 1);
-							await this.plugin.saveSettings();
-							this.display();
 						})
 				);
 
-			new Setting(card)
+			new Setting(bodyEl)
 				.setName("Trigger folder")
 				.setDesc(
 					"Vault path prefix to watch. Date tokens are resolved from the PDF filename. " +
@@ -752,10 +961,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			new Setting(card)
+			new Setting(bodyEl)
 				.setName("Action")
 				.setDesc(
-					"Periodic embeds insert a link into the matching periodic note (path configured in the Periodic Notes tab). " +
+					"Periodic embeds insert a link into the matching periodic note (path configured in the Notes tab). " +
 					"append_to_note appends to any named note. " +
 					"add_tag_to_companion adds a tag to the companion note's frontmatter. " +
 					"link_to_matching_note finds notes in a folder whose name contains all words of the PDF title and inserts an embed."
@@ -780,7 +989,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				);
 
 			// ── Action-specific fields ────────────────────────────────────
-			const dailyPatternSetting = new Setting(card)
+			const dailyPatternSetting = new Setting(bodyEl)
 				.setName("Daily note name pattern")
 				.setDesc(
 					"Moment.js format for the daily note filename (without .md extension). " +
@@ -799,7 +1008,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			const targetNoteSetting = new Setting(card)
+			const targetNoteSetting = new Setting(bodyEl)
 				.setName("Target note path")
 				.setDesc("Vault path to the note where the embed will be appended (e.g. MOCs/All PDFs.md).")
 				.addText((text) =>
@@ -812,7 +1021,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			const tagNameSetting = new Setting(card)
+			const tagNameSetting = new Setting(bodyEl)
 				.setName("Tag name")
 				.setDesc("Tag to add to the companion note's frontmatter tags array (without leading #).")
 				.addText((text) =>
@@ -825,7 +1034,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			const searchFolderSetting = new Setting(card)
+			const searchFolderSetting = new Setting(bodyEl)
 				.setName("Search folder path")
 				.setDesc(
 					"Vault folder to search for notes whose name contains all words of the PDF title " +
@@ -842,7 +1051,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			const insertPositionSetting = new Setting(card)
+			const insertPositionSetting = new Setting(bodyEl)
 				.setName("Insert position")
 				.setDesc("Where in the note to insert the embed.")
 				.addDropdown((drop) =>
@@ -857,7 +1066,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			const embedCompanionSetting = new Setting(card)
+			const embedCompanionSetting = new Setting(bodyEl)
 				.setName("Embed companion note instead of file")
 				.setDesc(
 					"When enabled, inserts a link to the companion note rather than the PDF. " +
