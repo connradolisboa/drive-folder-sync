@@ -755,7 +755,8 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				.setDesc(
 					"Periodic embeds insert a link into the matching periodic note (path configured in the Periodic Notes tab). " +
 					"append_to_note appends to any named note. " +
-					"add_tag_to_companion adds a tag to the companion note's frontmatter."
+					"add_tag_to_companion adds a tag to the companion note's frontmatter. " +
+					"link_to_matching_note finds notes in a folder whose name contains all words of the PDF title and inserts an embed."
 				)
 				.addDropdown((drop) =>
 					drop
@@ -766,6 +767,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.addOption("embed_to_yearly_note",    "Embed to yearly note")
 						.addOption("append_to_note",          "Append to note")
 						.addOption("add_tag_to_companion",    "Add tag to companion note")
+						.addOption("link_to_matching_note",   "Link to matching note")
 						.setValue(automation.action.type)
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].action.type =
@@ -821,6 +823,23 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
+			const searchFolderSetting = new Setting(card)
+				.setName("Search folder path")
+				.setDesc(
+					"Vault folder to search for notes whose name contains all words of the PDF title " +
+					'(case-insensitive, punctuation ignored). Example: "Books/Notes".'
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Books/Notes")
+						.setValue(automation.action.searchFolderPath ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.searchFolderPath =
+								val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
 			const insertPositionSetting = new Setting(card)
 				.setName("Insert position")
 				.setDesc("Where in the note to insert the embed.")
@@ -857,14 +876,16 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				type === "embed_to_monthly_note" ||
 				type === "embed_to_quarterly_note" ||
 				type === "embed_to_yearly_note" ||
-				type === "append_to_note";
+				type === "append_to_note" ||
+				type === "link_to_matching_note";
 
 			const updateActionFieldVisibility = (type: AutomationActionType) => {
 				dailyPatternSetting.settingEl.toggle(type === "embed_to_daily_note");
 				targetNoteSetting.settingEl.toggle(type === "append_to_note");
 				tagNameSetting.settingEl.toggle(type === "add_tag_to_companion");
+				searchFolderSetting.settingEl.toggle(type === "link_to_matching_note");
 				insertPositionSetting.settingEl.toggle(isEmbedType(type));
-				embedCompanionSetting.settingEl.toggle(isEmbedType(type));
+				embedCompanionSetting.settingEl.toggle(isEmbedType(type) && type !== "link_to_matching_note");
 			};
 			updateActionFieldVisibility(automation.action.type);
 		});

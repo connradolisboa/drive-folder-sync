@@ -131,7 +131,8 @@ export type AutomationActionType =
 	| "embed_to_quarterly_note"
 	| "embed_to_yearly_note"
 	| "append_to_note"
-	| "add_tag_to_companion";
+	| "add_tag_to_companion"
+	| "link_to_matching_note";
 
 export interface AutomationAction {
 	type: AutomationActionType;
@@ -148,6 +149,8 @@ export interface AutomationAction {
 	tagName?: string;
 	/** When true, embed the companion note instead of the PDF file. */
 	embedCompanion?: boolean;
+	/** For link_to_matching_note: vault folder to search for notes whose basename contains all words of the PDF stem. */
+	searchFolderPath?: string;
 }
 
 export interface Automation {

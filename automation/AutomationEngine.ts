@@ -77,6 +77,8 @@ export class AutomationEngine {
 			await this.runAppendToNote(vaultPath, companionPath, action);
 		} else if (action.type === "add_tag_to_companion") {
 			await this.runAddTagToCompanion(companionPath, action);
+		} else if (action.type === "link_to_matching_note") {
+			await this.runLinkToMatchingNote(vaultPath, action);
 		}
 	}
 
@@ -191,6 +193,41 @@ export class AutomationEngine {
 			console.log(`${LOG} Added tag "${action.tagName}" to companion note: ${companionPath}`);
 		} else {
 			console.log(`${LOG} Tag "${action.tagName}" already present in: ${companionPath}`);
+		}
+	}
+
+	private async runLinkToMatchingNote(
+		vaultPath: string,
+		action: AutomationAction
+	): Promise<void> {
+		if (!action.searchFolderPath) {
+			console.warn(`${LOG} link_to_matching_note: no searchFolderPath configured`);
+			return;
+		}
+
+		const fileName = vaultPath.split("/").pop() ?? vaultPath;
+		const stem = fileName.replace(/\.[^/.]+$/, "");
+		const folderPrefix = action.searchFolderPath.replace(/\/$/, "");
+		const stemWords = this.normalizeWords(stem);
+
+		if (stemWords.length === 0) return;
+
+		const matches = this.app.vault
+			.getMarkdownFiles()
+			.filter((file) => {
+				if (!file.path.startsWith(folderPrefix + "/")) return false;
+				const noteWords = this.normalizeWords(file.basename);
+				return stemWords.every((w) => noteWords.includes(w));
+			});
+
+		if (matches.length === 0) {
+			console.log(`${LOG} link_to_matching_note: no notes in "${folderPrefix}" match stem "${stem}"`);
+			return;
+		}
+
+		for (const note of matches) {
+			console.log(`${LOG} link_to_matching_note: inserting embed into ${note.path}`);
+			await this.insertEmbed(note, fileName, action.insertPosition);
 		}
 	}
 
@@ -340,6 +377,11 @@ export class AutomationEngine {
 	}
 
 	// ── Helpers ──────────────────────────────────────────────────────────────────
+
+	/** Lowercase, strip punctuation, split into words. Used for fuzzy title matching. */
+	private normalizeWords(s: string): string[] {
+		return s.toLowerCase().replace(/[^\w\s]/g, " ").split(/\s+/).filter(Boolean);
+	}
 
 	/** Extract the first YYYY-MM-DD substring from a string. */
 	private extractDate(str: string): string | null {
