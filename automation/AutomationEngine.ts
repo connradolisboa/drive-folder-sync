@@ -250,13 +250,15 @@ export class AutomationEngine {
 	}
 
 	/**
-	 * Resolve moment.js format tokens in a pattern string using the given date.
+	 * Resolve {{token}} placeholders in a pattern string using the given date.
+	 * Each {{...}} block is passed to moment().format(); everything else is literal.
 	 * If dateStr is null or moment is unavailable, returns the pattern as-is.
 	 */
 	private resolveDatePattern(pattern: string, dateStr: string | null): string {
 		if (!dateStr) return pattern;
 		try {
-			return moment(dateStr, "YYYY-MM-DD").format(pattern);
+			const m = moment(dateStr, "YYYY-MM-DD");
+			return pattern.replace(/\{\{([^}]+)\}\}/g, (_, token: string) => m.format(token));
 		} catch {
 			console.warn(`${LOG} Failed to resolve date pattern "${pattern}" for "${dateStr}"`);
 			return pattern;

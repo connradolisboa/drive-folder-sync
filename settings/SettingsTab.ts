@@ -557,9 +557,8 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 
 		const TOKEN_HINT =
 			"Supports date tokens from the PDF filename: " +
-			"YYYY (year), MM (month), DD (day), Q (quarter), " +
-			"ddd / dddd (weekday), MMM / MMMM (month name). " +
-			"Wrap literal text in brackets, e.g. [Q]Q → Q1.";
+			"{{YYYY}} (year), {{MM}} (month), {{DD}} (day), {{Q}} (quarter), " +
+			"{{ddd}} / {{dddd}} (weekday), {{MMM}} / {{MMMM}} (month name).";
 
 		this.plugin.settings.automations.forEach((automation, i) => {
 			const card = container.createDiv();
@@ -601,11 +600,11 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				.setDesc(
 					"Vault path prefix to watch. Date tokens are resolved from the PDF filename. " +
 					TOKEN_HINT +
-					" Example: Onyx/Notebooks/Daily/YYYY/[Q]Q"
+					" Example: Onyx/Notebooks/Daily/{{YYYY}}/Q{{Q}}"
 				)
 				.addText((text) =>
 					text
-						.setPlaceholder("Onyx/Notebooks/Daily/YYYY/[Q]Q")
+						.setPlaceholder("Onyx/Notebooks/Daily/{{YYYY}}/Q{{Q}}")
 						.setValue(automation.triggerFolderPath)
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].triggerFolderPath = val.trim();
@@ -640,12 +639,12 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				.setDesc(
 					"Moment.js format for the daily note filename (without .md extension). " +
 					TOKEN_HINT +
-					" Example: YYYY-MM-DD → matches 2026-03-18.md. " +
-					"Leave empty to search by frontmatter (date: YYYY-MM-DD + tag: periodic/daily)."
+					" Example: {{YYYY}}-{{MM}}-{{DD}} → matches 2026-03-18.md. " +
+					"Leave empty to search by frontmatter (date: {{YYYY}}-{{MM}}-{{DD}} + tag: periodic/daily)."
 				)
 				.addText((text) =>
 					text
-						.setPlaceholder("YYYY-MM-DD")
+						.setPlaceholder("{{YYYY}}-{{MM}}-{{DD}}")
 						.setValue(automation.action.dailyNoteNamePattern)
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].action.dailyNoteNamePattern =
