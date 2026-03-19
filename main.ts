@@ -10,6 +10,7 @@ import { SyncLogger } from "./sync/SyncLogger";
 import { DriveSyncSettingTab } from "./settings/SettingsTab";
 import { AutomationEngine } from "./automation/AutomationEngine";
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from "./ui/SyncStatusView";
+import { DryRunModal } from "./ui/DryRunModal";
 import { DEFAULT_SETTINGS, PluginSettings, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
@@ -110,19 +111,23 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		this.scheduler.stop();
 	}
 
-	async runSync(): Promise<SyncResult> {
+	async runSync(dryRun = false): Promise<SyncResult> {
 		if (this.syncing) {
 			console.log(`${LOG} runSync called while already syncing — skipped`);
 			return { downloaded: 0, skipped: 0, errors: 0, removed: 0 };
 		}
 		this.syncing = true;
-		console.log(`${LOG} Sync started`);
+		console.log(`${LOG} Sync started${dryRun ? " (dry run)" : ""}`);
 		try {
-			const result = await this.driveSync.sync();
+			const result = await this.driveSync.sync(dryRun);
 			console.log(`${LOG} Sync finished:`, result);
-			this.lastSyncResult = result;
-			this.pushResultToStatusView(result);
-			await this.syncLogger.append(result);
+			if (dryRun) {
+				new DryRunModal(this.app, result).open();
+			} else {
+				this.lastSyncResult = result;
+				this.pushResultToStatusView(result);
+				await this.syncLogger.append(result);
+			}
 			return result;
 		} catch (e) {
 			console.error(`${LOG} Sync threw an unhandled error:`, e);

@@ -195,10 +195,10 @@ Check the box when the feature is merged.
 - `ui/DryRunModal.ts` (new) — `Modal` subclass to display the diff
 
 **Checklist:**
-- [ ] Add `dryRun?: boolean` param to `DriveSync.sync()` and `syncPair()`
-- [ ] In dry-run mode, collect would-download and would-remove lists instead of performing actions; return them in an extended result type
-- [ ] Create `ui/DryRunModal.ts` that renders two lists: "Would download" and "Would remove"
-- [ ] Add "Dry run" button in settings "Manual sync" section that calls `runSync(true)` and opens the modal
+- [x] Add `dryRun?: boolean` param to `DriveSync.sync()` and `syncPair()`
+- [x] In dry-run mode, collect would-download and would-remove lists instead of performing actions; return them in an extended result type
+- [x] Create `ui/DryRunModal.ts` that renders two lists: "Would download" and "Would remove"
+- [x] Add "Dry run" button in settings "Manual sync" section that calls `runSync(true)` and opens the modal
 
 ---
 
@@ -216,8 +216,8 @@ Check the box when the feature is merged.
 - `settings/SettingsTab.ts` — add UI controls for new action fields (target note path, tag name)
 
 **Checklist:**
-- [ ] Add `"append_to_note" | "add_tag_to_companion"` to `AutomationActionType`
-- [ ] Add optional fields to `AutomationAction`: `targetNotePath?: string`, `tagName?: string`
-- [ ] Implement `runAppendToNote()` in `AutomationEngine` (reads note, appends embed, writes back)
-- [ ] Implement `runAddTagToCompanion()` in `AutomationEngine` (patches YAML frontmatter tags array)
-- [ ] Add conditional UI in `SettingsTab.renderAutomations()`: show `targetNotePath` input when action = `append_to_note`, `tagName` input when action = `add_tag_to_companion`
+- [x] Add `"append_to_note" | "add_tag_to_companion"` to `AutomationActionType`
+- [x] Add optional fields to `AutomationAction`: `targetNotePath?: string`, `tagName?: string`
+- [x] Implement `runAppendToNote()` in `AutomationEngine` (reads note, appends embed, writes back)
+- [x] Implement `runAddTagToCompanion()` in `AutomationEngine` (patches YAML frontmatter tags array)
+- [x] Add conditional UI in `SettingsTab.renderAutomations()`: show `targetNotePath` input when action = `append_to_note`, `tagName` input when action = `add_tag_to_companion`

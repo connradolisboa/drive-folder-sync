@@ -91,7 +91,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 
 // ── Automations ───────────────────────────────────────────────────────────────
 
-export type AutomationActionType = "embed_to_daily_note";
+export type AutomationActionType = "embed_to_daily_note" | "append_to_note" | "add_tag_to_companion";
 
 export interface AutomationAction {
 	type: AutomationActionType;
@@ -102,6 +102,10 @@ export interface AutomationAction {
 	 * Leave empty to fall back to frontmatter (date: YYYY-MM-DD + periodic/daily tag).
 	 */
 	dailyNoteNamePattern: string;
+	/** For append_to_note: vault path to the target note (e.g. "MOCs/All PDFs.md"). */
+	targetNotePath?: string;
+	/** For add_tag_to_companion: tag to add to the companion note's frontmatter tags array. */
+	tagName?: string;
 }
 
 export interface Automation {
@@ -120,6 +124,10 @@ export interface SyncResult {
 	removed: number;
 	timestamp?: number;
 	pairs?: Record<string, SyncResult>;
+	/** Populated in dry-run mode: paths that would be downloaded. */
+	wouldDownload?: string[];
+	/** Populated in dry-run mode: vault paths that would be removed. */
+	wouldRemove?: string[];
 }
 
 export interface DriveFileEntry {

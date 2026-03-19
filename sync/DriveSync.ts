@@ -33,7 +33,7 @@ export class DriveSync {
 		this.settings = settings;
 	}
 
-	async sync(): Promise<SyncResult> {
+	async sync(dryRun = false): Promise<SyncResult> {
 		await this.manifest.load();
 
 		console.log(`${LOG} Fetching access token`);
@@ -46,22 +46,27 @@ export class DriveSync {
 			removed: 0,
 			timestamp: Date.now(),
 			pairs: {},
+			...(dryRun ? { wouldDownload: [], wouldRemove: [] } : {}),
 		};
 
 		const activePairs = this.settings.syncPairs.filter(
 			(p) => p.enabled && p.driveFolderId.trim()
 		);
-		console.log(`${LOG} Active sync pairs: ${activePairs.length}`);
+		console.log(`${LOG} Active sync pairs: ${activePairs.length}${dryRun ? " (dry run)" : ""}`);
 
 		for (const pair of activePairs) {
 			console.log(`${LOG} Processing pair "${pair.label}" → "${pair.vaultDestFolder}"`);
 			try {
-				const pairResult = await this.syncPair(pair, token);
+				const pairResult = await this.syncPair(pair, token, dryRun);
 				result.downloaded += pairResult.downloaded;
 				result.skipped += pairResult.skipped;
 				result.errors += pairResult.errors;
 				result.removed += pairResult.removed;
 				result.pairs![pair.id] = pairResult;
+				if (dryRun) {
+					result.wouldDownload!.push(...(pairResult.wouldDownload ?? []));
+					result.wouldRemove!.push(...(pairResult.wouldRemove ?? []));
+				}
 			} catch (e) {
 				console.error(`${LOG} Pair "${pair.label}" failed:`, e);
 				result.errors++;
@@ -69,7 +74,7 @@ export class DriveSync {
 			}
 		}
 
-		await this.manifest.save();
+		if (!dryRun) await this.manifest.save();
 		return result;
 	}
 
@@ -89,8 +94,14 @@ export class DriveSync {
 		return { ...result, timestamp: Date.now() };
 	}
 
-	private async syncPair(pair: SyncPair, token: string): Promise<SyncResult> {
-		const result: SyncResult = { downloaded: 0, skipped: 0, errors: 0, removed: 0 };
+	private async syncPair(pair: SyncPair, token: string, dryRun = false): Promise<SyncResult> {
+		const result: SyncResult = {
+			downloaded: 0,
+			skipped: 0,
+			errors: 0,
+			removed: 0,
+			...(dryRun ? { wouldDownload: [], wouldRemove: [] } : {}),
+		};
 
 		// Resolve effective settings — pair override takes precedence over global
 		const effectiveDeletionBehavior = pair.deletionBehavior ?? this.settings.deletionBehavior;
@@ -102,8 +113,31 @@ export class DriveSync {
 		console.log(`${LOG} Found ${driveEntries.length} PDF(s) in Drive for pair "${pair.label}"`);
 
 		const seenIds = new Set<string>();
-		// Collect seen IDs up-front so the deletion pass is correct even when downloads run in parallel
 		for (const entry of driveEntries) seenIds.add(entry.file.id);
+
+		if (dryRun) {
+			// Dry run: classify entries without downloading
+			for (const entry of driveEntries) {
+				const displayPath = entry.relPath
+					? `${entry.relPath}/${entry.file.name}`
+					: entry.file.name;
+				const existing = this.manifest.get(entry.file.id);
+				const wouldDownload = !existing || entry.file.modifiedTime !== existing.driveModifiedTime;
+				if (wouldDownload) {
+					result.wouldDownload!.push(`${pair.label}: ${displayPath}`);
+				}
+			}
+			// Deletion dry-run pass
+			if (effectiveDeletionBehavior !== "keep") {
+				const pairEntries = this.manifest.allForPair(pair.id);
+				for (const [driveId, entry] of pairEntries) {
+					if (!seenIds.has(driveId)) {
+						result.wouldRemove!.push(entry.vaultPath);
+					}
+				}
+			}
+			return result;
+		}
 
 		const concurrency = Math.max(1, Math.min(this.settings.downloadConcurrency ?? 5, 10));
 		console.log(`${LOG} Processing ${driveEntries.length} file(s) with concurrency=${concurrency}`);
@@ -222,7 +256,7 @@ export class DriveSync {
 				});
 
 				if (this.automationEngine) {
-					await this.automationEngine.runForFile(vaultPath);
+					await this.automationEngine.runForFile(vaultPath, companionPath);
 				}
 
 				console.log(`${LOG} Downloaded: ${displayPath}`);

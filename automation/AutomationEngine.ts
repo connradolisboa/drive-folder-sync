@@ -13,7 +13,7 @@ export class AutomationEngine {
 		this.settings = settings;
 	}
 
-	async runForFile(vaultPath: string): Promise<void> {
+	async runForFile(vaultPath: string, companionPath?: string | null): Promise<void> {
 		const matching = this.settings.automations.filter(
 			(a) => a.enabled && this.matchesTrigger(a, vaultPath)
 		);
@@ -25,7 +25,7 @@ export class AutomationEngine {
 				`${LOG} Running automation "${automation.name}" for: ${vaultPath}`
 			);
 			try {
-				await this.runAction(automation.action, vaultPath);
+				await this.runAction(automation.action, vaultPath, companionPath);
 			} catch (e) {
 				console.error(
 					`${LOG} Automation "${automation.name}" failed for "${vaultPath}":`,
@@ -51,9 +51,13 @@ export class AutomationEngine {
 
 	// ── Actions ─────────────────────────────────────────────────────────────────
 
-	private async runAction(action: AutomationAction, vaultPath: string): Promise<void> {
+	private async runAction(action: AutomationAction, vaultPath: string, companionPath?: string | null): Promise<void> {
 		if (action.type === "embed_to_daily_note") {
 			await this.embedToDailyNote(vaultPath, action);
+		} else if (action.type === "append_to_note") {
+			await this.runAppendToNote(vaultPath, action);
+		} else if (action.type === "add_tag_to_companion") {
+			await this.runAddTagToCompanion(companionPath, action);
 		}
 	}
 
@@ -82,6 +86,94 @@ export class AutomationEngine {
 
 		console.log(`${LOG} Found daily note: ${dailyNote.path}`);
 		await this.insertEmbed(dailyNote, fileName, action.insertPosition);
+	}
+
+	private async runAppendToNote(
+		vaultPath: string,
+		action: AutomationAction
+	): Promise<void> {
+		if (!action.targetNotePath) {
+			console.warn(`${LOG} append_to_note: no targetNotePath configured`);
+			return;
+		}
+		const target = this.app.vault.getAbstractFileByPath(action.targetNotePath);
+		if (!(target instanceof TFile)) {
+			console.log(`${LOG} append_to_note: target note not found: ${action.targetNotePath}`);
+			return;
+		}
+		const fileName = vaultPath.split("/").pop() ?? vaultPath;
+		await this.insertEmbed(target, fileName, action.insertPosition);
+	}
+
+	private async runAddTagToCompanion(
+		companionPath: string | null | undefined,
+		action: AutomationAction
+	): Promise<void> {
+		if (!action.tagName) {
+			console.warn(`${LOG} add_tag_to_companion: no tagName configured`);
+			return;
+		}
+		if (!companionPath) {
+			console.log(`${LOG} add_tag_to_companion: no companion note for this file — skipping`);
+			return;
+		}
+		const file = this.app.vault.getAbstractFileByPath(companionPath);
+		if (!(file instanceof TFile)) {
+			console.log(`${LOG} add_tag_to_companion: companion note not found: ${companionPath}`);
+			return;
+		}
+
+		const content = await this.app.vault.read(file);
+		const newContent = this.addTagToFrontmatter(content, action.tagName);
+		if (newContent !== content) {
+			await this.app.vault.modify(file, newContent);
+			console.log(`${LOG} Added tag "${action.tagName}" to companion note: ${companionPath}`);
+		} else {
+			console.log(`${LOG} Tag "${action.tagName}" already present in: ${companionPath}`);
+		}
+	}
+
+	/**
+	 * Patch a YAML frontmatter block to include `tag` in the `tags:` array.
+	 * Handles both list and inline array forms. Creates `tags:` if missing.
+	 */
+	private addTagToFrontmatter(content: string, tag: string): string {
+		const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n/);
+		if (!fmMatch) {
+			// No frontmatter — prepend minimal block
+			return `---\ntags:\n  - ${tag}\n---\n${content}`;
+		}
+
+		const fmBody = fmMatch[1];
+		const fmEnd = fmMatch[0].length;
+
+		// Check if tag is already present
+		if (new RegExp(`(^|\\s)#?${tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`, "m").test(fmBody)) {
+			return content;
+		}
+
+		// Look for an existing tags: key
+		const listTagsMatch = fmBody.match(/^(tags:\s*\n(?:[ \t]+-[^\n]*\n)*)/m);
+		if (listTagsMatch) {
+			// Append to the list
+			const insertAt = content.indexOf(listTagsMatch[0]) + listTagsMatch[0].length;
+			return content.slice(0, insertAt) + `  - ${tag}\n` + content.slice(insertAt);
+		}
+
+		// Inline array form: tags: [foo, bar]
+		const inlineTagsMatch = fmBody.match(/^(tags:\s*\[)(.*?)(\])/m);
+		if (inlineTagsMatch) {
+			const fullMatch = inlineTagsMatch[0];
+			const existing = inlineTagsMatch[2].trim();
+			const replacement = existing
+				? `${inlineTagsMatch[1]}${existing}, ${tag}${inlineTagsMatch[3]}`
+				: `${inlineTagsMatch[1]}${tag}${inlineTagsMatch[3]}`;
+			return content.replace(fullMatch, replacement);
+		}
+
+		// No tags key — append before closing ---
+		const newFmBody = fmBody + `\ntags:\n  - ${tag}`;
+		return `---\n${newFmBody}\n---\n` + content.slice(fmEnd);
 	}
 
 	// ── Daily note finders ───────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
-import { Automation, DeletionBehavior, SyncPair } from "../types";
+import { Automation, AutomationActionType, DeletionBehavior, SyncPair } from "../types";
 
 export class DriveSyncSettingTab extends PluginSettingTab {
 	constructor(app: App, private plugin: DriveFolderSyncPlugin) {
@@ -348,6 +348,18 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						btn.setButtonText("Sync now").setDisabled(false);
 					}
 				})
+			)
+			.addButton((btn) =>
+				btn.setButtonText("Dry run").onClick(async () => {
+					try {
+						btn.setButtonText("Running…").setDisabled(true);
+						await this.plugin.runSync(true);
+					} catch (e) {
+						new Notice(`Dry run failed: ${(e as Error).message}`);
+					} finally {
+						btn.setButtonText("Dry run").setDisabled(false);
+					}
+				})
 			);
 	}
 
@@ -604,21 +616,26 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			new Setting(card)
 				.setName("Action")
 				.setDesc(
-					"Embed to daily note: finds the daily note whose filename matches the " +
-					"date extracted from the PDF, then inserts an embed link."
+					"embed_to_daily_note: inserts an embed into a daily note matched by date. " +
+					"append_to_note: appends an embed to any named vault note. " +
+					"add_tag_to_companion: adds a tag to the companion note's frontmatter."
 				)
 				.addDropdown((drop) =>
 					drop
 						.addOption("embed_to_daily_note", "Embed to daily note")
+						.addOption("append_to_note", "Append to note")
+						.addOption("add_tag_to_companion", "Add tag to companion note")
 						.setValue(automation.action.type)
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].action.type =
-								val as Automation["action"]["type"];
+								val as AutomationActionType;
 							await this.plugin.saveSettings();
+							updateActionFieldVisibility(val as AutomationActionType);
 						})
 				);
 
-			new Setting(card)
+			// ── Action-specific fields ────────────────────────────────────
+			const dailyPatternSetting = new Setting(card)
 				.setName("Daily note name pattern")
 				.setDesc(
 					"Moment.js format for the daily note filename (without .md extension). " +
@@ -637,9 +654,35 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			new Setting(card)
+			const targetNoteSetting = new Setting(card)
+				.setName("Target note path")
+				.setDesc("Vault path to the note where the embed will be appended (e.g. MOCs/All PDFs.md).")
+				.addText((text) =>
+					text
+						.setPlaceholder("MOCs/All PDFs.md")
+						.setValue(automation.action.targetNotePath ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.targetNotePath = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const tagNameSetting = new Setting(card)
+				.setName("Tag name")
+				.setDesc("Tag to add to the companion note's frontmatter tags array (without leading #).")
+				.addText((text) =>
+					text
+						.setPlaceholder("synced")
+						.setValue(automation.action.tagName ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.tagName = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const insertPositionSetting = new Setting(card)
 				.setName("Insert position")
-				.setDesc("Where in the daily note to insert the embed.")
+				.setDesc("Where in the note to insert the embed.")
 				.addDropdown((drop) =>
 					drop
 						.addOption("bottom", "Bottom of note")
@@ -651,6 +694,16 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 							await this.plugin.saveSettings();
 						})
 				);
+
+			const updateActionFieldVisibility = (type: AutomationActionType) => {
+				dailyPatternSetting.settingEl.toggle(type === "embed_to_daily_note");
+				targetNoteSetting.settingEl.toggle(type === "append_to_note");
+				tagNameSetting.settingEl.toggle(type === "add_tag_to_companion");
+				insertPositionSetting.settingEl.toggle(
+					type === "embed_to_daily_note" || type === "append_to_note"
+				);
+			};
+			updateActionFieldVisibility(automation.action.type);
 		});
 	}
 
