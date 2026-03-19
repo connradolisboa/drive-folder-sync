@@ -49,10 +49,26 @@ export class AutomationEngine {
 			automation.triggerFolderPath.replace(/\/$/, ""),
 			dateStr
 		);
-		return (
-			vaultPath.startsWith(resolvedTrigger + "/") ||
-			vaultPath.startsWith(resolvedTrigger + "\\")
-		);
+
+		const sep = vaultPath.includes("\\") ? "\\" : "/";
+		if (!vaultPath.startsWith(resolvedTrigger + "/") && !vaultPath.startsWith(resolvedTrigger + "\\")) {
+			return false;
+		}
+
+		// Relative path inside the trigger folder (e.g. "2026/MyBook.pdf" or "MyBook.pdf")
+		const relative = vaultPath.slice(resolvedTrigger.length + 1);
+		const isRootFile = !relative.includes("/") && !relative.includes("\\");
+
+		const scope = automation.triggerScope ?? "all";
+		if (scope === "root_only" && !isRootFile) return false;
+		if (scope === "subfolders_only" && isRootFile) return false;
+
+		if (automation.excludedSubfolders?.length && !isRootFile) {
+			const firstSegment = relative.split(sep)[0];
+			if (automation.excludedSubfolders.includes(firstSegment)) return false;
+		}
+
+		return true;
 	}
 
 	// ── Actions ─────────────────────────────────────────────────────────────────
@@ -222,6 +238,9 @@ export class AutomationEngine {
 
 		if (matches.length === 0) {
 			console.log(`${LOG} link_to_matching_note: no notes in "${folderPrefix}" match stem "${stem}"`);
+			if (action.createNoteIfNotFound) {
+				await this.createAndLinkNote(stem, fileName, folderPrefix, action);
+			}
 			return;
 		}
 
@@ -229,6 +248,48 @@ export class AutomationEngine {
 			console.log(`${LOG} link_to_matching_note: inserting embed into ${note.path}`);
 			await this.insertEmbed(note, fileName, action.insertPosition);
 		}
+	}
+
+	private async createAndLinkNote(
+		stem: string,
+		fileName: string,
+		searchFolderPath: string,
+		action: AutomationAction
+	): Promise<void> {
+		const targetFolder = (action.newNoteFolder?.trim() || searchFolderPath).replace(/\/$/, "");
+		const notePath = `${targetFolder}/${stem}.md`;
+
+		// If the note already exists (e.g. renamed after last sync), just link it
+		const existing = this.app.vault.getAbstractFileByPath(notePath);
+		if (existing instanceof TFile) {
+			console.log(`${LOG} link_to_matching_note: note already exists at "${notePath}", inserting embed`);
+			await this.insertEmbed(existing, fileName, action.insertPosition);
+			return;
+		}
+
+		// Load template content if specified
+		let content = "";
+		if (action.newNoteTemplatePath) {
+			const templateFile = this.app.vault.getAbstractFileByPath(action.newNoteTemplatePath);
+			if (templateFile instanceof TFile) {
+				content = await this.app.vault.read(templateFile);
+			} else {
+				console.warn(`${LOG} link_to_matching_note: template not found: ${action.newNoteTemplatePath}`);
+			}
+		}
+
+		// Ensure the target folder exists (create intermediate folders as needed)
+		const parts = targetFolder.split("/");
+		for (let i = 1; i <= parts.length; i++) {
+			const partial = parts.slice(0, i).join("/");
+			if (!(await this.app.vault.adapter.exists(partial))) {
+				await this.app.vault.createFolder(partial);
+			}
+		}
+
+		const newNote = await this.app.vault.create(notePath, content);
+		console.log(`${LOG} link_to_matching_note: created new note at "${notePath}"`);
+		await this.insertEmbed(newNote, fileName, action.insertPosition);
 	}
 
 	// ── Embed target resolution ──────────────────────────────────────────────────

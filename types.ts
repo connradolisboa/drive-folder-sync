@@ -156,6 +156,12 @@ export interface AutomationAction {
 	embedCompanion?: boolean;
 	/** For link_to_matching_note: vault folder to search for notes whose basename contains all words of the PDF stem. */
 	searchFolderPath?: string;
+	/** For link_to_matching_note: when true, create a new note if no matching note is found. */
+	createNoteIfNotFound?: boolean;
+	/** For link_to_matching_note: folder to place newly created notes. Defaults to searchFolderPath when empty. */
+	newNoteFolder?: string;
+	/** For link_to_matching_note: vault path to a template note for newly created notes. Blank note when empty. */
+	newNoteTemplatePath?: string;
 }
 
 export interface Automation {
@@ -164,6 +170,15 @@ export interface Automation {
 	enabled: boolean;
 	/** Vault folder path prefix that triggers this automation, e.g. "Onyx/Notebooks/Daily" */
 	triggerFolderPath: string;
+	/**
+	 * Which files inside the trigger folder fire this automation.
+	 * "all" (default) — every file at any depth.
+	 * "root_only" — only files sitting directly in the trigger folder (no subfolders).
+	 * "subfolders_only" — only files inside a subfolder (not directly in the trigger folder root).
+	 */
+	triggerScope?: "all" | "root_only" | "subfolders_only";
+	/** Subfolder names (relative to triggerFolderPath) whose files should not trigger this automation. */
+	excludedSubfolders?: string[];
 	action: AutomationAction;
 }
 

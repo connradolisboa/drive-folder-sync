@@ -962,6 +962,45 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				);
 
 			new Setting(bodyEl)
+				.setName("File scope")
+				.setDesc(
+					"Which files inside the trigger folder fire this automation. " +
+					'"All files" includes every depth. ' +
+					'"Root files only" skips subfolders. ' +
+					'"Subfolders only" skips files sitting directly in the trigger folder.'
+				)
+				.addDropdown((drop) =>
+					drop
+						.addOption("all",              "All files")
+						.addOption("root_only",        "Root files only")
+						.addOption("subfolders_only",  "Subfolders only")
+						.setValue(automation.triggerScope ?? "all")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].triggerScope =
+								val as "all" | "root_only" | "subfolders_only";
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(bodyEl)
+				.setName("Excluded subfolders")
+				.setDesc(
+					"Comma-separated subfolder names (relative to the trigger folder) whose files should be ignored. " +
+					'Example: "Archive, Old" skips files inside Archive/ and Old/.'
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Archive, Old")
+						.setValue((automation.excludedSubfolders ?? []).join(", "))
+						.onChange(async (val) => {
+							const parts = val.split(",").map((s) => s.trim()).filter(Boolean);
+							this.plugin.settings.automations[i].excludedSubfolders =
+								parts.length ? parts : undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(bodyEl)
 				.setName("Action")
 				.setDesc(
 					"Periodic embeds insert a link into the matching periodic note (path configured in the Notes tab). " +
@@ -990,12 +1029,14 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 
 			// ── Action-specific fields ────────────────────────────────────
 			const dailyPatternSetting = new Setting(bodyEl)
-				.setName("Daily note name pattern")
+				.setName("Daily note path (override)")
 				.setDesc(
-					"Moment.js format for the daily note filename (without .md extension). " +
+					"Per-automation override for the daily note path. Uses the same format as the global " +
+					"Daily note path in the Notes tab (folder + filename with Moment.js tokens). " +
 					TOKEN_HINT +
-					" Example: {{YYYY}}-{{MM}}-{{DD}} → matches 2026-03-18.md. " +
-					"Leave empty to search by frontmatter (date: {{YYYY}}-{{MM}}-{{DD}} + tag: periodic/daily)."
+					" Example: Journal/Daily/{{YYYY}}-{{MM}}-{{DD}}. " +
+					"Leave empty to use the global Daily note path from the Notes tab " +
+					"(or fall back to frontmatter search if that is also unset)."
 				)
 				.addText((text) =>
 					text
@@ -1051,6 +1092,58 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
+			const createNoteIfNotFoundSetting = new Setting(bodyEl)
+				.setName("Create note if not found")
+				.setDesc(
+					"When enabled, a new note is created if no matching note exists in the search folder. " +
+					"The new note uses the PDF title as its filename and can be pre-filled from a template."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.createNoteIfNotFound ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.createNoteIfNotFound = val;
+							await this.plugin.saveSettings();
+							newNoteFolderSetting.settingEl.toggle(val);
+							newNoteTemplateSetting.settingEl.toggle(val);
+						})
+				);
+
+			const createNoteEnabled = automation.action.createNoteIfNotFound ?? false;
+
+			const newNoteFolderSetting = new Setting(bodyEl)
+				.setName("New note folder")
+				.setDesc("Folder where the new note is created. Defaults to the search folder when left empty.")
+				.addText((text) =>
+					text
+						.setPlaceholder("(uses search folder)")
+						.setValue(automation.action.newNoteFolder ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.newNoteFolder =
+								val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+			newNoteFolderSetting.settingEl.toggle(createNoteEnabled);
+
+			const newNoteTemplateSetting = new Setting(bodyEl)
+				.setName("New note template")
+				.setDesc(
+					"Vault path to a template note whose content is copied into the new note. " +
+					"Leave empty to create a blank note."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Templates/Note Template.md")
+						.setValue(automation.action.newNoteTemplatePath ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.newNoteTemplatePath =
+								val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+			newNoteTemplateSetting.settingEl.toggle(createNoteEnabled);
+
 			const insertPositionSetting = new Setting(bodyEl)
 				.setName("Insert position")
 				.setDesc("Where in the note to insert the embed.")
@@ -1091,12 +1184,17 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				type === "link_to_matching_note";
 
 			const updateActionFieldVisibility = (type: AutomationActionType) => {
+				const isLinkToNote = type === "link_to_matching_note";
+				const createEnabled = this.plugin.settings.automations[i].action.createNoteIfNotFound ?? false;
 				dailyPatternSetting.settingEl.toggle(type === "embed_to_daily_note");
 				targetNoteSetting.settingEl.toggle(type === "append_to_note");
 				tagNameSetting.settingEl.toggle(type === "add_tag_to_companion");
-				searchFolderSetting.settingEl.toggle(type === "link_to_matching_note");
+				searchFolderSetting.settingEl.toggle(isLinkToNote);
+				createNoteIfNotFoundSetting.settingEl.toggle(isLinkToNote);
+				newNoteFolderSetting.settingEl.toggle(isLinkToNote && createEnabled);
+				newNoteTemplateSetting.settingEl.toggle(isLinkToNote && createEnabled);
 				insertPositionSetting.settingEl.toggle(isEmbedType(type));
-				embedCompanionSetting.settingEl.toggle(isEmbedType(type) && type !== "link_to_matching_note");
+				embedCompanionSetting.settingEl.toggle(isEmbedType(type) && !isLinkToNote);
 			};
 			updateActionFieldVisibility(automation.action.type);
 		});
