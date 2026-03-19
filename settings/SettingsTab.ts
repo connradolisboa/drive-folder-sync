@@ -1,6 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
-import { Automation, AutomationActionType, DeletionBehavior, SyncPair } from "../types";
+import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, SyncPair } from "../types";
 
 export class DriveSyncSettingTab extends PluginSettingTab {
 	constructor(app: App, private plugin: DriveFolderSyncPlugin) {
@@ -265,6 +265,39 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			this.plugin.settings.companionNotesEnabled
 		);
 
+		// ── Periodic Notes ────────────────────────────────────────────────
+		containerEl.createEl("h3", { text: "Periodic Notes" });
+		containerEl.createEl("p", {
+			text:
+				"Configure vault path templates for each periodic note type. " +
+				"Used by the \"Embed to weekly/monthly/…\" automation actions to locate the target note. " +
+				"Supports moment.js tokens wrapped in {{}}: {{YYYY}}, {{MM}}, {{DD}}, {{[W]WW}}, {{Q}}.",
+			cls: "setting-item-description",
+		});
+
+		const periodicFields: { key: keyof PeriodicNotesPaths; label: string; placeholder: string }[] = [
+			{ key: "daily",     label: "Daily note path",     placeholder: "Journal/Daily/{{YYYY}}-{{MM}}-{{DD}}" },
+			{ key: "weekly",    label: "Weekly note path",    placeholder: "Journal/Weekly/{{YYYY}}-{{[W]WW}}" },
+			{ key: "monthly",   label: "Monthly note path",   placeholder: "Journal/Monthly/{{YYYY}}-{{MM}}" },
+			{ key: "quarterly", label: "Quarterly note path", placeholder: "Journal/Quarterly/{{YYYY}}-Q{{Q}}" },
+			{ key: "yearly",    label: "Yearly note path",    placeholder: "Journal/Yearly/{{YYYY}}" },
+		];
+
+		for (const { key, label, placeholder } of periodicFields) {
+			new Setting(containerEl)
+				.setName(label)
+				.setDesc("Path template — do not include .md extension.")
+				.addText((text) =>
+					text
+						.setPlaceholder(placeholder)
+						.setValue(this.plugin.settings.periodicNotesPaths[key])
+						.onChange(async (val) => {
+							this.plugin.settings.periodicNotesPaths[key] = val.trim();
+							await this.plugin.saveSettings();
+						})
+				);
+		}
+
 		// ── Automations ───────────────────────────────────────────────────
 		containerEl.createEl("h3", { text: "Automations" });
 		containerEl.createEl("p", {
@@ -479,6 +512,30 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
+			new Setting(card)
+				.setName("Skip root-level files")
+				.setDesc("Ignore files sitting directly inside this Drive folder — only sync files found inside subfolders.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(pair.excludeRootFiles ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].excludeRootFiles = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(card)
+				.setName("Root files only")
+				.setDesc("Only sync files directly inside this Drive folder — ignore all subfolders.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(pair.rootFilesOnly ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].rootFilesOnly = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
 			// Advanced overrides (collapsible)
 			const advancedEl = card.createDiv();
 			advancedEl.style.display = "none";
@@ -538,6 +595,44 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.onChange(async (val) => {
 							this.plugin.settings.syncPairs[i].companionNotesEnabled =
 								val === "" ? undefined : val === "true";
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(advancedEl)
+				.setName("Companion notes folder (override)")
+				.setDesc(
+					"Override the global companion notes folder for this pair. " +
+					"Leave empty to use the global setting. " +
+					"Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}. " +
+					"Example: Notes/{{RootFolder}}/{{folderL1}}"
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Notes/{{RootFolder}}/{{folderL1}}")
+						.setValue(pair.companionNotesFolder ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].companionNotesFolder =
+								val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(advancedEl)
+				.setName("Companion note template (override)")
+				.setDesc(
+					"Vault path to a .md template file for companion notes in this pair. " +
+					"Leave empty to use the global template. " +
+					"Available placeholders: {{title}}, {{fileName}}, {{fileLink}}, " +
+					"{{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}, {{pairLabel}}"
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("Templates/my-template.md")
+						.setValue(pair.companionNoteTemplatePath ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].companionNoteTemplatePath =
+								val.trim() || undefined;
 							await this.plugin.saveSettings();
 						})
 				);
@@ -615,15 +710,19 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			new Setting(card)
 				.setName("Action")
 				.setDesc(
-					"embed_to_daily_note: inserts an embed into a daily note matched by date. " +
-					"append_to_note: appends an embed to any named vault note. " +
-					"add_tag_to_companion: adds a tag to the companion note's frontmatter."
+					"Periodic embeds insert a link into the matching periodic note (path configured in the Periodic Notes tab). " +
+					"append_to_note appends to any named note. " +
+					"add_tag_to_companion adds a tag to the companion note's frontmatter."
 				)
 				.addDropdown((drop) =>
 					drop
-						.addOption("embed_to_daily_note", "Embed to daily note")
-						.addOption("append_to_note", "Append to note")
-						.addOption("add_tag_to_companion", "Add tag to companion note")
+						.addOption("embed_to_daily_note",     "Embed to daily note")
+						.addOption("embed_to_weekly_note",    "Embed to weekly note")
+						.addOption("embed_to_monthly_note",   "Embed to monthly note")
+						.addOption("embed_to_quarterly_note", "Embed to quarterly note")
+						.addOption("embed_to_yearly_note",    "Embed to yearly note")
+						.addOption("append_to_note",          "Append to note")
+						.addOption("add_tag_to_companion",    "Add tag to companion note")
 						.setValue(automation.action.type)
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].action.type =
@@ -694,13 +793,35 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
+			const embedCompanionSetting = new Setting(card)
+				.setName("Embed companion note instead of file")
+				.setDesc(
+					"When enabled, inserts a link to the companion note rather than the PDF. " +
+					"Falls back to the PDF if no companion note exists."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.embedCompanion ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.embedCompanion = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const isEmbedType = (type: AutomationActionType) =>
+				type === "embed_to_daily_note" ||
+				type === "embed_to_weekly_note" ||
+				type === "embed_to_monthly_note" ||
+				type === "embed_to_quarterly_note" ||
+				type === "embed_to_yearly_note" ||
+				type === "append_to_note";
+
 			const updateActionFieldVisibility = (type: AutomationActionType) => {
 				dailyPatternSetting.settingEl.toggle(type === "embed_to_daily_note");
 				targetNoteSetting.settingEl.toggle(type === "append_to_note");
 				tagNameSetting.settingEl.toggle(type === "add_tag_to_companion");
-				insertPositionSetting.settingEl.toggle(
-					type === "embed_to_daily_note" || type === "append_to_note"
-				);
+				insertPositionSetting.settingEl.toggle(isEmbedType(type));
+				embedCompanionSetting.settingEl.toggle(isEmbedType(type));
 			};
 			updateActionFieldVisibility(automation.action.type);
 		});

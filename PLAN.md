@@ -221,3 +221,56 @@ Check the box when the feature is merged.
 - [x] Implement `runAppendToNote()` in `AutomationEngine` (reads note, appends embed, writes back)
 - [x] Implement `runAddTagToCompanion()` in `AutomationEngine` (patches YAML frontmatter tags array)
 - [x] Add conditional UI in `SettingsTab.renderAutomations()`: show `targetNotePath` input when action = `append_to_note`, `tagName` input when action = `add_tag_to_companion`
+
+---
+
+## Phase 5 — Periodic Notes Integration & Template Power
+
+### 16. Periodic Notes Settings Tab
+
+**Checklist:**
+- [x] Add `PeriodicNotesPaths` interface and `periodicNotesPaths` to `PluginSettings` / `DEFAULT_SETTINGS`
+- [x] Add "Periodic Notes" section in `SettingsTab.ts` with one path input per period (daily/weekly/monthly/quarterly/yearly)
+- [x] Each field accepts a path with `{{...}}` moment.js tokens (e.g. `Journal/Weekly/{{YYYY}}-{{[W]WW}}`)
+
+---
+
+### 17. Periodic Note Embed Automation Actions
+
+**Checklist:**
+- [x] Add `"embed_to_weekly_note" | "embed_to_monthly_note" | "embed_to_quarterly_note" | "embed_to_yearly_note"` to `AutomationActionType`
+- [x] Add `createdTime?: string` to `DriveFile`; add `driveCreatedTime?: string` to `ManifestEntry`
+- [x] Store `driveCreatedTime` in manifest during `processEntry()`; pass to `automationEngine.runForFile()`
+- [x] Add `embedToPeriodicNote()` in `AutomationEngine` — resolves date from filename then `driveCreatedTime`, looks up note via `periodicNotesPaths[period]`
+- [x] Add new action types to automation dropdown in `SettingsTab`
+- [x] `embed_to_daily_note` now falls back to `periodicNotesPaths.daily` when `dailyNoteNamePattern` is empty
+
+---
+
+### 18. Embed Companion Note Toggle
+
+**Checklist:**
+- [x] Add `embedCompanion?: boolean` to `AutomationAction`
+- [x] Pass `companionPath` through `runAction()` → all embed handlers; use companion basename when flag is true
+- [x] Add toggle "Embed companion note instead of file" in automation action UI (visible for all embed types)
+
+---
+
+### 19. Path Tokens in Companion Note Target Path
+
+**Checklist:**
+- [x] Add `resolvePathTokens()` to `CompanionNoteManager` — resolves `{{RootFolder}}`, `{{folderL1}}`, `{{folderL2}}`, `{{folderLN}}`
+- [x] Token mode activates when `companionNotesFolder` contains `{{`; in token mode the resolved path is used as-is
+- [x] Add placeholder hint text in settings: `Notes/{{RootFolder}}/{{folderL1}}`
+
+---
+
+### 27. Per-Pair Companion Note Template & Folder
+
+**Checklist:**
+- [x] Add `companionNotesFolder?: string` and `companionNoteTemplatePath?: string` to `SyncPair`
+- [x] `CompanionNoteManager.companionPath()` respects per-pair folder override (with token support)
+- [x] `CompanionNoteManager.loadTemplate()` respects per-pair template override
+- [x] Per-pair companion folder and template fields added under "Advanced overrides" in each pair card
+
+---

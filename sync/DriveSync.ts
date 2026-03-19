@@ -109,7 +109,12 @@ export class DriveSync {
 		const effectiveCompanionEnabled = pair.companionNotesEnabled ?? this.settings.companionNotesEnabled;
 
 		console.log(`${LOG} Collecting files from Drive folder: ${pair.driveFolderId}`);
-		const driveEntries = await this.collectFiles(pair.driveFolderId, "", token, pair.excludedSubfolders ?? []);
+		const driveEntries = await this.collectFiles(
+			pair.driveFolderId, "", token,
+			pair.excludedSubfolders ?? [],
+			pair.excludeRootFiles ?? false,
+			pair.rootFilesOnly ?? false
+		);
 		console.log(`${LOG} Found ${driveEntries.length} PDF(s) in Drive for pair "${pair.label}"`);
 
 		const seenIds = new Set<string>();
@@ -252,11 +257,12 @@ export class DriveSync {
 					vaultPath,
 					companionPath,
 					driveModifiedTime: entry.file.modifiedTime,
+					driveCreatedTime: entry.file.createdTime,
 					pairId: pair.id,
 				});
 
 				if (this.automationEngine) {
-					await this.automationEngine.runForFile(vaultPath, companionPath);
+					await this.automationEngine.runForFile(vaultPath, companionPath, entry.file.createdTime);
 				}
 
 				console.log(`${LOG} Downloaded: ${displayPath}`);
@@ -376,38 +382,55 @@ export class DriveSync {
 		folderId: string,
 		relPath: string,
 		token: string,
-		excludedSubfolders: string[] = []
+		excludedSubfolders: string[] = [],
+		excludeRootFiles = false,
+		rootFilesOnly = false
 	): Promise<DriveFileEntry[]> {
 		console.log(`${LOG} Listing folder id=${folderId} relPath="${relPath}"`);
 
+		const isRoot = relPath === "";
+
+		// If rootFilesOnly we still need to list subfolders at root to know their IDs,
+		// but we never recurse — so skip fetching subfolders when not at root.
 		const [files, subfolders] = await Promise.all([
 			this.listItems<DriveFile>(
 				token,
 				`'${folderId}' in parents and mimeType='application/pdf' and trashed=false`,
-				"files(id,name,modifiedTime,size)"
+				"files(id,name,modifiedTime,createdTime,size)"
 			),
-			this.listItems<DriveFolder>(
-				token,
-				`'${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
-				"files(id,name)"
-			),
+			rootFilesOnly && !isRoot
+				? Promise.resolve([] as DriveFolder[])
+				: this.listItems<DriveFolder>(
+					token,
+					`'${folderId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`,
+					"files(id,name)"
+				),
 		]);
 
 		console.log(
 			`${LOG} Folder "${relPath || "root"}": ${files.length} PDF(s), ${subfolders.length} subfolder(s)`
 		);
 
-		const entries: DriveFileEntry[] = files.map((f) => ({ file: f, relPath }));
+		// excludeRootFiles: skip files that sit directly in the pair root
+		const entries: DriveFileEntry[] =
+			(excludeRootFiles && isRoot)
+				? (console.log(`${LOG} Skipping ${files.length} root-level file(s) (excludeRootFiles=true)`), [])
+				: files.map((f) => ({ file: f, relPath }));
 
-		for (const folder of subfolders) {
-			const childRelPath = relPath ? `${relPath}/${folder.name}` : folder.name;
-			if (excludedSubfolders.includes(folder.name) || excludedSubfolders.includes(childRelPath)) {
-				console.log(`${LOG} Skipping excluded subfolder: ${childRelPath}`);
-				continue;
+		// rootFilesOnly: never recurse into subfolders
+		if (!rootFilesOnly) {
+			for (const folder of subfolders) {
+				const childRelPath = relPath ? `${relPath}/${folder.name}` : folder.name;
+				if (excludedSubfolders.includes(folder.name) || excludedSubfolders.includes(childRelPath)) {
+					console.log(`${LOG} Skipping excluded subfolder: ${childRelPath}`);
+					continue;
+				}
+				console.log(`${LOG} Descending into subfolder: ${childRelPath}`);
+				const childEntries = await this.collectFiles(
+					folder.id, childRelPath, token, excludedSubfolders, excludeRootFiles, rootFilesOnly
+				);
+				entries.push(...childEntries);
 			}
-			console.log(`${LOG} Descending into subfolder: ${childRelPath}`);
-			const childEntries = await this.collectFiles(folder.id, childRelPath, token, excludedSubfolders);
-			entries.push(...childEntries);
 		}
 
 		return entries;

@@ -1,10 +1,12 @@
 import { App, getAllTags, TFile } from "obsidian";
-import { Automation, AutomationAction, PluginSettings } from "../types";
+import { Automation, AutomationAction, PeriodicNotesPaths, PluginSettings } from "../types";
 
 const LOG = "[DriveSync/Automation]";
 
 // Obsidian bundles moment.js as a global
 declare const moment: (date: string, format: string) => { format(pattern: string): string };
+
+type PeriodicPeriod = "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
 
 export class AutomationEngine {
 	constructor(private app: App, private settings: PluginSettings) {}
@@ -13,7 +15,11 @@ export class AutomationEngine {
 		this.settings = settings;
 	}
 
-	async runForFile(vaultPath: string, companionPath?: string | null): Promise<void> {
+	async runForFile(
+		vaultPath: string,
+		companionPath?: string | null,
+		driveCreatedTime?: string
+	): Promise<void> {
 		const matching = this.settings.automations.filter(
 			(a) => a.enabled && this.matchesTrigger(a, vaultPath)
 		);
@@ -25,7 +31,7 @@ export class AutomationEngine {
 				`${LOG} Running automation "${automation.name}" for: ${vaultPath}`
 			);
 			try {
-				await this.runAction(automation.action, vaultPath, companionPath);
+				await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime);
 			} catch (e) {
 				console.error(
 					`${LOG} Automation "${automation.name}" failed for "${vaultPath}":`,
@@ -51,11 +57,24 @@ export class AutomationEngine {
 
 	// ── Actions ─────────────────────────────────────────────────────────────────
 
-	private async runAction(action: AutomationAction, vaultPath: string, companionPath?: string | null): Promise<void> {
+	private async runAction(
+		action: AutomationAction,
+		vaultPath: string,
+		companionPath?: string | null,
+		driveCreatedTime?: string
+	): Promise<void> {
 		if (action.type === "embed_to_daily_note") {
-			await this.embedToDailyNote(vaultPath, action);
+			await this.embedToDailyNote(vaultPath, companionPath, action, driveCreatedTime);
+		} else if (action.type === "embed_to_weekly_note") {
+			await this.embedToPeriodicNote("weekly", vaultPath, companionPath, action, driveCreatedTime);
+		} else if (action.type === "embed_to_monthly_note") {
+			await this.embedToPeriodicNote("monthly", vaultPath, companionPath, action, driveCreatedTime);
+		} else if (action.type === "embed_to_quarterly_note") {
+			await this.embedToPeriodicNote("quarterly", vaultPath, companionPath, action, driveCreatedTime);
+		} else if (action.type === "embed_to_yearly_note") {
+			await this.embedToPeriodicNote("yearly", vaultPath, companionPath, action, driveCreatedTime);
 		} else if (action.type === "append_to_note") {
-			await this.runAppendToNote(vaultPath, action);
+			await this.runAppendToNote(vaultPath, companionPath, action);
 		} else if (action.type === "add_tag_to_companion") {
 			await this.runAddTagToCompanion(companionPath, action);
 		}
@@ -63,20 +82,24 @@ export class AutomationEngine {
 
 	private async embedToDailyNote(
 		vaultPath: string,
-		action: AutomationAction
+		companionPath: string | null | undefined,
+		action: AutomationAction,
+		driveCreatedTime?: string
 	): Promise<void> {
 		const fileName = vaultPath.split("/").pop();
 		if (!fileName) return;
 
-		const dateStr = this.extractDate(fileName);
+		const dateStr = this.resolveDate(fileName, driveCreatedTime);
 		if (!dateStr) {
-			console.log(`${LOG} No YYYY-MM-DD date found in filename: ${fileName}`);
+			console.log(`${LOG} No date found for daily note embed: ${fileName}`);
 			return;
 		}
-		console.log(`${LOG} Extracted date "${dateStr}" from "${fileName}"`);
 
-		const dailyNote = action.dailyNoteNamePattern
-			? this.findDailyNoteByName(dateStr, action.dailyNoteNamePattern)
+		// Prefer per-action pattern; fall back to periodicNotesPaths.daily
+		const pattern = action.dailyNoteNamePattern || this.settings.periodicNotesPaths.daily;
+
+		const dailyNote = pattern
+			? this.findNoteByPattern(dateStr, pattern)
 			: this.findDailyNoteByFrontmatter(dateStr);
 
 		if (!dailyNote) {
@@ -85,11 +108,48 @@ export class AutomationEngine {
 		}
 
 		console.log(`${LOG} Found daily note: ${dailyNote.path}`);
-		await this.insertEmbed(dailyNote, fileName, action.insertPosition);
+		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
+		await this.insertEmbed(dailyNote, embedTarget, action.insertPosition);
+	}
+
+	private async embedToPeriodicNote(
+		period: PeriodicPeriod,
+		vaultPath: string,
+		companionPath: string | null | undefined,
+		action: AutomationAction,
+		driveCreatedTime?: string
+	): Promise<void> {
+		const fileName = vaultPath.split("/").pop();
+		if (!fileName) return;
+
+		const dateStr = this.resolveDate(fileName, driveCreatedTime);
+		if (!dateStr) {
+			console.log(`${LOG} No date found for ${period} note embed: ${fileName}`);
+			return;
+		}
+
+		const pathTemplate = this.settings.periodicNotesPaths[period];
+		if (!pathTemplate) {
+			console.log(`${LOG} No path configured for ${period} notes — skipping. Set it in Settings → Periodic Notes.`);
+			return;
+		}
+
+		const resolvedPath = this.resolveDatePattern(pathTemplate, dateStr);
+		const note = this.findNoteByPath(resolvedPath);
+
+		if (!note) {
+			console.log(`${LOG} No ${period} note found for date ${dateStr} (looked for "${resolvedPath}")`);
+			return;
+		}
+
+		console.log(`${LOG} Found ${period} note: ${note.path}`);
+		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
+		await this.insertEmbed(note, embedTarget, action.insertPosition);
 	}
 
 	private async runAppendToNote(
 		vaultPath: string,
+		companionPath: string | null | undefined,
 		action: AutomationAction
 	): Promise<void> {
 		if (!action.targetNotePath) {
@@ -102,7 +162,8 @@ export class AutomationEngine {
 			return;
 		}
 		const fileName = vaultPath.split("/").pop() ?? vaultPath;
-		await this.insertEmbed(target, fileName, action.insertPosition);
+		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
+		await this.insertEmbed(target, embedTarget, action.insertPosition);
 	}
 
 	private async runAddTagToCompanion(
@@ -133,6 +194,26 @@ export class AutomationEngine {
 		}
 	}
 
+	// ── Embed target resolution ──────────────────────────────────────────────────
+
+	/**
+	 * Return the basename (without extension) to embed.
+	 * When embedCompanion is true and a companion exists, embed the companion note;
+	 * otherwise embed the PDF file.
+	 */
+	private resolveEmbedTarget(
+		pdfFileName: string,
+		companionPath: string | null | undefined,
+		action: AutomationAction
+	): string {
+		if (action.embedCompanion && companionPath) {
+			// Return companion note basename without .md
+			const companionBase = companionPath.split("/").pop() ?? companionPath;
+			return companionBase.replace(/\.md$/i, "");
+		}
+		return pdfFileName;
+	}
+
 	/**
 	 * Patch a YAML frontmatter block to include `tag` in the `tags:` array.
 	 * Handles both list and inline array forms. Creates `tags:` if missing.
@@ -140,27 +221,22 @@ export class AutomationEngine {
 	private addTagToFrontmatter(content: string, tag: string): string {
 		const fmMatch = content.match(/^---\n([\s\S]*?)\n---\n/);
 		if (!fmMatch) {
-			// No frontmatter — prepend minimal block
 			return `---\ntags:\n  - ${tag}\n---\n${content}`;
 		}
 
 		const fmBody = fmMatch[1];
 		const fmEnd = fmMatch[0].length;
 
-		// Check if tag is already present
 		if (new RegExp(`(^|\\s)#?${tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\s|$)`, "m").test(fmBody)) {
 			return content;
 		}
 
-		// Look for an existing tags: key
 		const listTagsMatch = fmBody.match(/^(tags:\s*\n(?:[ \t]+-[^\n]*\n)*)/m);
 		if (listTagsMatch) {
-			// Append to the list
 			const insertAt = content.indexOf(listTagsMatch[0]) + listTagsMatch[0].length;
 			return content.slice(0, insertAt) + `  - ${tag}\n` + content.slice(insertAt);
 		}
 
-		// Inline array form: tags: [foo, bar]
 		const inlineTagsMatch = fmBody.match(/^(tags:\s*\[)(.*?)(\])/m);
 		if (inlineTagsMatch) {
 			const fullMatch = inlineTagsMatch[0];
@@ -171,25 +247,48 @@ export class AutomationEngine {
 			return content.replace(fullMatch, replacement);
 		}
 
-		// No tags key — append before closing ---
 		const newFmBody = fmBody + `\ntags:\n  - ${tag}`;
 		return `---\n${newFmBody}\n---\n` + content.slice(fmEnd);
 	}
 
-	// ── Daily note finders ───────────────────────────────────────────────────────
+	// ── Note finders ─────────────────────────────────────────────────────────────
 
-	/** Find by computing the expected basename from a moment.js format pattern. */
-	private findDailyNoteByName(dateStr: string, namePattern: string): TFile | null {
-		const expectedName = this.resolveDatePattern(namePattern, dateStr);
-		console.log(`${LOG} Looking for daily note with name: "${expectedName}"`);
+	/**
+	 * Find a note by its resolved path (with or without .md) or by basename.
+	 * Used for periodic note lookups where the path template gives the full location.
+	 */
+	private findNoteByPath(resolvedPath: string): TFile | null {
+		// Try full path first (with and without .md)
+		const withMd = resolvedPath.endsWith(".md") ? resolvedPath : resolvedPath + ".md";
+		const candidate = this.app.vault.getAbstractFileByPath(withMd);
+		if (candidate instanceof TFile) return candidate;
 
+		// Fallback: search by basename
+		const expectedBasename = resolvedPath.split("/").pop() ?? resolvedPath;
 		for (const file of this.app.vault.getMarkdownFiles()) {
-			if (file.basename === expectedName) return file;
+			if (file.basename === expectedBasename) return file;
 		}
 		return null;
 	}
 
-	/** Find by frontmatter date + periodic/daily tag (fallback when no name pattern set). */
+	/** Find by computing the expected basename from a moment.js-style {{token}} pattern. */
+	private findNoteByPattern(dateStr: string, pattern: string): TFile | null {
+		const expectedName = this.resolveDatePattern(pattern, dateStr);
+		console.log(`${LOG} Looking for note with name: "${expectedName}"`);
+
+		// Try path lookup first (pattern may include folder segments)
+		const byPath = this.findNoteByPath(expectedName);
+		if (byPath) return byPath;
+
+		// Fallback: basename-only search
+		const basename = expectedName.split("/").pop() ?? expectedName;
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			if (file.basename === basename) return file;
+		}
+		return null;
+	}
+
+	/** Find daily note by frontmatter date + periodic/daily tag (fallback). */
 	private findDailyNoteByFrontmatter(dateStr: string): TFile | null {
 		for (const file of this.app.vault.getMarkdownFiles()) {
 			const cache = this.app.metadataCache.getFileCache(file);
@@ -209,10 +308,10 @@ export class AutomationEngine {
 
 	private async insertEmbed(
 		note: TFile,
-		pdfFileName: string,
+		embedTarget: string,
 		position: "top" | "bottom"
 	): Promise<void> {
-		const embed = `![[${pdfFileName}]]`;
+		const embed = `![[${embedTarget}]]`;
 		const content = await this.app.vault.read(note);
 
 		if (content.includes(embed)) {
@@ -224,7 +323,6 @@ export class AutomationEngine {
 		if (position === "bottom") {
 			newContent = content.trimEnd() + "\n\n" + embed + "\n";
 		} else {
-			// Insert after closing frontmatter delimiter (\n---\n)
 			const fmEnd = content.indexOf("\n---\n", 3);
 			if (fmEnd !== -1) {
 				const insertPos = fmEnd + 5;
@@ -238,7 +336,7 @@ export class AutomationEngine {
 		}
 
 		await this.app.vault.modify(note, newContent);
-		console.log(`${LOG} Embedded "${pdfFileName}" into ${note.path} (${position})`);
+		console.log(`${LOG} Embedded "${embedTarget}" into ${note.path} (${position})`);
 	}
 
 	// ── Helpers ──────────────────────────────────────────────────────────────────
@@ -250,9 +348,19 @@ export class AutomationEngine {
 	}
 
 	/**
+	 * Resolve a date string for automation use.
+	 * Tries the filename first; falls back to driveCreatedTime if provided.
+	 */
+	private resolveDate(fileName: string, driveCreatedTime?: string): string | null {
+		return (
+			this.extractDate(fileName) ??
+			(driveCreatedTime ? this.extractDate(driveCreatedTime) ?? driveCreatedTime.substring(0, 10) : null)
+		);
+	}
+
+	/**
 	 * Resolve {{token}} placeholders in a pattern string using the given date.
 	 * Each {{...}} block is passed to moment().format(); everything else is literal.
-	 * If dateStr is null or moment is unavailable, returns the pattern as-is.
 	 */
 	private resolveDatePattern(pattern: string, dateStr: string | null): string {
 		if (!dateStr) return pattern;

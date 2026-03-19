@@ -32,25 +32,55 @@ export class CompanionNoteManager {
 
 	/**
 	 * Compute where the companion note for a given PDF should live.
-	 * If companionNotesFolder is set: <root>/<pair.label>/<relPath>/<stem>.md
-	 * If empty: <pair.vaultDestFolder>/<relPath>/<stem>.md  (alongside PDF)
+	 *
+	 * Effective folder resolution order:
+	 *   1. pair.companionNotesFolder (per-pair override)
+	 *   2. settings.companionNotesFolder (global)
+	 *   3. empty → place alongside the PDF
+	 *
+	 * If the resolved folder contains `{{...}}` tokens, they are resolved
+	 * using the PDF's vault path segments:
+	 *   {{RootFolder}} → first path segment (e.g. "Boox")
+	 *   {{folderL1}}   → direct parent dir of the file (e.g. "Active")
+	 *   {{folderL2}}   → grandparent dir (e.g. "Books")
+	 *   {{folderLN}}   → Nth level up from the file
+	 *
+	 * In token mode (folder contains `{{`) the resolved folder is used as-is
+	 * (no safeLabel/relPath appended) — tokens provide full location control.
+	 * In classic mode the old behaviour applies: <folder>/<safeLabel>/<relPath>/.
 	 */
 	companionPath(pair: SyncPair, relPath: string, pdfName: string): string {
 		const stem = pdfName.replace(/\.pdf$/i, "");
-		const safeLabel = pair.label.replace(/[/\\:*?"<>|]/g, "_");
 
-		let base: string;
-		if (this.settings.companionNotesFolder) {
-			base = relPath
-				? `${this.settings.companionNotesFolder}/${safeLabel}/${relPath}`
-				: `${this.settings.companionNotesFolder}/${safeLabel}`;
+		const effectiveFolder = (
+			pair.companionNotesFolder !== undefined
+				? pair.companionNotesFolder
+				: this.settings.companionNotesFolder
+		).trim();
+
+		if (effectiveFolder) {
+			if (effectiveFolder.includes("{{")) {
+				// Token mode — resolve tokens and use folder as the full base path
+				const pdfVaultPath = relPath
+					? `${pair.vaultDestFolder}/${relPath}/${pdfName}`
+					: `${pair.vaultDestFolder}/${pdfName}`;
+				const resolvedFolder = this.resolvePathTokens(effectiveFolder, pdfVaultPath);
+				return `${resolvedFolder}/${stem}.md`;
+			} else {
+				// Classic mode — append safeLabel + relPath
+				const safeLabel = pair.label.replace(/[/\\:*?"<>|]/g, "_");
+				const base = relPath
+					? `${effectiveFolder}/${safeLabel}/${relPath}`
+					: `${effectiveFolder}/${safeLabel}`;
+				return `${base}/${stem}.md`;
+			}
 		} else {
-			base = relPath
+			// No folder — place alongside the PDF
+			const base = relPath
 				? `${pair.vaultDestFolder}/${relPath}`
 				: pair.vaultDestFolder;
+			return `${base}/${stem}.md`;
 		}
-
-		return `${base}/${stem}.md`;
 	}
 
 	/**
@@ -66,7 +96,7 @@ export class CompanionNoteManager {
 		const notePath = this.companionPath(pair, relPath, file.name);
 		console.log(`${LOG} Creating companion note: ${notePath}`);
 
-		const template = await this.loadTemplate();
+		const template = await this.loadTemplate(pair);
 		const content = this.renderTemplate(template, file, pair, relPath, pdfVaultPath);
 
 		await this.ensureFolder(notePath);
@@ -108,7 +138,6 @@ export class CompanionNoteManager {
 
 	/**
 	 * Rename a companion note (called when its associated PDF is renamed in Drive).
-	 * Returns the new path.
 	 */
 	async rename(oldPath: string, newPath: string): Promise<void> {
 		console.log(`${LOG} Renaming companion note: ${oldPath} → ${newPath}`);
@@ -124,8 +153,44 @@ export class CompanionNoteManager {
 		console.log(`${LOG} Companion note renamed to: ${newPath}`);
 	}
 
-	private async loadTemplate(): Promise<string> {
-		const templatePath = this.settings.companionNoteTemplatePath.trim();
+	// ── Private helpers ───────────────────────────────────────────────────────
+
+	/**
+	 * Resolve {{RootFolder}}, {{folderL1}}, {{folderL2}} … tokens in a path template
+	 * using the segments of the PDF's vault path (directory part only).
+	 *
+	 * Given vaultFilePath = "Boox/Books/Active/file.pdf":
+	 *   dirs = ["Boox", "Books", "Active"]
+	 *   {{RootFolder}} → "Boox"   (dirs[0])
+	 *   {{folderL1}}   → "Active" (dirs[dirs.length - 1], direct parent)
+	 *   {{folderL2}}   → "Books"  (dirs[dirs.length - 2])
+	 */
+	private resolvePathTokens(template: string, vaultFilePath: string): string {
+		const parts = vaultFilePath.split("/");
+		parts.pop(); // strip filename
+		const dirs = parts.filter(Boolean);
+
+		return template.replace(/\{\{([^}]+)\}\}/g, (match, token: string) => {
+			if (token === "RootFolder") return dirs[0] ?? "";
+			const lm = token.match(/^folderL(\d+)$/);
+			if (lm) {
+				const level = parseInt(lm[1], 10);
+				return dirs[dirs.length - level] ?? "";
+			}
+			return match; // leave unrecognised tokens as-is
+		});
+	}
+
+	/**
+	 * Load the template for a given pair, respecting per-pair override then global.
+	 */
+	private async loadTemplate(pair?: SyncPair): Promise<string> {
+		const templatePath = (
+			pair?.companionNoteTemplatePath !== undefined
+				? pair.companionNoteTemplatePath
+				: this.settings.companionNoteTemplatePath
+		).trim();
+
 		if (!templatePath) return DEFAULT_TEMPLATE;
 
 		try {

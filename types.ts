@@ -2,6 +2,7 @@ export interface DriveFile {
 	id: string;
 	name: string;
 	modifiedTime: string; // ISO 8601
+	createdTime?: string; // ISO 8601 — used as date fallback in automations
 	size?: string;
 }
 
@@ -25,20 +26,38 @@ export interface SyncPair {
 	vaultDestFolder: string;
 	enabled: boolean;
 	excludedSubfolders?: string[];
+	/** Skip files sitting directly in the Drive folder root; only sync files inside subfolders. */
+	excludeRootFiles?: boolean;
+	/** Only sync files directly in the Drive folder root; ignore all subfolders. */
+	rootFilesOnly?: boolean;
 	// Per-pair overrides (undefined = fall back to global setting)
 	deletionBehavior?: DeletionBehavior;
 	archiveFolder?: string;
 	companionNotesEnabled?: boolean;
+	/** Override global companionNotesFolder for this pair. Supports {{RootFolder}}, {{folderL1}}, {{folderL2}} tokens. */
+	companionNotesFolder?: string;
+	/** Override global companionNoteTemplatePath for this pair. */
+	companionNoteTemplatePath?: string;
 }
 
 export interface ManifestEntry {
 	vaultPath: string;
 	companionPath: string | null;
 	driveModifiedTime: string; // ISO 8601
+	driveCreatedTime?: string; // ISO 8601 — used as date fallback in automations
 	pairId: string;
 }
 
 export type SyncManifest = Record<string, ManifestEntry>; // key = driveFileId
+
+/** Vault path templates for each periodic note type. Supports moment.js tokens wrapped in {{}}. */
+export interface PeriodicNotesPaths {
+	daily: string;      // e.g. "Journal/Daily/{{YYYY}}-{{MM}}-{{DD}}"
+	weekly: string;     // e.g. "Journal/Weekly/{{YYYY}}-{{[W]WW}}"
+	monthly: string;    // e.g. "Journal/Monthly/{{YYYY}}-{{MM}}"
+	quarterly: string;  // e.g. "Journal/Quarterly/{{YYYY}}-Q{{Q}}"
+	yearly: string;     // e.g. "Journal/Yearly/{{YYYY}}"
+}
 
 export interface PluginSettings {
 	clientId: string;
@@ -66,8 +85,11 @@ export interface PluginSettings {
 
 	// Companion notes (global)
 	companionNotesEnabled: boolean;
-	companionNotesFolder: string;      // empty = alongside PDF
+	companionNotesFolder: string;      // empty = alongside PDF; supports {{RootFolder}}, {{folderL1}}, {{folderL2}}
 	companionNoteTemplatePath: string; // vault path to .md template; empty = built-in default
+
+	// Periodic notes paths (used by embed_to_weekly_note etc.)
+	periodicNotesPaths: PeriodicNotesPaths;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -87,25 +109,41 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	companionNotesEnabled: false,
 	companionNotesFolder: "",
 	companionNoteTemplatePath: "",
+	periodicNotesPaths: {
+		daily: "",
+		weekly: "",
+		monthly: "",
+		quarterly: "",
+		yearly: "",
+	},
 };
 
 // ── Automations ───────────────────────────────────────────────────────────────
 
-export type AutomationActionType = "embed_to_daily_note" | "append_to_note" | "add_tag_to_companion";
+export type AutomationActionType =
+	| "embed_to_daily_note"
+	| "embed_to_weekly_note"
+	| "embed_to_monthly_note"
+	| "embed_to_quarterly_note"
+	| "embed_to_yearly_note"
+	| "append_to_note"
+	| "add_tag_to_companion";
 
 export interface AutomationAction {
 	type: AutomationActionType;
 	insertPosition: "top" | "bottom"; // top = after frontmatter, bottom = end of note
 	/**
 	 * Moment.js format pattern used to find the daily note by filename.
-	 * e.g. "YYYY-MM-DD" matches "2026-03-18.md".
-	 * Leave empty to fall back to frontmatter (date: YYYY-MM-DD + periodic/daily tag).
+	 * e.g. "{{YYYY}}-{{MM}}-{{DD}}" matches "2026-03-18.md".
+	 * Leave empty to use periodicNotesPaths.daily from settings.
 	 */
 	dailyNoteNamePattern: string;
 	/** For append_to_note: vault path to the target note (e.g. "MOCs/All PDFs.md"). */
 	targetNotePath?: string;
 	/** For add_tag_to_companion: tag to add to the companion note's frontmatter tags array. */
 	tagName?: string;
+	/** When true, embed the companion note instead of the PDF file. */
+	embedCompanion?: boolean;
 }
 
 export interface Automation {
