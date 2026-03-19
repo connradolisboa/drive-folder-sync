@@ -171,15 +171,14 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				drop
 					.addOption("keep", "Keep in vault")
 					.addOption("delete", "Move to system trash")
+					.addOption("delete_keep_companion", "Move to system trash (keep companion note)")
 					.addOption("archive", "Move to archive folder")
+					.addOption("archive_keep_companion", "Move to archive folder (keep companion note)")
 					.setValue(this.plugin.settings.deletionBehavior)
 					.onChange(async (val) => {
-						this.plugin.settings.deletionBehavior = val as
-							| "keep"
-							| "delete"
-							| "archive";
+						this.plugin.settings.deletionBehavior = val as DeletionBehavior;
 						await this.plugin.saveSettings();
-						archiveSetting.settingEl.toggle(val === "archive");
+						archiveSetting.settingEl.toggle(val === "archive" || val === "archive_keep_companion");
 					});
 			});
 
@@ -197,7 +196,8 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			);
 
 		archiveSetting.settingEl.toggle(
-			this.plugin.settings.deletionBehavior === "archive"
+			this.plugin.settings.deletionBehavior === "archive" ||
+			this.plugin.settings.deletionBehavior === "archive_keep_companion"
 		);
 
 		// ── Companion notes ───────────────────────────────────────────────
@@ -583,13 +583,15 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.addOption("", "— use global —")
 						.addOption("keep", "Keep in vault")
 						.addOption("delete", "Move to system trash")
+						.addOption("delete_keep_companion", "Move to system trash (keep companion note)")
 						.addOption("archive", "Move to archive folder")
+						.addOption("archive_keep_companion", "Move to archive folder (keep companion note)")
 						.setValue(pair.deletionBehavior ?? "")
 						.onChange(async (val) => {
 							this.plugin.settings.syncPairs[i].deletionBehavior =
 								val ? val as DeletionBehavior : undefined;
 							await this.plugin.saveSettings();
-							pairArchivePathSetting.settingEl.toggle(val === "archive");
+							pairArchivePathSetting.settingEl.toggle(val === "archive" || val === "archive_keep_companion");
 						});
 				});
 
@@ -605,7 +607,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 							await this.plugin.saveSettings();
 						})
 				);
-			pairArchivePathSetting.settingEl.toggle(pair.deletionBehavior === "archive");
+			pairArchivePathSetting.settingEl.toggle(pair.deletionBehavior === "archive" || pair.deletionBehavior === "archive_keep_companion");
 
 			new Setting(advancedEl)
 				.setName("Companion notes (override)")

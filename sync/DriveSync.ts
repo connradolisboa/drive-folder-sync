@@ -326,19 +326,27 @@ export class DriveSync {
 		deletionBehavior: DeletionBehavior,
 		archiveFolder: string
 	): Promise<void> {
+		const keepCompanion =
+			deletionBehavior === "delete_keep_companion" ||
+			deletionBehavior === "archive_keep_companion";
+		const effectivePdfBehavior: DeletionBehavior =
+			deletionBehavior === "delete_keep_companion" ? "delete" :
+			deletionBehavior === "archive_keep_companion" ? "archive" :
+			deletionBehavior;
+
 		// Remove PDF
 		const pdfFile = this.app.vault.getAbstractFileByPath(entry.vaultPath);
 		if (pdfFile instanceof TFile) {
-			await this.removeFile(pdfFile, entry.vaultPath, pair, deletionBehavior, archiveFolder);
+			await this.removeFile(pdfFile, entry.vaultPath, pair, effectivePdfBehavior, archiveFolder);
 		} else {
 			console.warn(`${LOG} File not found in vault — skipping remove: ${entry.vaultPath}`);
 		}
 
-		// Remove companion note
-		if (entry.companionPath) {
+		// Remove companion note (skip if behavior is set to keep it)
+		if (entry.companionPath && !keepCompanion) {
 			const compFile = this.app.vault.getAbstractFileByPath(entry.companionPath);
 			if (compFile instanceof TFile) {
-				await this.removeFile(compFile, entry.companionPath, pair, deletionBehavior, archiveFolder);
+				await this.removeFile(compFile, entry.companionPath, pair, effectivePdfBehavior, archiveFolder);
 			} else {
 				console.warn(
 					`${LOG} Companion note not found — skipping remove: ${entry.companionPath}`

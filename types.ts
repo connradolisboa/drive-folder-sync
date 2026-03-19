@@ -17,7 +17,12 @@ export interface DriveCredentials {
 	expiry: number; // Unix ms
 }
 
-export type DeletionBehavior = "keep" | "delete" | "archive";
+export type DeletionBehavior =
+	| "keep"
+	| "delete"
+	| "archive"
+	| "delete_keep_companion"
+	| "archive_keep_companion";
 
 export interface SyncPair {
 	id: string;
