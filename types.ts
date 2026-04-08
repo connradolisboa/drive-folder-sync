@@ -165,6 +165,13 @@ export interface AutomationAction {
 	tagName?: string;
 	/** When true, embed the companion note instead of the PDF file. */
 	embedCompanion?: boolean;
+	/**
+	 * Template for the line inserted into the target note.
+	 * Supports: {{embed}} → ![[target]], {{link}} → [[target]],
+	 *           {{target}} → embed target name, {{title}} → PDF stem, {{date}} → YYYY-MM-DD.
+	 * Leave empty to use the default: ![[target]].
+	 */
+	embedTemplate?: string;
 	/** For link_to_matching_note: vault folder to search for notes whose basename contains all words of the PDF stem. */
 	searchFolderPath?: string;
 	/** For link_to_matching_note: when true, create a new note if no matching note is found. */

@@ -1234,6 +1234,29 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
+			const embedTemplateSetting = new Setting(bodyEl)
+				.setName("Embed template")
+				.setDesc(
+					"Template for the content inserted into the note. Supports multiple lines. " +
+					"Leave empty for the default (![[file]]). " +
+					"Placeholders: {{embed}} → ![[target]], {{link}} → [[target]], " +
+					"{{target}} → embed target name, {{title}} → PDF stem (no extension), {{date}} → YYYY-MM-DD."
+				)
+				.addTextArea((text) => {
+					text
+						.setPlaceholder("- {{embed}}")
+						.setValue(automation.action.embedTemplate ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.embedTemplate =
+								val.trim() || undefined;
+							await this.plugin.saveSettings();
+						});
+					text.inputEl.rows = 4;
+					text.inputEl.style.width = "100%";
+					text.inputEl.style.fontFamily = "monospace";
+					text.inputEl.style.resize = "vertical";
+				});
+
 			const isEmbedType = (type: AutomationActionType) =>
 				type === "embed_to_daily_note" ||
 				type === "embed_to_weekly_note" ||
@@ -1255,6 +1278,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				newNoteTemplateSetting.settingEl.toggle(isLinkToNote && createEnabled);
 				insertPositionSetting.settingEl.toggle(isEmbedType(type));
 				embedCompanionSetting.settingEl.toggle(isEmbedType(type) && !isLinkToNote);
+				embedTemplateSetting.settingEl.toggle(isEmbedType(type));
 			};
 			updateActionFieldVisibility(automation.action.type);
 		});

@@ -127,7 +127,9 @@ export class AutomationEngine {
 
 		console.log(`${LOG} Found daily note: ${dailyNote.path}`);
 		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
-		await this.insertEmbed(dailyNote, embedTarget, action.insertPosition);
+		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
+		const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
+		await this.insertEmbed(dailyNote, line, action.insertPosition);
 	}
 
 	private async embedToPeriodicNote(
@@ -162,7 +164,9 @@ export class AutomationEngine {
 
 		console.log(`${LOG} Found ${period} note: ${note.path}`);
 		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
-		await this.insertEmbed(note, embedTarget, action.insertPosition);
+		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
+		const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
+		await this.insertEmbed(note, line, action.insertPosition);
 	}
 
 	private async runAppendToNote(
@@ -181,7 +185,10 @@ export class AutomationEngine {
 		}
 		const fileName = vaultPath.split("/").pop() ?? vaultPath;
 		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
-		await this.insertEmbed(target, embedTarget, action.insertPosition);
+		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
+		const dateStr = this.extractDate(fileName);
+		const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
+		await this.insertEmbed(target, line, action.insertPosition);
 	}
 
 	private async runAddTagToCompanion(
@@ -244,9 +251,11 @@ export class AutomationEngine {
 			return;
 		}
 
+		const dateStr = this.extractDate(fileName);
+		const matchLine = this.buildEmbedLine(action.embedTemplate, fileName, stem, dateStr);
 		for (const note of matches) {
 			console.log(`${LOG} link_to_matching_note: inserting embed into ${note.path}`);
-			await this.insertEmbed(note, fileName, action.insertPosition);
+			await this.insertEmbed(note, matchLine, action.insertPosition);
 		}
 	}
 
@@ -261,9 +270,11 @@ export class AutomationEngine {
 
 		// If the note already exists (e.g. renamed after last sync), just link it
 		const existing = this.app.vault.getAbstractFileByPath(notePath);
+		const dateStr = this.extractDate(fileName);
+		const embedLine = this.buildEmbedLine(action.embedTemplate, fileName, stem, dateStr);
 		if (existing instanceof TFile) {
 			console.log(`${LOG} link_to_matching_note: note already exists at "${notePath}", inserting embed`);
-			await this.insertEmbed(existing, fileName, action.insertPosition);
+			await this.insertEmbed(existing, embedLine, action.insertPosition);
 			return;
 		}
 
@@ -289,10 +300,36 @@ export class AutomationEngine {
 
 		const newNote = await this.app.vault.create(notePath, content);
 		console.log(`${LOG} link_to_matching_note: created new note at "${notePath}"`);
-		await this.insertEmbed(newNote, fileName, action.insertPosition);
+		await this.insertEmbed(newNote, embedLine, action.insertPosition);
 	}
 
 	// ── Embed target resolution ──────────────────────────────────────────────────
+
+	/**
+	 * Build the full line to insert into the target note.
+	 * If no template is set, falls back to `![[embedTarget]]`.
+	 * Available placeholders:
+	 *   {{embed}}  → ![[embedTarget]]
+	 *   {{link}}   → [[embedTarget]]
+	 *   {{target}} → embedTarget as-is
+	 *   {{title}}  → PDF stem (no extension)
+	 *   {{date}}   → resolved date string, or empty
+	 */
+	private buildEmbedLine(
+		template: string | undefined,
+		embedTarget: string,
+		pdfStem: string,
+		dateStr?: string | null
+	): string {
+		if (!template) return `![[${embedTarget}]]`;
+		const date = dateStr ?? "";
+		return template
+			.replace(/\{\{embed\}\}/g, `![[${embedTarget}]]`)
+			.replace(/\{\{link\}\}/g, `[[${embedTarget}]]`)
+			.replace(/\{\{target\}\}/g, embedTarget)
+			.replace(/\{\{title\}\}/g, pdfStem)
+			.replace(/\{\{date\}\}/g, date);
+	}
 
 	/**
 	 * Return the basename (without extension) to embed.
@@ -406,35 +443,34 @@ export class AutomationEngine {
 
 	private async insertEmbed(
 		note: TFile,
-		embedTarget: string,
+		line: string,
 		position: "top" | "bottom"
 	): Promise<void> {
-		const embed = `![[${embedTarget}]]`;
 		const content = await this.app.vault.read(note);
 
-		if (content.includes(embed)) {
+		if (content.includes(line)) {
 			console.log(`${LOG} Embed already present in ${note.path} — skipping`);
 			return;
 		}
 
 		let newContent: string;
 		if (position === "bottom") {
-			newContent = content.trimEnd() + "\n\n" + embed + "\n";
+			newContent = content.trimEnd() + "\n\n" + line + "\n";
 		} else {
 			const fmEnd = content.indexOf("\n---\n", 3);
 			if (fmEnd !== -1) {
 				const insertPos = fmEnd + 5;
 				newContent =
 					content.slice(0, insertPos) +
-					"\n" + embed + "\n\n" +
+					"\n" + line + "\n\n" +
 					content.slice(insertPos);
 			} else {
-				newContent = embed + "\n\n" + content;
+				newContent = line + "\n\n" + content;
 			}
 		}
 
 		await this.app.vault.modify(note, newContent);
-		console.log(`${LOG} Embedded "${embedTarget}" into ${note.path} (${position})`);
+		console.log(`${LOG} Inserted line "${line}" into ${note.path} (${position})`);
 	}
 
 	// ── Helpers ──────────────────────────────────────────────────────────────────
