@@ -50,20 +50,34 @@ export class SyncStatusView extends ItemView {
 		const ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : "unknown";
 		contentEl.createEl("p", { text: `Last sync: ${ts}` });
 
+		const summaryParts = [
+			`${r.downloaded} downloaded`,
+			`${r.skipped} up to date`,
+			...(( r.moved ?? 0) > 0 ? [`${r.moved} moved`] : []),
+			`${r.removed} removed`,
+			...((r.archived ?? 0) > 0 ? [`${r.archived} archived`] : []),
+			`${r.errors} errors`,
+		];
 		const summary = contentEl.createEl("p");
-		summary.textContent =
-			`Total — ${r.downloaded} downloaded, ${r.skipped} up to date, ` +
-			`${r.removed} removed, ${r.errors} errors`;
+		summary.textContent = `Total — ${summaryParts.join(", ")}`;
 
 		if (r.pairs && Object.keys(r.pairs).length > 0) {
 			contentEl.createEl("h5", { text: "Per-pair breakdown" });
+
+			const showMoved = Object.values(r.pairs).some((pr) => (pr.moved ?? 0) > 0);
+			const showArchived = Object.values(r.pairs).some((pr) => (pr.archived ?? 0) > 0);
 
 			const table = contentEl.createEl("table");
 			table.style.cssText = "width: 100%; border-collapse: collapse;";
 
 			const thead = table.createEl("thead");
 			const headerRow = thead.createEl("tr");
-			["Pair", "Downloaded", "Up to date", "Removed", "Errors"].forEach((h) => {
+			const headers = ["Pair", "Downloaded", "Up to date"];
+			if (showMoved) headers.push("Moved");
+			headers.push("Removed");
+			if (showArchived) headers.push("Archived");
+			headers.push("Errors");
+			headers.forEach((h) => {
 				const th = headerRow.createEl("th", { text: h });
 				th.style.cssText =
 					"text-align: left; padding: 4px 8px; " +
@@ -77,12 +91,15 @@ export class SyncStatusView extends ItemView {
 			for (const [pairId, pr] of Object.entries(r.pairs)) {
 				const label = pairLabelMap[pairId] ?? pairId;
 				const tr = tbody.createEl("tr");
-				[label, String(pr.downloaded), String(pr.skipped), String(pr.removed), String(pr.errors)].forEach(
-					(val) => {
-						const td = tr.createEl("td", { text: val });
-						td.style.cssText = "padding: 4px 8px;";
-					}
-				);
+				const cells = [label, String(pr.downloaded), String(pr.skipped)];
+				if (showMoved) cells.push(String(pr.moved ?? 0));
+				cells.push(String(pr.removed));
+				if (showArchived) cells.push(String(pr.archived ?? 0));
+				cells.push(String(pr.errors));
+				cells.forEach((val) => {
+					const td = tr.createEl("td", { text: val });
+					td.style.cssText = "padding: 4px 8px;";
+				});
 			}
 		}
 	}

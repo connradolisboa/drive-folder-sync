@@ -57,4 +57,34 @@ export class SyncManifestStore {
 	allForPair(pairId: string): [string, ManifestEntry][] {
 		return this.entries().filter(([, entry]) => entry.pairId === pairId);
 	}
+
+	findByVaultPath(path: string): [string, ManifestEntry] | undefined {
+		return this.entries().find(([, entry]) => entry.vaultPath === path);
+	}
+
+	findByCompanionPath(path: string): [string, ManifestEntry] | undefined {
+		return this.entries().find(([, entry]) => entry.companionPath === path);
+	}
+
+	/**
+	 * Update vaultPath or companionPath in-memory when the user renames a file in the vault.
+	 * Returns true if an entry was updated.
+	 */
+	healRename(oldPath: string, newPath: string): boolean {
+		const byVault = this.findByVaultPath(oldPath);
+		if (byVault) {
+			const [id, entry] = byVault;
+			this.data[id] = { ...entry, vaultPath: newPath };
+			console.log(`${LOG} Healed vault rename: "${oldPath}" → "${newPath}"`);
+			return true;
+		}
+		const byCompanion = this.findByCompanionPath(oldPath);
+		if (byCompanion) {
+			const [id, entry] = byCompanion;
+			this.data[id] = { ...entry, companionPath: newPath };
+			console.log(`${LOG} Healed companion rename: "${oldPath}" → "${newPath}"`);
+			return true;
+		}
+		return false;
+	}
 }

@@ -374,6 +374,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					.addOption("keep", "Keep in vault")
 					.addOption("delete", "Move to system trash")
 					.addOption("delete_keep_companion", "Move to system trash (keep companion note)")
+					.addOption("delete_only_companion", "Keep PDF, delete companion note only")
 					.addOption("archive", "Move to archive folder")
 					.addOption("archive_keep_companion", "Move to archive folder (keep companion note)")
 					.setValue(this.plugin.settings.deletionBehavior)
@@ -401,6 +402,35 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			this.plugin.settings.deletionBehavior === "archive" ||
 			this.plugin.settings.deletionBehavior === "archive_keep_companion"
 		);
+
+		// ── Drive Archive folder ───────────────────────────────────────────
+		el.createEl("h3", { text: "Drive Archive folder" });
+		el.createEl("p", {
+			text:
+				"Designate a Drive folder as an archive destination. Files moved there are not downloaded " +
+				"but are detected during sync — use the per-pair setting below to control what happens to " +
+				"the local vault copy when a file is archived in Drive.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(el)
+			.setName("Drive Archive folder ID")
+			.setDesc(
+				"Folder ID or URL of your Drive archive folder. " +
+				"Leave empty to disable. You can paste the full Drive URL here."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("Folder ID or paste full URL")
+					.setValue(this.plugin.settings.driveArchiveFolderId)
+					.onChange(async (val) => {
+						const match = val.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+						const id = match ? match[1] : val.trim();
+						if (match) text.setValue(id);
+						this.plugin.settings.driveArchiveFolderId = id;
+						await this.plugin.saveSettings();
+					})
+			);
 
 		// ── Sync log ──────────────────────────────────────────────────────
 		el.createEl("h3", { text: "Sync log" });
@@ -447,7 +477,9 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						new Notice(
 							`Sync complete — ${result.downloaded} downloaded, ` +
 							`${result.skipped} up to date` +
+							((result.moved ?? 0) > 0 ? `, ${result.moved} moved` : "") +
 							(result.removed > 0 ? `, ${result.removed} removed` : "") +
+							((result.archived ?? 0) > 0 ? `, ${result.archived} archived` : "") +
 							(result.errors > 0 ? `, ${result.errors} errors` : "")
 						);
 					} catch (e) {
@@ -661,7 +693,9 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					new Notice(
 						`"${pair.label}" — ${result.downloaded} downloaded, ` +
 						`${result.skipped} up to date` +
+						((result.moved ?? 0) > 0 ? `, ${result.moved} moved` : "") +
 						(result.removed > 0 ? `, ${result.removed} removed` : "") +
+						((result.archived ?? 0) > 0 ? `, ${result.archived} archived` : "") +
 						(result.errors > 0 ? `, ${result.errors} errors` : "")
 					);
 				} catch (e) {
@@ -788,6 +822,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.addOption("keep", "Keep in vault")
 						.addOption("delete", "Move to system trash")
 						.addOption("delete_keep_companion", "Move to system trash (keep companion note)")
+						.addOption("delete_only_companion", "Keep PDF, delete companion note only")
 						.addOption("archive", "Move to archive folder")
 						.addOption("archive_keep_companion", "Move to archive folder (keep companion note)")
 						.setValue(pair.deletionBehavior ?? "")
@@ -812,6 +847,31 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 			pairArchivePathSetting.settingEl.toggle(pair.deletionBehavior === "archive" || pair.deletionBehavior === "archive_keep_companion");
+
+			const driveArchiveBehaviorSetting = new Setting(advancedEl)
+				.setName("Drive archive behavior (override)")
+				.setDesc(
+					"What to do with the vault copy when a file moves to the Drive Archive folder. " +
+					"Leave unset to use this pair's deletion behavior. " +
+					"Only applies when a Drive Archive folder ID is configured globally."
+				)
+				.addDropdown((drop) => {
+					drop
+						.addOption("", "— use deletion behavior —")
+						.addOption("keep", "Do nothing (keep in vault)")
+						.addOption("delete", "Move to system trash")
+						.addOption("delete_keep_companion", "Move to system trash (keep companion note)")
+						.addOption("delete_only_companion", "Keep PDF, delete companion note only")
+						.addOption("archive", "Move to local archive folder")
+						.addOption("archive_keep_companion", "Move to local archive folder (keep companion note)")
+						.setValue(pair.driveArchiveBehavior ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].driveArchiveBehavior =
+								val ? val as DeletionBehavior : undefined;
+							await this.plugin.saveSettings();
+						});
+				});
+			driveArchiveBehaviorSetting.settingEl.toggle(!!this.plugin.settings.driveArchiveFolderId);
 
 			new Setting(advancedEl)
 				.setName("Companion notes (override)")

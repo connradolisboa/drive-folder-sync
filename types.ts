@@ -22,7 +22,8 @@ export type DeletionBehavior =
 	| "delete"
 	| "archive"
 	| "delete_keep_companion"
-	| "archive_keep_companion";
+	| "archive_keep_companion"
+	| "delete_only_companion";
 
 export interface SyncPair {
 	id: string;
@@ -38,6 +39,12 @@ export interface SyncPair {
 	// Per-pair overrides (undefined = fall back to global setting)
 	deletionBehavior?: DeletionBehavior;
 	archiveFolder?: string;
+	/**
+	 * What to do with the vault copy when a file is detected in the Drive archive folder.
+	 * Overrides deletionBehavior for archive-triggered removals.
+	 * undefined = fall back to the pair's effective deletionBehavior.
+	 */
+	driveArchiveBehavior?: DeletionBehavior;
 	companionNotesEnabled?: boolean;
 	/** Override global companionNotesFolder for this pair. Supports {{RootFolder}}, {{folderL1}}, {{folderL2}} tokens. */
 	companionNotesFolder?: string;
@@ -83,6 +90,9 @@ export interface PluginSettings {
 	deletionBehavior: DeletionBehavior;
 	archiveFolder: string;
 
+	/** Google Drive folder ID used as a global archive destination. Files moved here trigger driveArchiveBehavior. */
+	driveArchiveFolderId: string;
+
 	// Sync log
 	syncLogEnabled: boolean;
 	syncLogPath: string;
@@ -112,6 +122,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	automations: [],
 	deletionBehavior: "keep",
 	archiveFolder: "Drive Sync Archive",
+	driveArchiveFolderId: "",
 	syncLogEnabled: false,
 	syncLogPath: "Drive Sync/.sync-log.md",
 	companionNotesEnabled: false,
@@ -187,6 +198,10 @@ export interface SyncResult {
 	skipped: number;
 	errors: number;
 	removed: number;
+	/** Files relocated within the vault because they moved in Drive (no re-download). */
+	moved?: number;
+	/** Files removed from vault because they moved to the Drive archive folder. */
+	archived?: number;
 	timestamp?: number;
 	pairs?: Record<string, SyncResult>;
 	/** Populated in dry-run mode: paths that would be downloaded. */

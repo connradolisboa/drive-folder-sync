@@ -12,15 +12,17 @@ export class SyncLogger {
 		if (!this.settings.syncLogEnabled) return;
 		const path = normalizePath(this.settings.syncLogPath || "Drive Sync/.sync-log.md");
 		const timestamp = new Date(result.timestamp ?? Date.now()).toISOString();
+		const moved = result.moved ?? 0;
+		const archived = result.archived ?? 0;
 		const row =
-			`| ${timestamp} | ${result.downloaded} | ${result.skipped} | ${result.removed} | ${result.errors} |\n`;
+			`| ${timestamp} | ${result.downloaded} | ${result.skipped} | ${moved} | ${result.removed} | ${archived} | ${result.errors} |\n`;
 
 		const exists = await this.app.vault.adapter.exists(path);
 		if (!exists) {
 			await this.ensureParentFolder(path);
 			const header =
-				"| Timestamp | Downloaded | Skipped | Removed | Errors |\n" +
-				"| --- | --- | --- | --- | --- |\n";
+				"| Timestamp | Downloaded | Skipped | Moved | Removed | Archived | Errors |\n" +
+				"| --- | --- | --- | --- | --- | --- | --- |\n";
 			await this.app.vault.create(path, header + row);
 		} else {
 			const file = this.app.vault.getAbstractFileByPath(path);

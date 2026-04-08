@@ -30,6 +30,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	async onload() {
 		console.log(`${LOG} Loading plugin`);
 		await this.loadSettings();
+
 		console.log(`${LOG} Settings loaded:`, {
 			syncPairs: this.settings.syncPairs.length,
 			syncIntervalMinutes: this.settings.syncIntervalMinutes,
@@ -40,6 +41,10 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		});
 
 		this.manifestStore = new SyncManifestStore(this.app);
+		// Load manifest at startup so vault rename events are healable immediately
+		await this.manifestStore.load().catch((e) =>
+			console.error(`${LOG} Failed to pre-load manifest:`, e)
+		);
 		this.companionManager = new CompanionNoteManager(this.app, this.settings);
 		this.automationEngine = new AutomationEngine(this.app, this.settings);
 		this.syncLogger = new SyncLogger(this.app, this.settings);
@@ -83,6 +88,18 @@ export default class DriveFolderSyncPlugin extends Plugin {
 
 		this.addSettingTab(new DriveSyncSettingTab(this.app, this));
 
+		// Heal manifest when user manually moves/renames a synced file in the vault
+		this.registerEvent(
+			this.app.vault.on("rename", async (file, oldPath) => {
+				const healed = this.manifestStore.healRename(oldPath, file.path);
+				if (healed) {
+					await this.manifestStore.save().catch((e) =>
+						console.error(`${LOG} Failed to save manifest after rename heal:`, e)
+					);
+				}
+			})
+		);
+
 		const isAuthorized = await this.auth.isAuthorized();
 		console.log(`${LOG} Authorized: ${isAuthorized}`);
 
@@ -114,7 +131,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	async runSync(dryRun = false): Promise<SyncResult> {
 		if (this.syncing) {
 			console.log(`${LOG} runSync called while already syncing — skipped`);
-			return { downloaded: 0, skipped: 0, errors: 0, removed: 0 };
+			return { downloaded: 0, skipped: 0, errors: 0, removed: 0, moved: 0, archived: 0 };
 		}
 		this.syncing = true;
 		console.log(`${LOG} Sync started${dryRun ? " (dry run)" : ""}`);
@@ -140,7 +157,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	async runSyncForPair(pairId: string): Promise<SyncResult> {
 		if (this.syncing) {
 			console.log(`${LOG} runSyncForPair called while already syncing — skipped`);
-			return { downloaded: 0, skipped: 0, errors: 0, removed: 0 };
+			return { downloaded: 0, skipped: 0, errors: 0, removed: 0, moved: 0, archived: 0 };
 		}
 		this.syncing = true;
 		console.log(`${LOG} Single-pair sync started: ${pairId}`);
@@ -224,7 +241,9 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		return (
 			`Drive sync complete — ${result.downloaded} downloaded, ` +
 			`${result.skipped} up to date` +
+			((result.moved ?? 0) > 0 ? `, ${result.moved} moved` : "") +
 			(result.removed > 0 ? `, ${result.removed} removed` : "") +
+			((result.archived ?? 0) > 0 ? `, ${result.archived} archived` : "") +
 			(result.errors > 0 ? `, ${result.errors} errors` : "")
 		);
 	}

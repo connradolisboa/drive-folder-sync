@@ -44,6 +44,8 @@ export class DriveSync {
 			skipped: 0,
 			errors: 0,
 			removed: 0,
+			moved: 0,
+			archived: 0,
 			timestamp: Date.now(),
 			pairs: {},
 			...(dryRun ? { wouldDownload: [], wouldRemove: [] } : {}),
@@ -54,23 +56,72 @@ export class DriveSync {
 		);
 		console.log(`${LOG} Active sync pairs: ${activePairs.length}${dryRun ? " (dry run)" : ""}`);
 
+		// Pre-collect Drive archive folder IDs (one API call, shared across all pairs)
+		const archivedIds = this.settings.driveArchiveFolderId
+			? await this.collectArchiveIds(token)
+			: new Set<string>();
+		if (archivedIds.size > 0) {
+			console.log(`${LOG} Drive archive folder contains ${archivedIds.size} tracked file(s)`);
+		}
+
+		// ── Phase 1: process files for ALL pairs ─────────────────────────────
+		// Must complete before any deletion pass so cross-pair moves update pairId
+		// in the manifest before Pair 1's deletion pass runs.
+		const pairSeenIds = new Map<string, Set<string>>();
+		const globalSeenIds = new Set<string>();
+
 		for (const pair of activePairs) {
-			console.log(`${LOG} Processing pair "${pair.label}" → "${pair.vaultDestFolder}"`);
+			console.log(`${LOG} [Phase 1] Processing pair "${pair.label}" → "${pair.vaultDestFolder}"`);
 			try {
-				const pairResult = await this.syncPair(pair, token, dryRun);
+				const { pairResult, seenIds } = await this.syncPairFiles(pair, token, dryRun);
+				pairSeenIds.set(pair.id, seenIds);
+				seenIds.forEach((id) => globalSeenIds.add(id));
 				result.downloaded += pairResult.downloaded;
 				result.skipped += pairResult.skipped;
+				result.moved! += pairResult.moved ?? 0;
 				result.errors += pairResult.errors;
-				result.removed += pairResult.removed;
 				result.pairs![pair.id] = pairResult;
 				if (dryRun) {
 					result.wouldDownload!.push(...(pairResult.wouldDownload ?? []));
-					result.wouldRemove!.push(...(pairResult.wouldRemove ?? []));
 				}
 			} catch (e) {
-				console.error(`${LOG} Pair "${pair.label}" failed:`, e);
+				console.error(`${LOG} Pair "${pair.label}" file processing failed:`, e);
 				result.errors++;
-				result.pairs![pair.id] = { downloaded: 0, skipped: 0, errors: 1, removed: 0 };
+				result.pairs![pair.id] = { downloaded: 0, skipped: 0, errors: 1, removed: 0, moved: 0, archived: 0 };
+			}
+		}
+
+		// ── Phase 2: deletion passes for ALL pairs ───────────────────────────
+		if (!dryRun) {
+			for (const pair of activePairs) {
+				const seenIds = pairSeenIds.get(pair.id) ?? new Set<string>();
+				try {
+					const delResult = await this.runDeletionPass(pair, seenIds, globalSeenIds, archivedIds);
+					result.removed += delResult.removed;
+					result.archived! += delResult.archived ?? 0;
+					result.errors += delResult.errors;
+					const pr = result.pairs![pair.id];
+					pr.removed = delResult.removed;
+					pr.archived = delResult.archived ?? 0;
+					pr.errors += delResult.errors;
+				} catch (e) {
+					console.error(`${LOG} Pair "${pair.label}" deletion pass failed:`, e);
+					result.errors++;
+				}
+			}
+		} else {
+			// Dry-run deletion pass
+			for (const pair of activePairs) {
+				const seenIds = pairSeenIds.get(pair.id) ?? new Set<string>();
+				const effectiveDeletionBehavior = pair.deletionBehavior ?? this.settings.deletionBehavior;
+				if (effectiveDeletionBehavior !== "keep") {
+					const pairEntries = this.manifest.allForPair(pair.id);
+					for (const [driveId, entry] of pairEntries) {
+						if (!globalSeenIds.has(driveId) && !seenIds.has(driveId)) {
+							result.wouldRemove!.push(entry.vaultPath);
+						}
+					}
+				}
 			}
 		}
 
@@ -87,26 +138,46 @@ export class DriveSync {
 		const pair = this.settings.syncPairs.find((p) => p.id === pairId);
 		if (!pair) throw new Error(`Sync pair not found: ${pairId}`);
 
+		const archivedIds = this.settings.driveArchiveFolderId
+			? await this.collectArchiveIds(token)
+			: new Set<string>();
+
 		console.log(`${LOG} Single-pair sync: "${pair.label}"`);
-		const result = await this.syncPair(pair, token);
+		const { pairResult, seenIds } = await this.syncPairFiles(pair, token);
+		// For single-pair sync, globalSeenIds = seenIds (no cross-pair awareness)
+		const delResult = await this.runDeletionPass(pair, seenIds, seenIds, archivedIds);
+
+		const result: SyncResult = {
+			...pairResult,
+			removed: delResult.removed,
+			archived: delResult.archived ?? 0,
+			errors: pairResult.errors + delResult.errors,
+			timestamp: Date.now(),
+		};
 
 		await this.manifest.save();
-		return { ...result, timestamp: Date.now() };
+		return result;
 	}
 
-	private async syncPair(pair: SyncPair, token: string, dryRun = false): Promise<SyncResult> {
-		const result: SyncResult = {
+	// ── Phase 1: collect + process files ──────────────────────────────────────
+
+	private async syncPairFiles(
+		pair: SyncPair,
+		token: string,
+		dryRun = false
+	): Promise<{ pairResult: SyncResult; seenIds: Set<string> }> {
+		const pairResult: SyncResult = {
 			downloaded: 0,
 			skipped: 0,
 			errors: 0,
 			removed: 0,
-			...(dryRun ? { wouldDownload: [], wouldRemove: [] } : {}),
+			moved: 0,
+			archived: 0,
+			...(dryRun ? { wouldDownload: [] } : {}),
 		};
 
-		// Resolve effective settings — pair override takes precedence over global
-		const effectiveDeletionBehavior = pair.deletionBehavior ?? this.settings.deletionBehavior;
-		const effectiveArchiveFolder = pair.archiveFolder ?? this.settings.archiveFolder;
-		const effectiveCompanionEnabled = pair.companionNotesEnabled ?? this.settings.companionNotesEnabled;
+		const effectiveCompanionEnabled =
+			pair.companionNotesEnabled ?? this.settings.companionNotesEnabled;
 
 		console.log(`${LOG} Collecting files from Drive folder: ${pair.driveFolderId}`);
 		const driveEntries = await this.collectFiles(
@@ -121,27 +192,16 @@ export class DriveSync {
 		for (const entry of driveEntries) seenIds.add(entry.file.id);
 
 		if (dryRun) {
-			// Dry run: classify entries without downloading
 			for (const entry of driveEntries) {
 				const displayPath = entry.relPath
 					? `${entry.relPath}/${entry.file.name}`
 					: entry.file.name;
 				const existing = this.manifest.get(entry.file.id);
-				const wouldDownload = !existing || entry.file.modifiedTime !== existing.driveModifiedTime;
-				if (wouldDownload) {
-					result.wouldDownload!.push(`${pair.label}: ${displayPath}`);
+				if (!existing || entry.file.modifiedTime !== existing.driveModifiedTime) {
+					pairResult.wouldDownload!.push(`${pair.label}: ${displayPath}`);
 				}
 			}
-			// Deletion dry-run pass
-			if (effectiveDeletionBehavior !== "keep") {
-				const pairEntries = this.manifest.allForPair(pair.id);
-				for (const [driveId, entry] of pairEntries) {
-					if (!seenIds.has(driveId)) {
-						result.wouldRemove!.push(entry.vaultPath);
-					}
-				}
-			}
-			return result;
+			return { pairResult, seenIds };
 		}
 
 		const concurrency = Math.max(1, Math.min(this.settings.downloadConcurrency ?? 5, 10));
@@ -154,33 +214,109 @@ export class DriveSync {
 		);
 
 		for (const r of entryResults) {
-			result.downloaded += r.downloaded;
-			result.skipped += r.skipped;
-			result.errors += r.errors;
+			pairResult.downloaded += r.downloaded;
+			pairResult.skipped += r.skipped;
+			pairResult.moved! += r.moved ?? 0;
+			pairResult.errors += r.errors;
 		}
 
-		// Deletion pass — manifest-driven
-		if (effectiveDeletionBehavior !== "keep") {
-			console.log(
-				`${LOG} Running deletion pass for pair "${pair.label}" (behavior: ${effectiveDeletionBehavior})`
-			);
-			const pairEntries = this.manifest.allForPair(pair.id);
-			for (const [driveId, entry] of pairEntries) {
-				if (!seenIds.has(driveId)) {
-					console.log(`${LOG} No longer in Drive — removing: ${entry.vaultPath}`);
-					try {
-						await this.removeEntry(entry, pair, effectiveDeletionBehavior, effectiveArchiveFolder);
-						this.manifest.delete(driveId);
-						result.removed++;
-					} catch (e) {
-						console.error(`${LOG} Failed to remove "${entry.vaultPath}":`, e);
-					}
+		return { pairResult, seenIds };
+	}
+
+	// ── Phase 2: deletion pass ────────────────────────────────────────────────
+
+	private async runDeletionPass(
+		pair: SyncPair,
+		seenIds: Set<string>,
+		globalSeenIds: Set<string>,
+		archivedIds: Set<string>
+	): Promise<SyncResult> {
+		const result: SyncResult = { downloaded: 0, skipped: 0, errors: 0, removed: 0, archived: 0 };
+
+		const effectiveDeletionBehavior = pair.deletionBehavior ?? this.settings.deletionBehavior;
+		const effectiveArchiveFolder = pair.archiveFolder ?? this.settings.archiveFolder;
+
+		// Skip deletion pass entirely if nothing will be done
+		if (effectiveDeletionBehavior === "keep" && !pair.driveArchiveBehavior) {
+			return result;
+		}
+
+		console.log(
+			`${LOG} Running deletion pass for pair "${pair.label}" (behavior: ${effectiveDeletionBehavior})`
+		);
+
+		const pairEntries = this.manifest.allForPair(pair.id);
+		for (const [driveId, entry] of pairEntries) {
+			if (seenIds.has(driveId)) continue; // still present in this pair
+
+			if (globalSeenIds.has(driveId)) {
+				// File moved to another pair — pairId already updated in processEntry;
+				// skip deletion so the other pair owns it.
+				console.log(`${LOG} File moved to another pair — skipping deletion: ${entry.vaultPath}`);
+				continue;
+			}
+
+			if (archivedIds.has(driveId)) {
+				// File moved to Drive archive folder
+				const archiveBehavior =
+					pair.driveArchiveBehavior ?? effectiveDeletionBehavior;
+				if (archiveBehavior === "keep") {
+					console.log(`${LOG} Drive-archived (behavior=keep): ${entry.vaultPath}`);
+					continue;
 				}
+				console.log(
+					`${LOG} Drive-archived (behavior=${archiveBehavior}): ${entry.vaultPath}`
+				);
+				try {
+					await this.removeEntry(entry, pair, archiveBehavior, effectiveArchiveFolder);
+					this.manifest.delete(driveId);
+					result.archived!++;
+				} catch (e) {
+					console.error(`${LOG} Failed to remove archived "${entry.vaultPath}":`, e);
+					result.errors++;
+				}
+				continue;
+			}
+
+			// File no longer in Drive at all
+			if (effectiveDeletionBehavior === "keep") continue;
+
+			console.log(`${LOG} No longer in Drive — removing: ${entry.vaultPath}`);
+			try {
+				await this.removeEntry(entry, pair, effectiveDeletionBehavior, effectiveArchiveFolder);
+				this.manifest.delete(driveId);
+				result.removed++;
+			} catch (e) {
+				console.error(`${LOG} Failed to remove "${entry.vaultPath}":`, e);
+				result.errors++;
 			}
 		}
 
 		return result;
 	}
+
+	// ── Archive folder pre-collection ─────────────────────────────────────────
+
+	private async collectArchiveIds(token: string): Promise<Set<string>> {
+		const folderId = this.settings.driveArchiveFolderId;
+		if (!folderId) return new Set();
+		try {
+			console.log(`${LOG} Listing Drive archive folder: ${folderId}`);
+			const files = await this.listItems<DriveFile>(
+				token,
+				`'${folderId}' in parents and mimeType='application/pdf' and trashed=false`,
+				"files(id)"
+			);
+			const ids = new Set(files.map((f) => f.id));
+			console.log(`${LOG} Drive archive folder: ${ids.size} PDF(s) found`);
+			return ids;
+		} catch (e) {
+			console.error(`${LOG} Failed to list Drive archive folder — skipping archive detection:`, e);
+			return new Set();
+		}
+	}
+
+	// ── Entry processing ──────────────────────────────────────────────────────
 
 	private async runConcurrent<T, R>(
 		items: T[],
@@ -208,7 +344,7 @@ export class DriveSync {
 		token: string,
 		companionEnabled: boolean
 	): Promise<SyncResult> {
-		const r: SyncResult = { downloaded: 0, skipped: 0, errors: 0, removed: 0 };
+		const r: SyncResult = { downloaded: 0, skipped: 0, errors: 0, removed: 0, moved: 0 };
 		const displayPath = entry.relPath
 			? `${entry.relPath}/${entry.file.name}`
 			: entry.file.name;
@@ -222,7 +358,7 @@ export class DriveSync {
 
 			const existing = this.manifest.get(entry.file.id);
 			if (existing && existing.vaultPath !== expectedVaultPath) {
-				console.log(`${LOG} Rename detected: "${existing.vaultPath}" → "${expectedVaultPath}"`);
+				console.log(`${LOG} Move detected: "${existing.vaultPath}" → "${expectedVaultPath}"`);
 				await this.handleRename(existing, entry, pair, expectedVaultPath, companionEnabled);
 			}
 
@@ -267,6 +403,9 @@ export class DriveSync {
 
 				console.log(`${LOG} Downloaded: ${displayPath}`);
 				r.downloaded++;
+			} else if (existing && existing.vaultPath !== expectedVaultPath) {
+				// Pure move — no content change, just relocated
+				r.moved!++;
 			} else {
 				console.log(`${LOG} Up to date, skipping: ${displayPath}`);
 				r.skipped++;
@@ -304,20 +443,23 @@ export class DriveSync {
 			);
 			if (newCompanionPath !== existing.companionPath) {
 				await this.companion.rename(existing.companionPath, newCompanionPath);
-				// Update manifest entry immediately so downstream code sees the new companion path
+				// Update manifest immediately — pairId updated to current pair
 				this.manifest.set(entry.file.id, {
 					...existing,
 					vaultPath: newVaultPath,
 					companionPath: newCompanionPath,
+					pairId: pair.id,
 				});
+				return;
 			}
-		} else {
-			// Update just the vault path
-			this.manifest.set(entry.file.id, {
-				...existing,
-				vaultPath: newVaultPath,
-			});
 		}
+
+		// Update vault path and pairId (covers both within-pair and cross-pair moves)
+		this.manifest.set(entry.file.id, {
+			...existing,
+			vaultPath: newVaultPath,
+			pairId: pair.id,
+		});
 	}
 
 	private async removeEntry(
@@ -329,24 +471,32 @@ export class DriveSync {
 		const keepCompanion =
 			deletionBehavior === "delete_keep_companion" ||
 			deletionBehavior === "archive_keep_companion";
+		const onlyCompanion = deletionBehavior === "delete_only_companion";
+
 		const effectivePdfBehavior: DeletionBehavior =
 			deletionBehavior === "delete_keep_companion" ? "delete" :
 			deletionBehavior === "archive_keep_companion" ? "archive" :
+			deletionBehavior === "delete_only_companion" ? "keep" :
 			deletionBehavior;
 
-		// Remove PDF
-		const pdfFile = this.app.vault.getAbstractFileByPath(entry.vaultPath);
-		if (pdfFile instanceof TFile) {
-			await this.removeFile(pdfFile, entry.vaultPath, pair, effectivePdfBehavior, archiveFolder);
-		} else {
-			console.warn(`${LOG} File not found in vault — skipping remove: ${entry.vaultPath}`);
+		// Remove (or keep) PDF
+		if (!onlyCompanion) {
+			const pdfFile = this.app.vault.getAbstractFileByPath(entry.vaultPath);
+			if (pdfFile instanceof TFile) {
+				await this.removeFile(pdfFile, entry.vaultPath, pair, effectivePdfBehavior, archiveFolder);
+			} else {
+				console.warn(`${LOG} File not found in vault — skipping remove: ${entry.vaultPath}`);
+			}
 		}
 
-		// Remove companion note (skip if behavior is set to keep it)
+		// Remove companion note
 		if (entry.companionPath && !keepCompanion) {
 			const compFile = this.app.vault.getAbstractFileByPath(entry.companionPath);
 			if (compFile instanceof TFile) {
-				await this.removeFile(compFile, entry.companionPath, pair, effectivePdfBehavior, archiveFolder);
+				// For delete_only_companion, always delete (not archive) the companion
+				const companionBehavior: DeletionBehavior =
+					onlyCompanion ? "delete" : effectivePdfBehavior;
+				await this.removeFile(compFile, entry.companionPath, pair, companionBehavior, archiveFolder);
 			} else {
 				console.warn(
 					`${LOG} Companion note not found — skipping remove: ${entry.companionPath}`
@@ -374,6 +524,7 @@ export class DriveSync {
 			await this.ensureFolder(archiveDir);
 			await this.app.fileManager.renameFile(file, archivePath);
 		}
+		// "keep" and "delete_only_companion" for PDF: do nothing
 	}
 
 	private computeVaultPath(
@@ -398,8 +549,6 @@ export class DriveSync {
 
 		const isRoot = relPath === "";
 
-		// If rootFilesOnly we still need to list subfolders at root to know their IDs,
-		// but we never recurse — so skip fetching subfolders when not at root.
 		const [files, subfolders] = await Promise.all([
 			this.listItems<DriveFile>(
 				token,
@@ -419,13 +568,11 @@ export class DriveSync {
 			`${LOG} Folder "${relPath || "root"}": ${files.length} PDF(s), ${subfolders.length} subfolder(s)`
 		);
 
-		// excludeRootFiles: skip files that sit directly in the pair root
 		const entries: DriveFileEntry[] =
 			(excludeRootFiles && isRoot)
 				? (console.log(`${LOG} Skipping ${files.length} root-level file(s) (excludeRootFiles=true)`), [])
 				: files.map((f) => ({ file: f, relPath }));
 
-		// rootFilesOnly: never recurse into subfolders
 		if (!rootFilesOnly) {
 			for (const folder of subfolders) {
 				const childRelPath = relPath ? `${relPath}/${folder.name}` : folder.name;
