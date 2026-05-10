@@ -799,6 +799,18 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
+			new Setting(bodyEl)
+				.setName("Collapse single-file folders")
+				.setDesc("Strip a wrapper folder when it has the same name as the file inside it. e.g. Books/My Book/My Book.pdf → Books/My Book.pdf")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(pair.collapseSingleFileFolder ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.syncPairs[i].collapseSingleFileFolder = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
 			// Advanced overrides (collapsible)
 			const advancedEl = bodyEl.createDiv();
 			advancedEl.style.display = "none";

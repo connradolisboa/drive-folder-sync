@@ -350,9 +350,13 @@ export class DriveSync {
 			: entry.file.name;
 
 		try {
+			const effectiveRelPath = pair.collapseSingleFileFolder
+				? this.collapseRelPath(entry.relPath, entry.file.name)
+				: entry.relPath;
+
 			const expectedVaultPath = this.computeVaultPath(
 				pair.vaultDestFolder,
-				entry.relPath,
+				effectiveRelPath,
 				entry.file.name
 			);
 
@@ -370,7 +374,7 @@ export class DriveSync {
 					entry.file,
 					token,
 					pair.vaultDestFolder,
-					entry.relPath
+					effectiveRelPath
 				);
 
 				let companionPath: string | null = null;
@@ -525,6 +529,15 @@ export class DriveSync {
 			await this.app.fileManager.renameFile(file, archivePath);
 		}
 		// "keep" and "delete_only_companion" for PDF: do nothing
+	}
+
+	private collapseRelPath(relPath: string, fileName: string): string {
+		if (!relPath) return relPath;
+		const parts = relPath.split("/");
+		const lastFolder = parts[parts.length - 1];
+		const fileStem = fileName.replace(/\.[^.]+$/, "");
+		if (lastFolder === fileStem) return parts.slice(0, -1).join("/");
+		return relPath;
 	}
 
 	private computeVaultPath(

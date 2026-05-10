@@ -36,6 +36,12 @@ export interface SyncPair {
 	excludeRootFiles?: boolean;
 	/** Only sync files directly in the Drive folder root; ignore all subfolders. */
 	rootFilesOnly?: boolean;
+	/**
+	 * When true, if a file's immediate parent folder has the same name as the file (without extension),
+	 * that wrapper folder is stripped from the vault path.
+	 * e.g. "Books/My Book/My Book.pdf" → "Books/My Book.pdf"
+	 */
+	collapseSingleFileFolder?: boolean;
 	// Per-pair overrides (undefined = fall back to global setting)
 	deletionBehavior?: DeletionBehavior;
 	archiveFolder?: string;
