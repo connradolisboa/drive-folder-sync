@@ -11,6 +11,8 @@ import { DriveSyncSettingTab } from "./settings/SettingsTab";
 import { AutomationEngine } from "./automation/AutomationEngine";
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from "./ui/SyncStatusView";
 import { DryRunModal } from "./ui/DryRunModal";
+import { FileTrackerModal } from "./ui/FileTrackerModal";
+import { TranscriptionStore } from "./ai/TranscriptionStore";
 import { transcribeCurrentFile } from "./commands/TranscribeCurrentFile";
 import { Automation, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
 
@@ -22,6 +24,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	scheduler: Scheduler;
 	lastSyncResult: SyncResult | null = null;
 	manifestStore: SyncManifestStore;
+	transcriptionStore: TranscriptionStore;
 	private driveSync: DriveSync;
 	private companionManager: CompanionNoteManager;
 	private automationEngine: AutomationEngine;
@@ -46,6 +49,10 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		await this.manifestStore.load().catch((e) =>
 			console.error(`${LOG} Failed to pre-load manifest:`, e)
 		);
+		this.transcriptionStore = new TranscriptionStore(this.app);
+		await this.transcriptionStore.load().catch((e) =>
+			console.error(`${LOG} Failed to pre-load transcription store:`, e)
+		);
 		this.companionManager = new CompanionNoteManager(this.app, this.settings);
 		this.automationEngine = new AutomationEngine(this.app, this.settings, this.manifestStore);
 		this.syncLogger = new SyncLogger(this.app, this.settings);
@@ -59,7 +66,8 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			this.app,
 			this.manifestStore,
 			this.companionManager,
-			this.automationEngine
+			this.automationEngine,
+			this.transcriptionStore
 		);
 		this.scheduler = new Scheduler();
 
@@ -85,6 +93,10 @@ export default class DriveFolderSyncPlugin extends Plugin {
 
 		this.addRibbonIcon("layout-dashboard", "Drive Sync Status", () => {
 			this.activateStatusView();
+		});
+
+		this.addRibbonIcon("file-search", "Drive Sync File Tracker", () => {
+			new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings).open();
 		});
 
 		this.addSettingTab(new DriveSyncSettingTab(this.app, this));
@@ -128,6 +140,37 @@ export default class DriveFolderSyncPlugin extends Plugin {
 				transcribeCurrentFile(this).catch((e) =>
 					new Notice(`Transcription failed: ${(e as Error).message}`)
 				);
+			},
+		});
+
+		this.addCommand({
+			id: "file-tracker",
+			name: "Open file tracker",
+			callback: () => {
+				new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings).open();
+			},
+		});
+
+		this.addCommand({
+			id: "force-full-retranscribe",
+			name: "Force full re-transcription of current file",
+			callback: () => {
+				const active = this.app.workspace.getActiveFile();
+				if (!active || !active.path.toLowerCase().endsWith(".pdf")) {
+					new Notice("Open a PDF file first.");
+					return;
+				}
+				const entry = this.manifestStore.findByVaultPath(active.path);
+				if (!entry) {
+					new Notice("This PDF is not tracked by Drive Sync.");
+					return;
+				}
+				const [driveFileId] = entry;
+				this.transcriptionStore.delete(driveFileId);
+				this.transcriptionStore.save().catch((e) =>
+					console.error(`${LOG} Failed to save transcription store after force-clear:`, e)
+				);
+				new Notice(`Transcription record cleared for "${active.basename}". Re-sync to re-transcribe.`);
 			},
 		});
 

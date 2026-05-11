@@ -195,11 +195,38 @@ class DestinationPickerModal extends Modal {
 			notice.hide();
 			await writeTranscription(this.app, destFile, transcription, mode, this.pdfFile.name);
 			new Notice(`Transcription written to "${destFile.name}"`);
+			await this.recordTranscription(pdfBytes, destFile);
 		} catch (e) {
 			notice.hide();
 			console.error(LOG, "Transcription failed:", e);
 			new Notice(`Transcription failed: ${(e as Error).message}`);
 		}
+	}
+
+	private async recordTranscription(pdfBytes: ArrayBuffer, destFile: TFile): Promise<void> {
+		const store = this.plugin.transcriptionStore;
+		if (!store) return;
+
+		const { analyzePdf } = await import("../ai/PdfPageHasher");
+		const info = analyzePdf(pdfBytes);
+
+		// Find Drive metadata for this PDF via the manifest
+		const manifestEntry = this.plugin.manifestStore.findByVaultPath(this.pdfFile.path);
+		const driveFileId = manifestEntry ? manifestEntry[0] : null;
+		const driveModifiedTime = manifestEntry ? manifestEntry[1].driveModifiedTime : "";
+
+		if (!driveFileId) return; // file not synced from Drive — skip tracking
+
+		const isCompanion = manifestEntry && manifestEntry[1].companionPath === destFile.path;
+		const isDaily = destFile.path.includes(moment().format("YYYY-MM-DD"));
+		const destType = isCompanion ? "companion" : isDaily ? "daily" : "note";
+
+		store.recordTranscription(driveFileId, this.pdfFile.path, info.hash, info.pageCount, driveModifiedTime, {
+			type: destType as "companion" | "daily" | "note",
+			path: destFile.path,
+			transcribedAt: new Date().toISOString(),
+		});
+		await store.save();
 	}
 }
 

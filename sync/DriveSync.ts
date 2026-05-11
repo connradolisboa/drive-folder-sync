@@ -6,6 +6,8 @@ import { CompanionNoteManager } from "./CompanionNoteManager";
 import { AutomationEngine } from "../automation/AutomationEngine";
 import { GeminiClient } from "../ai/GeminiClient";
 import { MistralClient } from "../ai/MistralClient";
+import { TranscriptionStore } from "../ai/TranscriptionStore";
+import { analyzePdf } from "../ai/PdfPageHasher";
 import {
 	DeletionBehavior,
 	DriveFile,
@@ -30,7 +32,8 @@ export class DriveSync {
 		private app: App,
 		private manifest: SyncManifestStore,
 		private companion: CompanionNoteManager,
-		private automationEngine?: AutomationEngine
+		private automationEngine?: AutomationEngine,
+		private transcriptionStore?: TranscriptionStore
 	) {}
 
 	updateSettings(settings: PluginSettings): void {
@@ -157,7 +160,10 @@ export class DriveSync {
 			}
 		}
 
-		if (!dryRun) await this.manifest.save();
+		if (!dryRun) {
+			await this.manifest.save();
+			await this.transcriptionStore?.save();
+		}
 		return result;
 	}
 
@@ -188,6 +194,7 @@ export class DriveSync {
 		};
 
 		await this.manifest.save();
+		await this.transcriptionStore?.save();
 		return result;
 	}
 
@@ -411,6 +418,7 @@ export class DriveSync {
 
 				// Attempt AI transcription (non-blocking on failure)
 				let transcription: string | undefined;
+				let pdfBytes: ArrayBuffer | null = null;
 				// Resolve companion path: manifest takes priority, then property-declared companion
 				const resolvedCompanionPath = existing?.companionPath
 					?? this.companion.findCompanionByProperty(vaultPath)
@@ -434,11 +442,19 @@ export class DriveSync {
 					}
 					if (!alreadyTranscribed) {
 						try {
-							const pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
+							pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
 							transcription = await gemini.transcribePdf(pdfBytes);
 						} catch (e) {
 							console.error(`${LOG} Gemini transcription failed for "${vaultPath}":`, e);
 						}
+					}
+				} else if (this.transcriptionStore?.get(entry.file.id)) {
+					// No transcription client active, but a prior transcription record exists.
+					// Read bytes to detect page-count changes since the last transcription.
+					try {
+						pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
+					} catch (e) {
+						console.error(`${LOG} Failed to read PDF for page-count update:`, e);
 					}
 				}
 
@@ -465,6 +481,27 @@ export class DriveSync {
 					driveCreatedTime: entry.file.createdTime,
 					pairId: pair.id,
 				});
+
+				// Update transcription tracking store
+				if (this.transcriptionStore && pdfBytes) {
+					const info = analyzePdf(pdfBytes);
+					if (transcription !== undefined) {
+						// A fresh transcription ran — record full details
+						const finalCompanionPath = companionPath ?? resolvedCompanionPath;
+						const dest = finalCompanionPath
+							? { type: "companion" as const, path: finalCompanionPath, transcribedAt: new Date().toISOString() }
+							: { type: "note" as const, path: vaultPath, transcribedAt: new Date().toISOString() };
+						this.transcriptionStore.recordTranscription(
+							entry.file.id, vaultPath, info.hash, info.pageCount,
+							entry.file.modifiedTime, dest
+						);
+					} else {
+						// No transcription this run — update page count for change detection
+						this.transcriptionStore.updateCurrentState(
+							entry.file.id, info.pageCount, entry.file.modifiedTime
+						);
+					}
+				}
 
 				if (this.automationEngine) {
 					// Fall back to manifest's stored companion path when companion notes are
