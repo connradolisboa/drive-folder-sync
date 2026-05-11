@@ -102,5 +102,19 @@ export class SyncStatusView extends ItemView {
 				});
 			}
 		}
+
+		if (r.conflicts?.length) {
+			contentEl.createEl("h5", { text: "Companion note conflicts" });
+			contentEl.createEl("p", {
+				text:
+					`${r.conflicts.length} companion note${r.conflicts.length !== 1 ? "s were" : " was"} ` +
+					"edited locally since the last sync. Conflict backups were created:",
+				cls: "setting-item-description",
+			});
+			const list = contentEl.createEl("ul");
+			for (const conflictPath of r.conflicts) {
+				list.createEl("li", { text: conflictPath });
+			}
+		}
 	}
 }

@@ -249,6 +249,19 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			})
 		);
 
+		// Detect user vault-side deletions — mark manifest entries so re-sync is skipped
+		this.registerEvent(
+			this.app.vault.on("delete", async (file) => {
+				const marked = this.manifestStore.markUserDeleted(file.path);
+				if (marked) {
+					console.log(`${LOG} User deleted tracked file: ${file.path}`);
+					await this.manifestStore.save().catch((e) =>
+						console.error(`${LOG} Failed to save manifest after user deletion:`, e)
+					);
+				}
+			})
+		);
+
 		const isAuthorized = await this.auth.isAuthorized();
 		console.log(`${LOG} Authorized: ${isAuthorized}`);
 

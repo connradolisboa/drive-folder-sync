@@ -519,6 +519,21 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			this.plugin.settings.deletionBehavior === "archive_keep_companion"
 		);
 
+		new Setting(el)
+			.setName("Re-download vault-deleted files when Drive updates them")
+			.setDesc(
+				"When you manually delete a file from your vault, Drive Sync won't re-download it. " +
+				"Enable this to re-download if the file's Drive version advances after your deletion."
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.redownloadUserDeleted ?? true)
+					.onChange(async (val) => {
+						this.plugin.settings.redownloadUserDeleted = val;
+						await this.plugin.saveSettings();
+					})
+			);
+
 		// ── Drive Archive folder ───────────────────────────────────────────
 		el.createEl("h3", { text: "Drive Archive folder" });
 		el.createEl("p", {

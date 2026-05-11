@@ -103,18 +103,23 @@ export class DriveSync {
 		// Must complete before any deletion pass so cross-pair moves update pairId
 		// in the manifest before Pair 1's deletion pass runs.
 		const pairSeenIds = new Map<string, Set<string>>();
+		const pairTrashedIds = new Map<string, Set<string>>();
 		const globalSeenIds = new Set<string>();
 
 		for (const pair of activePairs) {
 			console.log(`${LOG} [Phase 1] Processing pair "${pair.label}" → "${pair.vaultDestFolder}"`);
 			try {
-				const { pairResult, seenIds } = await this.syncPairFiles(pair, token, dryRun);
+				const { pairResult, seenIds, trashedIds } = await this.syncPairFiles(pair, token, dryRun);
 				pairSeenIds.set(pair.id, seenIds);
+				pairTrashedIds.set(pair.id, trashedIds);
 				seenIds.forEach((id) => globalSeenIds.add(id));
 				result.downloaded += pairResult.downloaded;
 				result.skipped += pairResult.skipped;
 				result.moved! += pairResult.moved ?? 0;
 				result.errors += pairResult.errors;
+				if (pairResult.conflicts?.length) {
+					result.conflicts = [...(result.conflicts ?? []), ...pairResult.conflicts];
+				}
 				result.pairs![pair.id] = pairResult;
 				if (dryRun) {
 					result.wouldDownload!.push(...(pairResult.wouldDownload ?? []));
@@ -130,8 +135,9 @@ export class DriveSync {
 		if (!dryRun) {
 			for (const pair of activePairs) {
 				const seenIds = pairSeenIds.get(pair.id) ?? new Set<string>();
+				const trashedIds = pairTrashedIds.get(pair.id) ?? new Set<string>();
 				try {
-					const delResult = await this.runDeletionPass(pair, seenIds, globalSeenIds, archivedIds);
+					const delResult = await this.runDeletionPass(pair, seenIds, globalSeenIds, archivedIds, trashedIds);
 					result.removed += delResult.removed;
 					result.archived! += delResult.archived ?? 0;
 					result.errors += delResult.errors;
@@ -150,9 +156,10 @@ export class DriveSync {
 				const seenIds = pairSeenIds.get(pair.id) ?? new Set<string>();
 				const effectiveDeletionBehavior = pair.deletionBehavior ?? this.settings.deletionBehavior;
 				if (effectiveDeletionBehavior !== "keep") {
+					const trashedIds = pairTrashedIds.get(pair.id) ?? new Set<string>();
 					const pairEntries = this.manifest.allForPair(pair.id);
 					for (const [driveId, entry] of pairEntries) {
-						if (!globalSeenIds.has(driveId) && !seenIds.has(driveId)) {
+						if (!globalSeenIds.has(driveId) && !seenIds.has(driveId) && !trashedIds.has(driveId)) {
 							result.wouldRemove!.push(entry.vaultPath);
 						}
 					}
@@ -181,9 +188,9 @@ export class DriveSync {
 			: new Set<string>();
 
 		console.log(`${LOG} Single-pair sync: "${pair.label}"`);
-		const { pairResult, seenIds } = await this.syncPairFiles(pair, token);
+		const { pairResult, seenIds, trashedIds } = await this.syncPairFiles(pair, token);
 		// For single-pair sync, globalSeenIds = seenIds (no cross-pair awareness)
-		const delResult = await this.runDeletionPass(pair, seenIds, seenIds, archivedIds);
+		const delResult = await this.runDeletionPass(pair, seenIds, seenIds, archivedIds, trashedIds);
 
 		const result: SyncResult = {
 			...pairResult,
@@ -204,7 +211,7 @@ export class DriveSync {
 		pair: SyncPair,
 		token: string,
 		dryRun = false
-	): Promise<{ pairResult: SyncResult; seenIds: Set<string> }> {
+	): Promise<{ pairResult: SyncResult; seenIds: Set<string>; trashedIds: Set<string> }> {
 		const pairResult: SyncResult = {
 			downloaded: 0,
 			skipped: 0,
@@ -219,13 +226,19 @@ export class DriveSync {
 			pair.companionNotesEnabled ?? this.settings.companionNotesEnabled;
 
 		console.log(`${LOG} Collecting files from Drive folder: ${pair.driveFolderId}`);
-		const driveEntries = await this.collectFiles(
+		const allDriveEntries = await this.collectFiles(
 			pair.driveFolderId, "", token,
 			pair.excludedSubfolders ?? [],
 			pair.excludeRootFiles ?? false,
 			pair.rootFilesOnly ?? false
 		);
-		console.log(`${LOG} Found ${driveEntries.length} PDF(s) in Drive for pair "${pair.label}"`);
+		const driveEntries = allDriveEntries.filter((e) => !e.file.trashed);
+		const trashedIds = new Set(allDriveEntries.filter((e) => e.file.trashed).map((e) => e.file.id));
+		console.log(
+			`${LOG} Found ${driveEntries.length} active PDF(s)` +
+			(trashedIds.size > 0 ? `, ${trashedIds.size} trashed` : "") +
+			` in Drive for pair "${pair.label}"`
+		);
 
 		const seenIds = new Set<string>();
 		for (const entry of driveEntries) seenIds.add(entry.file.id);
@@ -240,7 +253,7 @@ export class DriveSync {
 					pairResult.wouldDownload!.push(`${pair.label}: ${displayPath}`);
 				}
 			}
-			return { pairResult, seenIds };
+			return { pairResult, seenIds, trashedIds };
 		}
 
 		const concurrency = Math.max(1, Math.min(this.settings.downloadConcurrency ?? 5, 10));
@@ -257,9 +270,12 @@ export class DriveSync {
 			pairResult.skipped += r.skipped;
 			pairResult.moved! += r.moved ?? 0;
 			pairResult.errors += r.errors;
+			if (r.conflicts?.length) {
+				pairResult.conflicts = [...(pairResult.conflicts ?? []), ...r.conflicts];
+			}
 		}
 
-		return { pairResult, seenIds };
+		return { pairResult, seenIds, trashedIds };
 	}
 
 	// ── Phase 2: deletion pass ────────────────────────────────────────────────
@@ -268,7 +284,8 @@ export class DriveSync {
 		pair: SyncPair,
 		seenIds: Set<string>,
 		globalSeenIds: Set<string>,
-		archivedIds: Set<string>
+		archivedIds: Set<string>,
+		trashedIds: Set<string> = new Set()
 	): Promise<SyncResult> {
 		const result: SyncResult = { downloaded: 0, skipped: 0, errors: 0, removed: 0, archived: 0 };
 
@@ -314,6 +331,15 @@ export class DriveSync {
 					console.error(`${LOG} Failed to remove archived "${entry.vaultPath}":`, e);
 					result.errors++;
 				}
+				continue;
+			}
+
+			// 5.6: File is in Drive Trash — preserve vault copy, update manifest flag
+			if (trashedIds.has(driveId)) {
+				if (!entry.driveTrashed) {
+					this.manifest.set(driveId, { ...entry, driveTrashed: true });
+				}
+				console.log(`${LOG} In Drive trash — preserving vault copy: ${entry.vaultPath}`);
 				continue;
 			}
 
@@ -405,6 +431,22 @@ export class DriveSync {
 				await this.handleRename(existing, entry, pair, expectedVaultPath, companionEnabled);
 			}
 
+			// 5.3: Skip re-download if user deleted the file from the vault
+			if (existing?.userDeletedAt) {
+				const driveChanged = entry.file.modifiedTime !== existing.driveModifiedTime;
+				if (!driveChanged || !this.settings.redownloadUserDeleted) {
+					if (driveChanged) {
+						// Advance the stored modifiedTime so we don't flag this every sync
+						this.manifest.set(entry.file.id, { ...existing, driveModifiedTime: entry.file.modifiedTime });
+					}
+					console.log(`${LOG} User-deleted — skipping: ${displayPath}`);
+					r.skipped++;
+					return r;
+				}
+				console.log(`${LOG} Drive version advanced past user deletion — re-downloading: ${displayPath}`);
+				this.manifest.clearUserDeleted(entry.file.id);
+			}
+
 			const needsDownload = !existing || entry.file.modifiedTime !== existing.driveModifiedTime;
 
 			if (needsDownload) {
@@ -459,9 +501,14 @@ export class DriveSync {
 				}
 
 				let companionPath: string | null = null;
+				let companionMtime: number | undefined;
 				if (companionEnabled) {
 					if (resolvedCompanionPath) {
-						await this.companion.update(resolvedCompanionPath, entry.file, pair, vaultPath, transcription);
+						const { conflictPath } = await this.companion.update(
+							resolvedCompanionPath, entry.file, pair, vaultPath, transcription,
+							existing?.companionMtime
+						);
+						if (conflictPath) r.conflicts = [...(r.conflicts ?? []), conflictPath];
 						companionPath = resolvedCompanionPath;
 					} else {
 						companionPath = await this.companion.create(
@@ -472,6 +519,11 @@ export class DriveSync {
 							transcription
 						);
 					}
+					// 5.4: Record mtime for concurrent-edit detection on the next sync
+					if (companionPath) {
+						const stat = await this.app.vault.adapter.stat(companionPath);
+						if (stat) companionMtime = stat.mtime;
+					}
 				}
 
 				this.manifest.set(entry.file.id, {
@@ -480,6 +532,7 @@ export class DriveSync {
 					driveModifiedTime: entry.file.modifiedTime,
 					driveCreatedTime: entry.file.createdTime,
 					pairId: pair.id,
+					companionMtime,
 				});
 
 				// Update transcription tracking store
@@ -523,6 +576,10 @@ export class DriveSync {
 				// Pure move — no content change, just relocated
 				r.moved!++;
 			} else {
+				// Clear driveTrashed if file was previously in trash but is now active and unchanged
+				if (existing?.driveTrashed) {
+					this.manifest.set(entry.file.id, { ...existing, driveTrashed: undefined });
+				}
 				console.log(`${LOG} Up to date, skipping: ${displayPath}`);
 				r.skipped++;
 			}
@@ -677,8 +734,8 @@ export class DriveSync {
 		const [files, subfolders] = await Promise.all([
 			this.listItems<DriveFile>(
 				token,
-				`'${folderId}' in parents and mimeType='application/pdf' and trashed=false`,
-				"files(id,name,modifiedTime,createdTime,size)"
+				`'${folderId}' in parents and mimeType='application/pdf'`,
+				"files(id,name,modifiedTime,createdTime,size,trashed)"
 			),
 			rootFilesOnly && !isRoot
 				? Promise.resolve([] as DriveFolder[])
@@ -716,6 +773,31 @@ export class DriveSync {
 		return entries;
 	}
 
+	/** Fetch with exponential backoff — retries on 429 and 5xx responses. */
+	private async fetchWithRetry(url: string, options: RequestInit, maxRetries = 3): Promise<Response> {
+		let lastError: unknown;
+		for (let attempt = 0; attempt <= maxRetries; attempt++) {
+			if (attempt > 0) {
+				const delay = 1000 * Math.pow(2, attempt - 1); // 1 s, 2 s, 4 s
+				console.log(`${LOG} Drive API retry ${attempt}/${maxRetries} after ${delay}ms`);
+				await new Promise((r) => setTimeout(r, delay));
+			}
+			try {
+				const resp = await fetch(url, options);
+				// Return immediately on success or a non-retriable client error
+				if (resp.ok || (resp.status >= 400 && resp.status < 500 && resp.status !== 429)) {
+					return resp;
+				}
+				lastError = new Error(`HTTP ${resp.status}`);
+				console.warn(`${LOG} Drive API returned ${resp.status} — will retry`);
+			} catch (e) {
+				lastError = e;
+				console.warn(`${LOG} Drive API fetch failed — will retry:`, e);
+			}
+		}
+		throw lastError;
+	}
+
 	private async listItems<T>(
 		token: string,
 		query: string,
@@ -735,7 +817,7 @@ export class DriveSync {
 			if (pageToken) params.set("pageToken", pageToken);
 
 			console.log(`${LOG} GET ${FILES_API} page=${page} query="${query}"`);
-			const resp = await fetch(`${FILES_API}?${params}`, {
+			const resp = await this.fetchWithRetry(`${FILES_API}?${params}`, {
 				headers: { Authorization: `Bearer ${token}` },
 			});
 

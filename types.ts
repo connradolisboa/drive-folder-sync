@@ -4,6 +4,7 @@ export interface DriveFile {
 	modifiedTime: string; // ISO 8601
 	createdTime?: string; // ISO 8601 — used as date fallback in automations
 	size?: string;
+	trashed?: boolean;   // true when file is in Drive trash
 }
 
 export interface DriveFolder {
@@ -75,6 +76,9 @@ export interface ManifestEntry {
 	driveCreatedTime?: string; // ISO 8601 — used as date fallback in automations
 	pairId: string;
 	automationRuns?: Record<string, AutomationRunRecord>;
+	userDeletedAt?: string;  // ISO — user deleted from vault; skip re-sync until Drive advances
+	companionMtime?: number; // ms — filesystem mtime when companion was last written (conflict detection)
+	driveTrashed?: boolean;  // true when file is in Drive trash (not permanently deleted)
 }
 
 export type SyncManifest = Record<string, ManifestEntry>; // key = driveFileId
@@ -104,6 +108,8 @@ export interface PluginSettings {
 	downloadConcurrency: number;
 	deletionBehavior: DeletionBehavior;
 	archiveFolder: string;
+	/** Re-download a file that the user deleted from the vault when Drive's version advances. */
+	redownloadUserDeleted: boolean;
 
 	/** Google Drive folder ID used as a global archive destination. Files moved here trigger driveArchiveBehavior. */
 	driveArchiveFolderId: string;
@@ -145,6 +151,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	automations: [],
 	deletionBehavior: "keep",
 	archiveFolder: "Drive Sync Archive",
+	redownloadUserDeleted: true,
 	driveArchiveFolderId: "",
 	syncLogEnabled: false,
 	syncLogPath: "Drive Sync/.sync-log.md",
@@ -256,6 +263,8 @@ export interface SyncResult {
 	wouldDownload?: string[];
 	/** Populated in dry-run mode: vault paths that would be removed. */
 	wouldRemove?: string[];
+	/** Conflict backup paths created when a companion note was edited since last sync. */
+	conflicts?: string[];
 }
 
 export interface DriveFileEntry {

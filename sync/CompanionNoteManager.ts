@@ -146,14 +146,36 @@ export class CompanionNoteManager {
 	 * Preserves user-added frontmatter; refreshes sync-tracking fields.
 	 * Migrates legacy `lastUpdate` → `sourceDriveModifiedTime` on first write.
 	 * If `transcription` is provided, updates or appends the ## Transcription section and sets transcribed: true.
+	 * If `knownMtime` is provided, detects concurrent edits: creates a `.conflict-<ts>.md` backup
+	 * when the file's current mtime exceeds the last-known mtime.
 	 */
-	async update(companionNotePath: string, file: DriveFile, pair: SyncPair, pdfVaultPath?: string, transcription?: string): Promise<void> {
+	async update(
+		companionNotePath: string,
+		file: DriveFile,
+		pair: SyncPair,
+		pdfVaultPath?: string,
+		transcription?: string,
+		knownMtime?: number
+	): Promise<{ conflictPath: string | null }> {
 		console.log(`${LOG} Updating companion note frontmatter: ${companionNotePath}`);
 
 		const tFile = this.app.vault.getAbstractFileByPath(companionNotePath);
 		if (!(tFile instanceof TFile)) {
 			console.warn(`${LOG} Companion note not found in vault — skipping update: ${companionNotePath}`);
-			return;
+			return { conflictPath: null };
+		}
+
+		// 5.4: Detect concurrent edits — backup if user modified companion since last sync
+		let conflictPath: string | null = null;
+		if (knownMtime !== undefined) {
+			const stat = await this.app.vault.adapter.stat(companionNotePath);
+			if (stat && stat.mtime > knownMtime) {
+				conflictPath = companionNotePath.replace(/\.md$/i, `.conflict-${Date.now()}.md`);
+				console.log(`${LOG} Companion edited since last sync — creating conflict backup: ${conflictPath}`);
+				const currentContent = await this.app.vault.read(tFile);
+				await this.ensureFolder(conflictPath);
+				await this.app.vault.create(conflictPath, currentContent);
+			}
 		}
 
 		await this.app.fileManager.processFrontMatter(tFile, (fm) => {
@@ -181,6 +203,7 @@ export class CompanionNoteManager {
 		}
 
 		console.log(`${LOG} Companion note frontmatter updated: ${companionNotePath}`);
+		return { conflictPath };
 	}
 
 	/**

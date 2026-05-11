@@ -27,14 +27,22 @@ export class SyncManifestStore {
 	}
 
 	async save(): Promise<void> {
+		const tmpPath = MANIFEST_PATH + ".tmp";
+		const content = JSON.stringify(this.data, null, 2);
 		try {
-			await this.app.vault.adapter.write(
-				MANIFEST_PATH,
-				JSON.stringify(this.data, null, 2)
-			);
+			// Write to tmp then rename — best-effort atomic to protect against partial writes
+			await this.app.vault.adapter.write(tmpPath, content);
+			await this.app.vault.adapter.rename(tmpPath, MANIFEST_PATH);
 			console.log(`${LOG} Saved ${Object.keys(this.data).length} manifest entries`);
 		} catch (e) {
-			console.error(`${LOG} Failed to save manifest:`, e);
+			console.error(`${LOG} Atomic save failed — falling back to direct write:`, e);
+			try { await this.app.vault.adapter.remove(tmpPath); } catch { /* ignore */ }
+			try {
+				await this.app.vault.adapter.write(MANIFEST_PATH, content);
+				console.log(`${LOG} Saved ${Object.keys(this.data).length} manifest entries (direct write)`);
+			} catch (e2) {
+				console.error(`${LOG} Failed to save manifest:`, e2);
+			}
 		}
 	}
 
@@ -75,6 +83,25 @@ export class SyncManifestStore {
 
 	getAutomationRun(driveFileId: string, automationId: string): AutomationRunRecord | undefined {
 		return this.data[driveFileId]?.automationRuns?.[automationId];
+	}
+
+	/**
+	 * Mark a vault path as user-deleted so the sync engine skips re-downloading it
+	 * until Drive's modifiedTime advances. Returns true if the entry was found.
+	 */
+	markUserDeleted(vaultPath: string): boolean {
+		const byVault = this.findByVaultPath(vaultPath);
+		if (!byVault) return false;
+		const [id, entry] = byVault;
+		this.data[id] = { ...entry, userDeletedAt: new Date().toISOString() };
+		console.log(`${LOG} Marked as user-deleted: "${vaultPath}"`);
+		return true;
+	}
+
+	/** Clear the userDeletedAt flag so the file will be re-downloaded on next sync. */
+	clearUserDeleted(driveFileId: string): void {
+		const entry = this.data[driveFileId];
+		if (entry) delete entry.userDeletedAt;
 	}
 
 	/**

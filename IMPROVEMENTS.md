@@ -248,8 +248,8 @@ These follow the audit in the "Failure Points" section below. Implement after th
 **Goal:** Renames in Drive trigger vault renames; today's `vault.rename()` breaks backlinks.
 
 **Tasks:**
-- [ ] Replace `vault.rename()` with `app.fileManager.renameFile()` in `DriveSync.handleRename()`
-- [ ] Same for companion note renames
+- [x] Replace `vault.rename()` with `app.fileManager.renameFile()` in `DriveSync.handleRename()`
+- [x] Same for companion note renames
 
 **Files:** `sync/DriveSync.ts:467-509`.
 
@@ -260,8 +260,8 @@ These follow the audit in the "Failure Points" section below. Implement after th
 **Goal:** Today only the PDF rename is healed; user renaming the companion breaks the manifest mapping.
 
 **Tasks:**
-- [ ] Extend `manifest.healRename()` (or add `healCompanionRename()`) to detect when a renamed file is a companion (matches a `companionPath` in the manifest) and update accordingly
-- [ ] Hook into `vault.on("rename")` in `main.ts`
+- [x] Extend `manifest.healRename()` (or add `healCompanionRename()`) to detect when a renamed file is a companion (matches a `companionPath` in the manifest) and update accordingly
+- [x] Hook into `vault.on("rename")` in `main.ts`
 
 **Files:** `sync/SyncManifest.ts`, `main.ts:93-100`.
 
@@ -272,9 +272,9 @@ These follow the audit in the "Failure Points" section below. Implement after th
 **Goal:** If user deletes the PDF in Obsidian, next sync re-downloads it as a ghost.
 
 **Tasks:**
-- [ ] Hook `vault.on("delete")` — if the deleted file matches a manifest entry's `vaultPath`, mark `userDeleted: true` with timestamp
-- [ ] In `DriveSync.processEntry()`, skip re-download for `userDeleted=true` entries UNLESS Drive's `modifiedTime` advances past the deletion timestamp
-- [ ] Add a settings toggle: "Re-download user-deleted files when Drive updates them" (default: ask)
+- [x] Hook `vault.on("delete")` — if the deleted file matches a manifest entry's `vaultPath`, mark `userDeleted: true` with timestamp
+- [x] In `DriveSync.processEntry()`, skip re-download for `userDeleted=true` entries UNLESS Drive's `modifiedTime` advances past the deletion timestamp
+- [x] Add a settings toggle: "Re-download user-deleted files when Drive updates them" (default: ask)
 
 **Files:** `types.ts` (extend `ManifestEntry`), `sync/SyncManifest.ts`, `sync/DriveSync.ts`, `main.ts`.
 
@@ -285,9 +285,9 @@ These follow the audit in the "Failure Points" section below. Implement after th
 **Goal:** Sync overwriting a companion while user is editing it silently clobbers unsaved changes.
 
 **Tasks:**
-- [ ] Before overwriting a companion, check `app.vault.adapter.stat(companionPath).mtime` vs the manifest's last-known mtime
-- [ ] If vault mtime is newer → log a conflict, write a `.conflict-<timestamp>.md` backup, then proceed
-- [ ] Surface the conflict in the status view
+- [x] Before overwriting a companion, check `app.vault.adapter.stat(companionPath).mtime` vs the manifest's last-known mtime
+- [x] If vault mtime is newer → log a conflict, write a `.conflict-<timestamp>.md` backup, then proceed
+- [x] Surface the conflict in the status view
 
 **Files:** `sync/CompanionNoteManager.ts`, `ui/SyncStatusView.ts`.
 
@@ -298,9 +298,9 @@ These follow the audit in the "Failure Points" section below. Implement after th
 **Goal:** Sync errors mid-run leave the manifest in an inconsistent state.
 
 **Tasks:**
-- [ ] Buffer manifest updates in memory during a sync
-- [ ] Write to `.obsidian/drive-sync-manifest.json.tmp` then atomic rename on phase boundary
-- [ ] Add Drive API retry with exponential backoff (max 3 retries)
+- [x] Buffer manifest updates in memory during a sync
+- [x] Write to `.obsidian/drive-sync-manifest.json.tmp` then atomic rename on phase boundary
+- [x] Add Drive API retry with exponential backoff (max 3 retries)
 
 **Files:** `sync/SyncManifest.ts`, `sync/DriveSync.ts`.
 
@@ -311,9 +311,9 @@ These follow the audit in the "Failure Points" section below. Implement after th
 **Goal:** Don't delete vault copies when files are only in Drive Trash (still recoverable).
 
 **Tasks:**
-- [ ] Audit the Drive list query — make `trashed=true` files visible
-- [ ] On finding a trashed file: mark manifest entry `driveTrashed: true`, preserve vault copy
-- [ ] Only delete vault copy when file is genuinely missing from Drive (not just trashed)
+- [x] Audit the Drive list query — make `trashed=true` files visible
+- [x] On finding a trashed file: mark manifest entry `driveTrashed: true`, preserve vault copy
+- [x] Only delete vault copy when file is genuinely missing from Drive (not just trashed)
 
 **Files:** `sync/DriveSync.ts` (Drive query + Phase 2 deletion logic).
 
@@ -324,9 +324,9 @@ These follow the audit in the "Failure Points" section below. Implement after th
 **Goal:** When a file moves across pairs with different companion-folder configs, the companion needs to move under the new pair's rules.
 
 **Tasks:**
-- [ ] In `handleRename()`, when `pairId` changes, recompute companion path under the new pair's `companionFolder` settings (don't reuse old pair's resolved path)
-- [ ] Move the companion file to the new location
-- [ ] Update manifest with the new `companionPath`
+- [x] In `handleRename()`, when `pairId` changes, recompute companion path under the new pair's `companionFolder` settings (don't reuse old pair's resolved path)
+- [x] Move the companion file to the new location
+- [x] Update manifest with the new `companionPath`
 
 **Files:** `sync/DriveSync.ts`, `sync/CompanionNoteManager.ts`.
 
