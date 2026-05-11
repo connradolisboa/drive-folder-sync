@@ -407,11 +407,29 @@ export class DriveSync {
 				let transcription: string | undefined;
 				const gemini = this.getGeminiClient();
 				if (gemini) {
-					try {
-						const pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
-						transcription = await gemini.transcribePdf(pdfBytes);
-					} catch (e) {
-						console.error(`${LOG} Gemini transcription failed for "${vaultPath}":`, e);
+					// Skip transcription if the companion already has a fresh transcription for this Drive version
+					let alreadyTranscribed = false;
+					const existingCompanionPath = existing?.companionPath ?? null;
+					if (existingCompanionPath) {
+						const companionFile = this.app.vault.getAbstractFileByPath(existingCompanionPath);
+						if (companionFile instanceof TFile) {
+							const fm = this.app.metadataCache.getFileCache(companionFile)?.frontmatter;
+							if (
+								fm?.transcribed === true &&
+								(fm?.sourceDriveModifiedTime ?? fm?.lastUpdate) === entry.file.modifiedTime
+							) {
+								alreadyTranscribed = true;
+								console.log(`${LOG} Transcription skipped — already transcribed for this Drive version: ${vaultPath}`);
+							}
+						}
+					}
+					if (!alreadyTranscribed) {
+						try {
+							const pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
+							transcription = await gemini.transcribePdf(pdfBytes);
+						} catch (e) {
+							console.error(`${LOG} Gemini transcription failed for "${vaultPath}":`, e);
+						}
 					}
 				}
 
@@ -419,7 +437,7 @@ export class DriveSync {
 				if (companionEnabled) {
 					const currentCompanionPath = existing?.companionPath ?? null;
 					if (currentCompanionPath) {
-						await this.companion.update(currentCompanionPath, entry.file, pair, transcription);
+						await this.companion.update(currentCompanionPath, entry.file, pair, vaultPath, transcription);
 						companionPath = currentCompanionPath;
 					} else {
 						companionPath = await this.companion.create(

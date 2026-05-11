@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { App, FuzzySuggestModal, Notice, Plugin } from "obsidian";
 import * as crypto from "crypto";
 import { GoogleAuth } from "./auth/GoogleAuth";
 import { DriveSync } from "./sync/DriveSync";
@@ -11,7 +11,7 @@ import { DriveSyncSettingTab } from "./settings/SettingsTab";
 import { AutomationEngine } from "./automation/AutomationEngine";
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from "./ui/SyncStatusView";
 import { DryRunModal } from "./ui/DryRunModal";
-import { DEFAULT_SETTINGS, PluginSettings, SyncResult } from "./types";
+import { DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
 
@@ -87,6 +87,38 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		});
 
 		this.addSettingTab(new DriveSyncSettingTab(this.app, this));
+
+		this.addCommand({
+			id: "sync-now",
+			name: "Sync now",
+			callback: () => {
+				this.runSync(false)
+					.then((r) => new Notice(this.formatResult(r)))
+					.catch((e) => new Notice(`Drive sync failed: ${(e as Error).message}`));
+			},
+		});
+
+		this.addCommand({
+			id: "dry-run",
+			name: "Dry run",
+			callback: () => {
+				this.runSync(true).catch((e) =>
+					new Notice(`Drive sync failed: ${(e as Error).message}`)
+				);
+			},
+		});
+
+		this.addCommand({
+			id: "sync-pair",
+			name: "Sync single pair…",
+			callback: () => {
+				new SyncPairPickerModal(this.app, this.settings.syncPairs, (pair) => {
+					this.runSyncForPair(pair.id)
+						.then((r) => new Notice(this.formatResult(r)))
+						.catch((e) => new Notice(`Drive sync failed: ${(e as Error).message}`));
+				}).open();
+			},
+		});
 
 		// Heal manifest when user manually moves/renames a synced file in the vault
 		this.registerEvent(
@@ -246,5 +278,28 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			((result.archived ?? 0) > 0 ? `, ${result.archived} archived` : "") +
 			(result.errors > 0 ? `, ${result.errors} errors` : "")
 		);
+	}
+}
+
+class SyncPairPickerModal extends FuzzySuggestModal<SyncPair> {
+	constructor(
+		app: App,
+		private pairs: SyncPair[],
+		private onChoose: (pair: SyncPair) => void
+	) {
+		super(app);
+		this.setPlaceholder("Pick a sync pair…");
+	}
+
+	getItems(): SyncPair[] {
+		return this.pairs;
+	}
+
+	getItemText(pair: SyncPair): string {
+		return pair.label;
+	}
+
+	onChooseItem(pair: SyncPair): void {
+		this.onChoose(pair);
 	}
 }

@@ -5,7 +5,9 @@ const LOG = "[DriveSync/Companion]";
 
 const DEFAULT_TEMPLATE = `---
 processed: false
-lastUpdate: "{{lastUpdate}}"
+companion-of: "[[{{sourceVaultStem}}]]"
+sourceVaultPath: "{{sourceVaultPath}}"
+sourceDriveModifiedTime: "{{sourceDriveModifiedTime}}"
 syncDate: "{{syncDate}}"
 driveFileId: "{{driveFileId}}"
 pairLabel: "{{pairLabel}}"
@@ -16,7 +18,7 @@ pairLabel: "{{pairLabel}}"
 > [!info] Source
 > File: [[{{title}}]]
 > Drive ID: \`{{driveFileId}}\`
-> Last updated: {{lastUpdate}}
+> Last updated: {{sourceDriveModifiedTime}}
 > Relative path: {{relativePath}}
 
 ## Notes
@@ -122,13 +124,16 @@ export class CompanionNoteManager {
 			await this.app.vault.create(notePath, content);
 		}
 
-		if (transcription) {
-			const tFile = this.app.vault.getAbstractFileByPath(notePath);
-			if (tFile instanceof TFile) {
-				await this.app.fileManager.processFrontMatter(tFile, (fm) => {
-					fm["transcribed"] = true;
-				});
-			}
+		const createdFile = this.app.vault.getAbstractFileByPath(notePath);
+		if (createdFile instanceof TFile) {
+			await this.app.fileManager.processFrontMatter(createdFile, (fm) => {
+				// Ensure tracking fields are always present, even when using a custom template
+				const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
+				fm["companion-of"] = `[[${stem}]]`;
+				fm["sourceVaultPath"] = pdfVaultPath;
+				fm["sourceDriveModifiedTime"] = file.modifiedTime;
+				if (transcription) fm["transcribed"] = true;
+			});
 		}
 
 		console.log(`${LOG} Companion note created: ${notePath}`);
@@ -137,10 +142,11 @@ export class CompanionNoteManager {
 
 	/**
 	 * Update frontmatter of an existing companion note when its PDF is re-downloaded.
-	 * Only touches processed, lastUpdate, syncDate, and pairLabel — preserves the rest of the note.
+	 * Preserves user-added frontmatter; refreshes sync-tracking fields.
+	 * Migrates legacy `lastUpdate` → `sourceDriveModifiedTime` on first write.
 	 * If `transcription` is provided, updates or appends the ## Transcription section and sets transcribed: true.
 	 */
-	async update(companionNotePath: string, file: DriveFile, pair: SyncPair, transcription?: string): Promise<void> {
+	async update(companionNotePath: string, file: DriveFile, pair: SyncPair, pdfVaultPath?: string, transcription?: string): Promise<void> {
 		console.log(`${LOG} Updating companion note frontmatter: ${companionNotePath}`);
 
 		const tFile = this.app.vault.getAbstractFileByPath(companionNotePath);
@@ -150,10 +156,20 @@ export class CompanionNoteManager {
 		}
 
 		await this.app.fileManager.processFrontMatter(tFile, (fm) => {
+			// Migration: rename legacy lastUpdate → sourceDriveModifiedTime
+			if ("lastUpdate" in fm && !("sourceDriveModifiedTime" in fm)) {
+				fm["sourceDriveModifiedTime"] = fm["lastUpdate"];
+				delete fm["lastUpdate"];
+			}
 			fm["processed"] = false;
-			fm["lastUpdate"] = file.modifiedTime;
+			fm["sourceDriveModifiedTime"] = file.modifiedTime;
 			fm["syncDate"] = new Date().toISOString();
 			fm["pairLabel"] = pair.label;
+			if (pdfVaultPath) {
+				const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
+				fm["companion-of"] = `[[${stem}]]`;
+				fm["sourceVaultPath"] = pdfVaultPath;
+			}
 			if (transcription) fm["transcribed"] = true;
 		});
 
@@ -258,17 +274,21 @@ export class CompanionNoteManager {
 		file: DriveFile,
 		pair: SyncPair,
 		relPath: string,
-		_pdfVaultPath: string,
+		pdfVaultPath: string,
 		transcription?: string
 	): string {
 		const stem = file.name.replace(/\.pdf$/i, "");
 		const syncDate = new Date().toISOString();
 		const title = this.resolveTitle(file, pair, relPath);
+		const sourceVaultStem = pdfVaultPath.replace(/\.[^.]+$/, "");
 
 		return template
 			.replaceAll("{{title}}", title)
 			.replaceAll("{{fileName}}", file.name)
 			.replaceAll("{{fileLink}}", `[[${stem}]]`)
+			.replaceAll("{{sourceVaultPath}}", pdfVaultPath)
+			.replaceAll("{{sourceVaultStem}}", sourceVaultStem)
+			.replaceAll("{{sourceDriveModifiedTime}}", file.modifiedTime)
 			.replaceAll("{{lastUpdate}}", file.modifiedTime)
 			.replaceAll("{{syncDate}}", syncDate)
 			.replaceAll("{{driveFileId}}", file.id)
