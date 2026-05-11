@@ -411,13 +411,16 @@ export class DriveSync {
 
 				// Attempt AI transcription (non-blocking on failure)
 				let transcription: string | undefined;
+				// Resolve companion path: manifest takes priority, then property-declared companion
+				const resolvedCompanionPath = existing?.companionPath
+					?? this.companion.findCompanionByProperty(vaultPath)
+					?? null;
 				const gemini = this.getTranscriptionClient();
 				if (gemini) {
 					// Skip transcription if the companion already has a fresh transcription for this Drive version
 					let alreadyTranscribed = false;
-					const existingCompanionPath = existing?.companionPath ?? null;
-					if (existingCompanionPath) {
-						const companionFile = this.app.vault.getAbstractFileByPath(existingCompanionPath);
+					if (resolvedCompanionPath) {
+						const companionFile = this.app.vault.getAbstractFileByPath(resolvedCompanionPath);
 						if (companionFile instanceof TFile) {
 							const fm = this.app.metadataCache.getFileCache(companionFile)?.frontmatter;
 							if (
@@ -441,10 +444,9 @@ export class DriveSync {
 
 				let companionPath: string | null = null;
 				if (companionEnabled) {
-					const currentCompanionPath = existing?.companionPath ?? null;
-					if (currentCompanionPath) {
-						await this.companion.update(currentCompanionPath, entry.file, pair, vaultPath, transcription);
-						companionPath = currentCompanionPath;
+					if (resolvedCompanionPath) {
+						await this.companion.update(resolvedCompanionPath, entry.file, pair, vaultPath, transcription);
+						companionPath = resolvedCompanionPath;
 					} else {
 						companionPath = await this.companion.create(
 							entry.file,
@@ -467,7 +469,7 @@ export class DriveSync {
 				if (this.automationEngine) {
 					// Fall back to manifest's stored companion path when companion notes are
 					// currently disabled — lets transcribe_to_companion find an existing note.
-					const automationCompanionPath = companionPath ?? existing?.companionPath ?? null;
+					const automationCompanionPath = companionPath ?? resolvedCompanionPath ?? null;
 					await this.automationEngine.runForFile(
 						vaultPath,
 						automationCompanionPath,

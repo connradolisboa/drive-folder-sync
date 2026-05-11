@@ -5,6 +5,7 @@ const LOG = "[DriveSync/Companion]";
 
 const DEFAULT_TEMPLATE = `---
 processed: false
+companion: "[[{{fileName}}]]"
 companion-of: "[[{{sourceVaultStem}}]]"
 sourceVaultPath: "{{sourceVaultPath}}"
 sourceDriveModifiedTime: "{{sourceDriveModifiedTime}}"
@@ -127,6 +128,7 @@ export class CompanionNoteManager {
 			if (createdFile instanceof TFile) {
 				await this.app.fileManager.processFrontMatter(createdFile, (fm) => {
 					const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
+					fm["companion"] = `[[${file.name}]]`;
 					fm["companion-of"] = `[[${stem}]]`;
 					fm["sourceVaultPath"] = pdfVaultPath;
 					fm["sourceDriveModifiedTime"] = file.modifiedTime;
@@ -165,7 +167,9 @@ export class CompanionNoteManager {
 			fm["syncDate"] = new Date().toISOString();
 			fm["pairLabel"] = pair.label;
 			if (pdfVaultPath) {
+				const pdfName = pdfVaultPath.split("/").pop() ?? pdfVaultPath;
 				const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
+				fm["companion"] = `[[${pdfName}]]`;
 				fm["companion-of"] = `[[${stem}]]`;
 				fm["sourceVaultPath"] = pdfVaultPath;
 			}
@@ -318,6 +322,41 @@ export class CompanionNoteManager {
 
 		await this.app.vault.modify(tFile, newContent);
 		console.log(`${LOG} Transcription section updated in: ${tFile.path}`);
+	}
+
+	/**
+	 * Scan vault notes for one that declares itself a companion of the given PDF
+	 * via the `companion` frontmatter property, e.g. companion: "[[Link File.pdf]]".
+	 * Matches by filename (with or without extension) or full vault path.
+	 * Returns the note's vault path if found, null otherwise.
+	 */
+	findCompanionByProperty(pdfVaultPath: string): string | null {
+		const pdfName = pdfVaultPath.split("/").pop() ?? "";
+		const pdfStem = pdfName.replace(/\.[^.]+$/, "");
+		const pdfPathStem = pdfVaultPath.replace(/\.[^.]+$/, "");
+
+		for (const file of this.app.vault.getMarkdownFiles()) {
+			const fm = this.app.metadataCache.getFileCache(file)?.frontmatter;
+			const raw = fm?.companion;
+			if (raw == null) continue;
+
+			let linkTarget: string | null = null;
+			if (typeof raw === "string") {
+				const m = raw.match(/^\[\[(.+?)\]\]$/);
+				linkTarget = m ? m[1] : null;
+			} else if (typeof raw === "object" && typeof raw.link === "string") {
+				linkTarget = raw.link;
+			}
+
+			if (!linkTarget) continue;
+
+			const t = linkTarget.split("|")[0].trim();
+			if (t === pdfName || t === pdfStem || t === pdfVaultPath || t === pdfPathStem) {
+				console.log(`${LOG} Found companion via property: ${file.path} → ${pdfVaultPath}`);
+				return file.path;
+			}
+		}
+		return null;
 	}
 
 	private async ensureFolder(filePath: string): Promise<void> {
