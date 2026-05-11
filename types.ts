@@ -124,11 +124,13 @@ export interface PluginSettings {
 	// Periodic notes paths (used by embed_to_weekly_note etc.)
 	periodicNotesPaths: PeriodicNotesPaths;
 
-	// Gemini AI transcription
+	// AI transcription
+	transcriptionProvider: "gemini" | "mistral";
 	geminiApiKey: string;
 	geminiEnabled: boolean;
 	geminiModel: string;
 	geminiPrompt: string;
+	mistralApiKey: string;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -157,10 +159,12 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 		quarterly: "",
 		yearly: "",
 	},
+	transcriptionProvider: "gemini",
 	geminiApiKey: "",
 	geminiEnabled: false,
 	geminiModel: "gemini-2.0-flash",
 	geminiPrompt: "Transcribe all text visible in this PDF exactly as written, preserving structure. Return plain text only.",
+	mistralApiKey: "",
 };
 
 // ── Automations ───────────────────────────────────────────────────────────────

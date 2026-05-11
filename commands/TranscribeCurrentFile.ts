@@ -9,6 +9,7 @@ import {
 } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
 import { GeminiClient } from "../ai/GeminiClient";
+import { MistralClient } from "../ai/MistralClient";
 
 // Obsidian bundles moment.js as a global
 declare const moment: () => { format(pattern: string): string };
@@ -25,8 +26,17 @@ export async function transcribeCurrentFile(plugin: DriveFolderSyncPlugin): Prom
 		new Notice("Transcription only supports PDF files.");
 		return;
 	}
-	if (!plugin.settings.geminiEnabled || !plugin.settings.geminiApiKey) {
-		new Notice("Gemini is not configured. Enable it in Drive Sync settings.");
+	if (!plugin.settings.geminiEnabled) {
+		new Notice("AI transcription is not enabled. Enable it in Drive Sync settings.");
+		return;
+	}
+	const provider = plugin.settings.transcriptionProvider ?? "gemini";
+	if (provider === "mistral" && !plugin.settings.mistralApiKey) {
+		new Notice("Mistral API key is not set. Add it in Drive Sync settings.");
+		return;
+	}
+	if (provider === "gemini" && !plugin.settings.geminiApiKey) {
+		new Notice("Gemini API key is not set. Add it in Drive Sync settings.");
 		return;
 	}
 
@@ -172,12 +182,16 @@ class DestinationPickerModal extends Modal {
 		const notice = new Notice(`Transcribing "${this.pdfFile.basename}"…`, 0);
 		try {
 			const pdfBytes = await this.app.vault.readBinary(this.pdfFile);
-			const gemini = new GeminiClient(
-				this.plugin.settings.geminiApiKey,
-				this.plugin.settings.geminiModel,
-				this.plugin.settings.geminiPrompt
-			);
-			const transcription = await gemini.transcribePdf(pdfBytes);
+			const provider = this.plugin.settings.transcriptionProvider ?? "gemini";
+			const client: GeminiClient | MistralClient =
+				provider === "mistral"
+					? new MistralClient(this.plugin.settings.mistralApiKey)
+					: new GeminiClient(
+						this.plugin.settings.geminiApiKey,
+						this.plugin.settings.geminiModel,
+						this.plugin.settings.geminiPrompt
+					);
+			const transcription = await client.transcribePdf(pdfBytes);
 			notice.hide();
 			await writeTranscription(this.app, destFile, transcription, mode, this.pdfFile.name);
 			new Notice(`Transcription written to "${destFile.name}"`);

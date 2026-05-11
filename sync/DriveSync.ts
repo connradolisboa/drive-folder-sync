@@ -5,6 +5,7 @@ import { SyncManifestStore } from "./SyncManifest";
 import { CompanionNoteManager } from "./CompanionNoteManager";
 import { AutomationEngine } from "../automation/AutomationEngine";
 import { GeminiClient } from "../ai/GeminiClient";
+import { MistralClient } from "../ai/MistralClient";
 import {
 	DeletionBehavior,
 	DriveFile,
@@ -20,7 +21,7 @@ const FILES_API = "https://www.googleapis.com/drive/v3/files";
 const LOG = "[DriveSync/Sync]";
 
 export class DriveSync {
-	private geminiClient: GeminiClient | null = null;
+	private transcriptionClient: GeminiClient | MistralClient | null = null;
 
 	constructor(
 		private auth: GoogleAuth,
@@ -34,12 +35,10 @@ export class DriveSync {
 
 	updateSettings(settings: PluginSettings): void {
 		this.settings = settings;
-		this.geminiClient = null; // invalidate cached client on settings change
+		this.transcriptionClient = null; // invalidate cached client on settings change
 	}
 
-	private getGeminiClient(): GeminiClient | null {
-		if (!this.settings.geminiApiKey) return null;
-
+	private getTranscriptionClient(): GeminiClient | MistralClient | null {
 		const hasTranscriptionAutomation = this.settings.automations.some(
 			(a) =>
 				a.enabled &&
@@ -49,14 +48,21 @@ export class DriveSync {
 
 		if (!this.settings.geminiEnabled && !hasTranscriptionAutomation) return null;
 
-		if (!this.geminiClient) {
-			this.geminiClient = new GeminiClient(
-				this.settings.geminiApiKey,
-				this.settings.geminiModel || "gemini-2.0-flash",
-				this.settings.geminiPrompt || "Transcribe all text visible in this PDF exactly as written, preserving structure. Return plain text only."
-			);
+		if (!this.transcriptionClient) {
+			const provider = this.settings.transcriptionProvider ?? "gemini";
+			if (provider === "mistral") {
+				if (!this.settings.mistralApiKey) return null;
+				this.transcriptionClient = new MistralClient(this.settings.mistralApiKey);
+			} else {
+				if (!this.settings.geminiApiKey) return null;
+				this.transcriptionClient = new GeminiClient(
+					this.settings.geminiApiKey,
+					this.settings.geminiModel || "gemini-2.0-flash",
+					this.settings.geminiPrompt || "Transcribe all text visible in this PDF exactly as written, preserving structure. Return plain text only."
+				);
+			}
 		}
-		return this.geminiClient;
+		return this.transcriptionClient;
 	}
 
 	async sync(dryRun = false): Promise<SyncResult> {
@@ -403,9 +409,9 @@ export class DriveSync {
 					effectiveRelPath
 				);
 
-				// Attempt Gemini transcription (non-blocking on failure)
+				// Attempt AI transcription (non-blocking on failure)
 				let transcription: string | undefined;
-				const gemini = this.getGeminiClient();
+				const gemini = this.getTranscriptionClient();
 				if (gemini) {
 					// Skip transcription if the companion already has a fresh transcription for this Drive version
 					let alreadyTranscribed = false;

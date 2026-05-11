@@ -282,18 +282,58 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
-		// ── Gemini AI ─────────────────────────────────────────────────────────
-		el.createEl("h3", { text: "Gemini AI (optional)" });
+		// ── AI Transcription ──────────────────────────────────────────────────
+		el.createEl("h3", { text: "AI Transcription (optional)" });
 		el.createEl("p", {
 			text:
-				"Use Google's Gemini API to transcribe handwritten or printed text from synced PDFs. " +
-				"Transcription is stored in companion notes and available as {{transcription}} in templates.",
+				"Transcribe handwritten or printed text from synced PDFs using an AI API. " +
+				"Output is stored in companion notes and available as {{transcription}} in templates.",
 			cls: "setting-item-description",
 		});
 
+		const provider = this.plugin.settings.transcriptionProvider ?? "gemini";
+
 		new Setting(el)
+			.setName("Enable AI transcription")
+			.setDesc("Automatically transcribe PDFs when they are downloaded during sync.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.geminiEnabled)
+					.onChange(async (val) => {
+						this.plugin.settings.geminiEnabled = val;
+						await this.plugin.saveSettings();
+						providerSetting.settingEl.toggle(val);
+						geminiApiKeySetting.settingEl.toggle(val && currentProvider() === "gemini");
+						geminiModelSetting.settingEl.toggle(val && currentProvider() === "gemini");
+						geminiPromptSetting.settingEl.toggle(val && currentProvider() === "gemini");
+						mistralApiKeySetting.settingEl.toggle(val && currentProvider() === "mistral");
+					})
+			);
+
+		const currentProvider = () => this.plugin.settings.transcriptionProvider ?? "gemini";
+
+		const providerSetting = new Setting(el)
+			.setName("Provider")
+			.setDesc("Which AI service to use for transcription.")
+			.addDropdown((drop) =>
+				drop
+					.addOption("gemini", "Google Gemini")
+					.addOption("mistral", "Mistral OCR")
+					.setValue(provider)
+					.onChange(async (val) => {
+						this.plugin.settings.transcriptionProvider = val as "gemini" | "mistral";
+						await this.plugin.saveSettings();
+						const isGemini = val === "gemini";
+						geminiApiKeySetting.settingEl.toggle(isGemini);
+						geminiModelSetting.settingEl.toggle(isGemini);
+						geminiPromptSetting.settingEl.toggle(isGemini);
+						mistralApiKeySetting.settingEl.toggle(!isGemini);
+					})
+			);
+
+		const geminiApiKeySetting = new Setting(el)
 			.setName("Gemini API key")
-			.setDesc("Your Gemini API key from Google AI Studio (aistudio.google.com). Stored locally.")
+			.setDesc("From Google AI Studio (aistudio.google.com). Free tier available.")
 			.addText((text) => {
 				text.inputEl.type = "password";
 				text
@@ -304,20 +344,6 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					});
 			});
-
-		new Setting(el)
-			.setName("Enable Gemini transcription")
-			.setDesc("Automatically transcribe PDFs when they are downloaded during sync.")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.geminiEnabled)
-					.onChange(async (val) => {
-						this.plugin.settings.geminiEnabled = val;
-						await this.plugin.saveSettings();
-						geminiModelSetting.settingEl.toggle(val);
-						geminiPromptSetting.settingEl.toggle(val);
-					})
-			);
 
 		const geminiModelSetting = new Setting(el)
 			.setName("Model")
@@ -350,8 +376,27 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				text.inputEl.style.resize = "vertical";
 			});
 
-		geminiModelSetting.settingEl.toggle(this.plugin.settings.geminiEnabled);
-		geminiPromptSetting.settingEl.toggle(this.plugin.settings.geminiEnabled);
+		const mistralApiKeySetting = new Setting(el)
+			.setName("Mistral API key")
+			.setDesc("From console.mistral.ai. Uses the mistral-ocr-latest model.")
+			.addText((text) => {
+				text.inputEl.type = "password";
+				text
+					.setPlaceholder("…")
+					.setValue(this.plugin.settings.mistralApiKey)
+					.onChange(async (val) => {
+						this.plugin.settings.mistralApiKey = val.trim();
+						await this.plugin.saveSettings();
+					});
+			});
+
+		const enabled = this.plugin.settings.geminiEnabled;
+		const isGemini = currentProvider() === "gemini";
+		providerSetting.settingEl.toggle(enabled);
+		geminiApiKeySetting.settingEl.toggle(enabled && isGemini);
+		geminiModelSetting.settingEl.toggle(enabled && isGemini);
+		geminiPromptSetting.settingEl.toggle(enabled && isGemini);
+		mistralApiKeySetting.settingEl.toggle(enabled && !isGemini);
 	}
 
 	private renderSyncTab(el: HTMLElement): void {

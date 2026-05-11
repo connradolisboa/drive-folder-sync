@@ -20,6 +20,7 @@ export class GeminiClient {
 			url: `${API_BASE}/models/${this.model}:generateContent?key=${this.apiKey}`,
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
+			throw: false,
 			body: JSON.stringify({
 				contents: [
 					{
@@ -41,7 +42,7 @@ export class GeminiClient {
 			const errBody =
 				typeof response.json?.error?.message === "string"
 					? response.json.error.message
-					: response.text.slice(0, 200);
+					: response.text.slice(0, 300);
 			throw new Error(`Gemini API error ${response.status}: ${errBody}`);
 		}
 
