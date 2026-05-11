@@ -60,12 +60,21 @@ export interface SyncPair {
 	companionNoteTitle?: string;
 }
 
+export interface AutomationRunRecord {
+	lastRunAt: string;                 // ISO
+	lastRunDriveModifiedTime: string;  // Drive modifiedTime at time of run
+	result: "success" | "skipped" | "error";
+	outputs?: string[];                // e.g. ["daily-note:2026-05-10", "companion:Notes/foo.md"]
+	errorMessage?: string;
+}
+
 export interface ManifestEntry {
 	vaultPath: string;
 	companionPath: string | null;
 	driveModifiedTime: string; // ISO 8601
 	driveCreatedTime?: string; // ISO 8601 — used as date fallback in automations
 	pairId: string;
+	automationRuns?: Record<string, AutomationRunRecord>;
 }
 
 export type SyncManifest = Record<string, ManifestEntry>; // key = driveFileId

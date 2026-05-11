@@ -46,7 +46,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			console.error(`${LOG} Failed to pre-load manifest:`, e)
 		);
 		this.companionManager = new CompanionNoteManager(this.app, this.settings);
-		this.automationEngine = new AutomationEngine(this.app, this.settings);
+		this.automationEngine = new AutomationEngine(this.app, this.settings, this.manifestStore);
 		this.syncLogger = new SyncLogger(this.app, this.settings);
 
 		const downloader = new DownloadManager(this.app);

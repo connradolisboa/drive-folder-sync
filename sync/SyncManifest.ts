@@ -1,5 +1,5 @@
 import { App } from "obsidian";
-import { ManifestEntry, SyncManifest } from "../types";
+import { AutomationRunRecord, ManifestEntry, SyncManifest } from "../types";
 
 const MANIFEST_PATH = ".obsidian/drive-sync-manifest.json";
 const LOG = "[DriveSync/Manifest]";
@@ -64,6 +64,17 @@ export class SyncManifestStore {
 
 	findByCompanionPath(path: string): [string, ManifestEntry] | undefined {
 		return this.entries().find(([, entry]) => entry.companionPath === path);
+	}
+
+	recordAutomationRun(driveFileId: string, automationId: string, run: AutomationRunRecord): void {
+		const entry = this.data[driveFileId];
+		if (!entry) return;
+		if (!entry.automationRuns) entry.automationRuns = {};
+		entry.automationRuns[automationId] = run;
+	}
+
+	getAutomationRun(driveFileId: string, automationId: string): AutomationRunRecord | undefined {
+		return this.data[driveFileId]?.automationRuns?.[automationId];
 	}
 
 	/**

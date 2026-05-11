@@ -1,5 +1,6 @@
 import { App, getAllTags, TFile } from "obsidian";
-import { Automation, AutomationAction, PeriodicNotesPaths, PluginSettings } from "../types";
+import { Automation, AutomationAction, AutomationRunRecord, PeriodicNotesPaths, PluginSettings } from "../types";
+import type { SyncManifestStore } from "../sync/SyncManifest";
 
 const LOG = "[DriveSync/Automation]";
 
@@ -9,17 +10,28 @@ declare const moment: (date: string, format: string) => { format(pattern: string
 type PeriodicPeriod = "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
 
 export class AutomationEngine {
-	constructor(private app: App, private settings: PluginSettings) {}
+	constructor(
+		private app: App,
+		private settings: PluginSettings,
+		private manifest?: SyncManifestStore
+	) {}
 
 	updateSettings(settings: PluginSettings): void {
 		this.settings = settings;
+	}
+
+	updateManifest(manifest: SyncManifestStore): void {
+		this.manifest = manifest;
 	}
 
 	async runForFile(
 		vaultPath: string,
 		companionPath?: string | null,
 		driveCreatedTime?: string,
-		transcription?: string
+		transcription?: string,
+		driveFileId?: string,
+		driveModifiedTime?: string,
+		force = false
 	): Promise<void> {
 		const matching = this.settings.automations.filter(
 			(a) => a.enabled && this.matchesTrigger(a, vaultPath)
@@ -28,18 +40,65 @@ export class AutomationEngine {
 		if (matching.length === 0) return;
 
 		for (const automation of matching) {
-			console.log(
-				`${LOG} Running automation "${automation.name}" for: ${vaultPath}`
-			);
+			const shouldRun = this.shouldRunAutomation(automation.id, driveFileId, driveModifiedTime, force);
+
+			if (!shouldRun) {
+				console.log(`${LOG} Skipping automation "${automation.name}" for "${vaultPath}" — already ran for this Drive version`);
+				if (driveFileId) {
+					this.manifest?.recordAutomationRun(driveFileId, automation.id, {
+						lastRunAt: new Date().toISOString(),
+						lastRunDriveModifiedTime: driveModifiedTime ?? "",
+						result: "skipped",
+					});
+				}
+				continue;
+			}
+
+			console.log(`${LOG} Running automation "${automation.name}" for: ${vaultPath}`);
 			try {
 				await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, transcription);
+				if (driveFileId) {
+					this.manifest?.recordAutomationRun(driveFileId, automation.id, {
+						lastRunAt: new Date().toISOString(),
+						lastRunDriveModifiedTime: driveModifiedTime ?? "",
+						result: "success",
+					});
+				}
 			} catch (e) {
-				console.error(
-					`${LOG} Automation "${automation.name}" failed for "${vaultPath}":`,
-					e
-				);
+				console.error(`${LOG} Automation "${automation.name}" failed for "${vaultPath}":`, e);
+				if (driveFileId) {
+					this.manifest?.recordAutomationRun(driveFileId, automation.id, {
+						lastRunAt: new Date().toISOString(),
+						lastRunDriveModifiedTime: driveModifiedTime ?? "",
+						result: "error",
+						errorMessage: e instanceof Error ? e.message : String(e),
+					});
+				}
 			}
 		}
+	}
+
+	/**
+	 * Decision matrix:
+	 *   Never run before          → RUN
+	 *   Ran before, same modTime  → SKIP (unless force)
+	 *   Ran before, newer modTime → RUN
+	 *   Last result was error     → RUN
+	 */
+	private shouldRunAutomation(
+		automationId: string,
+		driveFileId?: string,
+		driveModifiedTime?: string,
+		force = false
+	): boolean {
+		if (force) return true;
+		if (!driveFileId || !this.manifest) return true;
+
+		const prior = this.manifest.getAutomationRun(driveFileId, automationId);
+		if (!prior) return true;
+		if (prior.result === "error") return true;
+		if (driveModifiedTime && prior.lastRunDriveModifiedTime !== driveModifiedTime) return true;
+		return false;
 	}
 
 	// ── Trigger matching ────────────────────────────────────────────────────────

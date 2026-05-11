@@ -118,22 +118,21 @@ export class CompanionNoteManager {
 
 		const exists = await this.app.vault.adapter.exists(notePath);
 		if (exists) {
-			console.log(`${LOG} Companion note already exists — overwriting: ${notePath}`);
-			await this.app.vault.adapter.write(notePath, content);
+			// Adopt the existing file — update its tracking frontmatter instead of overwriting user content
+			console.log(`${LOG} Companion note already exists — adopting: ${notePath}`);
+			await this.update(notePath, file, pair, pdfVaultPath, transcription);
 		} else {
 			await this.app.vault.create(notePath, content);
-		}
-
-		const createdFile = this.app.vault.getAbstractFileByPath(notePath);
-		if (createdFile instanceof TFile) {
-			await this.app.fileManager.processFrontMatter(createdFile, (fm) => {
-				// Ensure tracking fields are always present, even when using a custom template
-				const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
-				fm["companion-of"] = `[[${stem}]]`;
-				fm["sourceVaultPath"] = pdfVaultPath;
-				fm["sourceDriveModifiedTime"] = file.modifiedTime;
-				if (transcription) fm["transcribed"] = true;
-			});
+			const createdFile = this.app.vault.getAbstractFileByPath(notePath);
+			if (createdFile instanceof TFile) {
+				await this.app.fileManager.processFrontMatter(createdFile, (fm) => {
+					const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
+					fm["companion-of"] = `[[${stem}]]`;
+					fm["sourceVaultPath"] = pdfVaultPath;
+					fm["sourceDriveModifiedTime"] = file.modifiedTime;
+					if (transcription) fm["transcribed"] = true;
+				});
+			}
 		}
 
 		console.log(`${LOG} Companion note created: ${notePath}`);

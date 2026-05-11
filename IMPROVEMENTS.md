@@ -16,11 +16,11 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 **Goal:** Expose existing functionality (sync, dry-run, per-pair sync) via the command palette. Foundation for later commands.
 
 **Tasks:**
-- [ ] Register `drive-sync:sync-now` in `main.ts` → `runSync(false)`
-- [ ] Register `drive-sync:dry-run` → `runSync(true)`
-- [ ] Register `drive-sync:sync-pair` → modal picks pair, calls `runSyncForPair(pairId)`
-- [ ] Add a `SuggestModal<SyncPair>` for the pair picker (reuse Obsidian's `FuzzySuggestModal`)
-- [ ] All commands use plain `callback`, not `checkCallback` — always available
+- [x] Register `drive-sync:sync-now` in `main.ts` → `runSync(false)`
+- [x] Register `drive-sync:dry-run` → `runSync(true)`
+- [x] Register `drive-sync:sync-pair` → modal picks pair, calls `runSyncForPair(pairId)`
+- [x] Add a `SuggestModal<SyncPair>` for the pair picker (reuse Obsidian's `FuzzySuggestModal`)
+- [x] All commands use plain `callback`, not `checkCallback` — always available
 
 **Files:** `main.ts` only.
 
@@ -33,14 +33,14 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 **Goal:** Make the PDF ↔ companion-note relationship self-describing inside the markdown. Foundation for idempotent re-runs (Phase 1) — we need somewhere to read run state from.
 
 **Tasks:**
-- [ ] Extend default companion template in `sync/CompanionNoteManager.ts:6-24` with new fields:
-  - [ ] `companion-of: "[[<sourceVaultPath>]]"` — Obsidian wikilink to the source PDF
-  - [ ] `sourceVaultPath: "<path>"` — string fallback if the wikilink breaks
-  - [ ] Rename existing `lastUpdate` → `sourceDriveModifiedTime` for clarity (migrate old field on read)
-  - [ ] Keep existing `driveFileId`, `transcribed`, `pairLabel`, `syncDate`
-- [ ] Update `CompanionNoteManager.update()` to refresh the new fields while preserving user-added frontmatter (use Obsidian's `processFrontMatter` API)
-- [ ] Add a migration helper: on first sync after upgrade, rewrite old companion frontmatter to the new schema
-- [ ] **Start reading `transcribed: true`** before re-transcribing (currently set but ignored)
+- [x] Extend default companion template in `sync/CompanionNoteManager.ts:6-24` with new fields:
+  - [x] `companion-of: "[[<sourceVaultPath>]]"` — Obsidian wikilink to the source PDF
+  - [x] `sourceVaultPath: "<path>"` — string fallback if the wikilink breaks
+  - [x] Rename existing `lastUpdate` → `sourceDriveModifiedTime` for clarity (migrate old field on read)
+  - [x] Keep existing `driveFileId`, `transcribed`, `pairLabel`, `syncDate`
+- [x] Update `CompanionNoteManager.update()` to refresh the new fields while preserving user-added frontmatter (use Obsidian's `processFrontMatter` API)
+- [x] Add a migration helper: on first sync after upgrade, rewrite old companion frontmatter to the new schema
+- [x] **Start reading `transcribed: true`** before re-transcribing (currently set but ignored)
 
 **Files:** `sync/CompanionNoteManager.ts`, `sync/DriveSync.ts:408-441`.
 
@@ -55,7 +55,7 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 **Goal:** The same automation must never duplicate work. Same companion must never be created twice. Same PDF must never be re-transcribed unless content changed or user forces it.
 
 **Tasks:**
-- [ ] Extend `ManifestEntry` in `types.ts`:
+- [x] Extend `ManifestEntry` in `types.ts`:
   ```ts
   automationRuns?: {
     [automationId: string]: {
@@ -67,8 +67,8 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
     };
   };
   ```
-- [ ] Add `SyncManifest.recordAutomationRun(driveFileId, automationId, run)` and `getAutomationRun(driveFileId, automationId)`
-- [ ] Implement the decision matrix in `AutomationEngine.ts` — wrap every `runAction()` call:
+- [x] Add `SyncManifest.recordAutomationRun(driveFileId, automationId, run)` and `getAutomationRun(driveFileId, automationId)`
+- [x] Implement the decision matrix in `AutomationEngine.ts` — wrap every `runAction()` call:
 
   | Condition | Default | `force=true` |
   |---|---|---|
@@ -77,7 +77,7 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
   | Ran before, `driveModifiedTime` newer | RUN | RUN |
   | Last result was `error` | RUN | RUN |
 
-- [ ] Record `success` / `skipped` / `error` after each run
+- [x] Record `success` / `skipped` / `error` after each run
 
 **Files:** `types.ts`, `sync/SyncManifest.ts`, `automation/AutomationEngine.ts`.
 
@@ -86,8 +86,8 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 ### 1.2 Companion-creation guard
 
 **Tasks:**
-- [ ] Before `CompanionNoteManager.create()`, look up the manifest entry's `companionPath`. If present AND file exists on disk → switch to `update()`.
-- [ ] If `companionPath` missing but a file with the expected stem exists at the expected location → **adopt** it (write `driveFileId` to its frontmatter, update manifest) instead of creating a new one.
+- [x] Before `CompanionNoteManager.create()`, look up the manifest entry's `companionPath`. If present AND file exists on disk → switch to `update()`.
+- [x] If `companionPath` missing but a file with the expected stem exists at the expected location → **adopt** it (write `driveFileId` to its frontmatter, update manifest) instead of creating a new one.
 
 **Files:** `sync/CompanionNoteManager.ts`.
 
@@ -96,9 +96,9 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 ### 1.3 Transcription guard
 
 **Tasks:**
-- [ ] Read companion `transcribed: true` flag before calling Gemini
-- [ ] If `transcribed=true` AND PDF's `driveModifiedTime` matches the stored `sourceDriveModifiedTime` → skip
-- [ ] Honor `force=true` to override
+- [x] Read companion `transcribed: true` flag before calling Gemini
+- [x] If `transcribed=true` AND PDF's `driveModifiedTime` matches the stored `sourceDriveModifiedTime` → skip
+- [x] Honor `force=true` to override
 
 **Files:** `sync/DriveSync.ts`, `sync/CompanionNoteManager.ts`.
 
@@ -107,9 +107,9 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 ### 1.4 Embed/link/tag guards audit
 
 **Tasks:**
-- [ ] Embed insertions already de-duped at `AutomationEngine.ts:544-546` — verify still correct
-- [ ] Audit `link_to_matching_note` action for the same de-dup pattern; add if missing
-- [ ] Audit `add_tag_to_companion` action — don't re-add an existing tag
+- [x] Embed insertions already de-duped at `AutomationEngine.ts:544-546` — verify still correct
+- [x] Audit `link_to_matching_note` action for the same de-dup pattern; add if missing
+- [x] Audit `add_tag_to_companion` action — don't re-add an existing tag
 
 **Files:** `automation/AutomationEngine.ts`.
 

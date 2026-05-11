@@ -462,7 +462,14 @@ export class DriveSync {
 					// Fall back to manifest's stored companion path when companion notes are
 					// currently disabled — lets transcribe_to_companion find an existing note.
 					const automationCompanionPath = companionPath ?? existing?.companionPath ?? null;
-					await this.automationEngine.runForFile(vaultPath, automationCompanionPath, entry.file.createdTime, transcription);
+					await this.automationEngine.runForFile(
+						vaultPath,
+						automationCompanionPath,
+						entry.file.createdTime,
+						transcription,
+						entry.file.id,
+						entry.file.modifiedTime
+					);
 				}
 
 				console.log(`${LOG} Downloaded: ${displayPath}`);
