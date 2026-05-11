@@ -4,6 +4,7 @@ import { DownloadManager } from "./DownloadManager";
 import { SyncManifestStore } from "./SyncManifest";
 import { CompanionNoteManager } from "./CompanionNoteManager";
 import { AutomationEngine } from "../automation/AutomationEngine";
+import { GeminiClient } from "../ai/GeminiClient";
 import {
 	DeletionBehavior,
 	DriveFile,
@@ -19,6 +20,8 @@ const FILES_API = "https://www.googleapis.com/drive/v3/files";
 const LOG = "[DriveSync/Sync]";
 
 export class DriveSync {
+	private geminiClient: GeminiClient | null = null;
+
 	constructor(
 		private auth: GoogleAuth,
 		private downloader: DownloadManager,
@@ -31,6 +34,29 @@ export class DriveSync {
 
 	updateSettings(settings: PluginSettings): void {
 		this.settings = settings;
+		this.geminiClient = null; // invalidate cached client on settings change
+	}
+
+	private getGeminiClient(): GeminiClient | null {
+		if (!this.settings.geminiApiKey) return null;
+
+		const hasTranscriptionAutomation = this.settings.automations.some(
+			(a) =>
+				a.enabled &&
+				(a.action.type === "transcribe_to_companion" ||
+					a.action.type === "transcribe_to_periodic_note")
+		);
+
+		if (!this.settings.geminiEnabled && !hasTranscriptionAutomation) return null;
+
+		if (!this.geminiClient) {
+			this.geminiClient = new GeminiClient(
+				this.settings.geminiApiKey,
+				this.settings.geminiModel || "gemini-2.0-flash",
+				this.settings.geminiPrompt || "Transcribe all text visible in this PDF exactly as written, preserving structure. Return plain text only."
+			);
+		}
+		return this.geminiClient;
 	}
 
 	async sync(dryRun = false): Promise<SyncResult> {
@@ -377,18 +403,31 @@ export class DriveSync {
 					effectiveRelPath
 				);
 
+				// Attempt Gemini transcription (non-blocking on failure)
+				let transcription: string | undefined;
+				const gemini = this.getGeminiClient();
+				if (gemini) {
+					try {
+						const pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
+						transcription = await gemini.transcribePdf(pdfBytes);
+					} catch (e) {
+						console.error(`${LOG} Gemini transcription failed for "${vaultPath}":`, e);
+					}
+				}
+
 				let companionPath: string | null = null;
 				if (companionEnabled) {
 					const currentCompanionPath = existing?.companionPath ?? null;
 					if (currentCompanionPath) {
-						await this.companion.update(currentCompanionPath, entry.file, pair);
+						await this.companion.update(currentCompanionPath, entry.file, pair, transcription);
 						companionPath = currentCompanionPath;
 					} else {
 						companionPath = await this.companion.create(
 							entry.file,
 							pair,
 							entry.relPath,
-							vaultPath
+							vaultPath,
+							transcription
 						);
 					}
 				}
@@ -402,7 +441,10 @@ export class DriveSync {
 				});
 
 				if (this.automationEngine) {
-					await this.automationEngine.runForFile(vaultPath, companionPath, entry.file.createdTime);
+					// Fall back to manifest's stored companion path when companion notes are
+					// currently disabled — lets transcribe_to_companion find an existing note.
+					const automationCompanionPath = companionPath ?? existing?.companionPath ?? null;
+					await this.automationEngine.runForFile(vaultPath, automationCompanionPath, entry.file.createdTime, transcription);
 				}
 
 				console.log(`${LOG} Downloaded: ${displayPath}`);

@@ -114,6 +114,12 @@ export interface PluginSettings {
 
 	// Periodic notes paths (used by embed_to_weekly_note etc.)
 	periodicNotesPaths: PeriodicNotesPaths;
+
+	// Gemini AI transcription
+	geminiApiKey: string;
+	geminiEnabled: boolean;
+	geminiModel: string;
+	geminiPrompt: string;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -142,6 +148,10 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 		quarterly: "",
 		yearly: "",
 	},
+	geminiApiKey: "",
+	geminiEnabled: false,
+	geminiModel: "gemini-2.0-flash",
+	geminiPrompt: "Transcribe all text visible in this PDF exactly as written, preserving structure. Return plain text only.",
 };
 
 // ── Automations ───────────────────────────────────────────────────────────────
@@ -154,7 +164,9 @@ export type AutomationActionType =
 	| "embed_to_yearly_note"
 	| "append_to_note"
 	| "add_tag_to_companion"
-	| "link_to_matching_note";
+	| "link_to_matching_note"
+	| "transcribe_to_periodic_note"
+	| "transcribe_to_companion";
 
 export interface AutomationAction {
 	type: AutomationActionType;
@@ -186,6 +198,16 @@ export interface AutomationAction {
 	newNoteFolder?: string;
 	/** For link_to_matching_note: vault path to a template note for newly created notes. Blank note when empty. */
 	newNoteTemplatePath?: string;
+	/** For link_to_matching_note: fraction of PDF stem words that must appear in a candidate note name (0.0–1.0). Default 1.0 = all words must match. */
+	matchConfidenceThreshold?: number;
+	/** For link_to_matching_note: also search frontmatter aliases fields when matching note names. */
+	matchOnAliases?: boolean;
+	/** For link_to_matching_note: also add a backlink in the companion note pointing to each matched note. */
+	bidirectionalLink?: boolean;
+	/** For transcribe_to_periodic_note: which periodic note type to append the transcription to. */
+	periodicNoteType?: "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
+	/** For transcribe_to_periodic_note: template for the content inserted. Supports {{transcription}}, {{title}}, {{date}}, {{link}}, {{embed}}. */
+	transcriptionTemplate?: string;
 }
 
 export interface Automation {

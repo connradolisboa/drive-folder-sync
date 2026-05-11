@@ -18,7 +18,8 @@ export class AutomationEngine {
 	async runForFile(
 		vaultPath: string,
 		companionPath?: string | null,
-		driveCreatedTime?: string
+		driveCreatedTime?: string,
+		transcription?: string
 	): Promise<void> {
 		const matching = this.settings.automations.filter(
 			(a) => a.enabled && this.matchesTrigger(a, vaultPath)
@@ -31,7 +32,7 @@ export class AutomationEngine {
 				`${LOG} Running automation "${automation.name}" for: ${vaultPath}`
 			);
 			try {
-				await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime);
+				await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, transcription);
 			} catch (e) {
 				console.error(
 					`${LOG} Automation "${automation.name}" failed for "${vaultPath}":`,
@@ -77,7 +78,8 @@ export class AutomationEngine {
 		action: AutomationAction,
 		vaultPath: string,
 		companionPath?: string | null,
-		driveCreatedTime?: string
+		driveCreatedTime?: string,
+		transcription?: string
 	): Promise<void> {
 		if (action.type === "embed_to_daily_note") {
 			await this.embedToDailyNote(vaultPath, companionPath, action, driveCreatedTime);
@@ -94,7 +96,11 @@ export class AutomationEngine {
 		} else if (action.type === "add_tag_to_companion") {
 			await this.runAddTagToCompanion(companionPath, action);
 		} else if (action.type === "link_to_matching_note") {
-			await this.runLinkToMatchingNote(vaultPath, action);
+			await this.runLinkToMatchingNote(vaultPath, companionPath, action);
+		} else if (action.type === "transcribe_to_periodic_note") {
+			await this.runTranscribeToPeriodicNote(vaultPath, companionPath, action, driveCreatedTime, transcription);
+		} else if (action.type === "transcribe_to_companion") {
+			await this.runTranscribeToCompanion(companionPath, action, transcription);
 		}
 	}
 
@@ -221,6 +227,7 @@ export class AutomationEngine {
 
 	private async runLinkToMatchingNote(
 		vaultPath: string,
+		companionPath: string | null | undefined,
 		action: AutomationAction
 	): Promise<void> {
 		if (!action.searchFolderPath) {
@@ -235,16 +242,35 @@ export class AutomationEngine {
 
 		if (stemWords.length === 0) return;
 
-		const matches = this.app.vault
-			.getMarkdownFiles()
-			.filter((file) => {
-				if (!file.path.startsWith(folderPrefix + "/")) return false;
-				const noteWords = this.normalizeWords(file.basename);
-				return stemWords.every((w) => noteWords.includes(w));
-			});
+		const threshold = action.matchConfidenceThreshold ?? 1.0;
 
-		if (matches.length === 0) {
-			console.log(`${LOG} link_to_matching_note: no notes in "${folderPrefix}" match stem "${stem}"`);
+		const scored = this.app.vault
+			.getMarkdownFiles()
+			.filter((file) => file.path.startsWith(folderPrefix + "/"))
+			.map((file) => {
+				const candidateWords = this.normalizeWords(file.basename);
+
+				if (action.matchOnAliases) {
+					const cache = this.app.metadataCache.getFileCache(file);
+					const aliases = cache?.frontmatter?.aliases;
+					if (typeof aliases === "string") {
+						candidateWords.push(...this.normalizeWords(aliases));
+					} else if (Array.isArray(aliases)) {
+						for (const a of aliases) {
+							if (typeof a === "string") candidateWords.push(...this.normalizeWords(a));
+						}
+					}
+				}
+
+				const matched = stemWords.filter((w) => candidateWords.includes(w)).length;
+				const score = stemWords.length === 0 ? 0 : matched / stemWords.length;
+				return { file, score };
+			})
+			.filter((m) => m.score >= threshold)
+			.sort((a, b) => b.score - a.score);
+
+		if (scored.length === 0) {
+			console.log(`${LOG} link_to_matching_note: no notes in "${folderPrefix}" match stem "${stem}" (threshold=${threshold})`);
 			if (action.createNoteIfNotFound) {
 				await this.createAndLinkNote(stem, fileName, folderPrefix, action);
 			}
@@ -253,10 +279,74 @@ export class AutomationEngine {
 
 		const dateStr = this.extractDate(fileName);
 		const matchLine = this.buildEmbedLine(action.embedTemplate, fileName, stem, dateStr);
-		for (const note of matches) {
-			console.log(`${LOG} link_to_matching_note: inserting embed into ${note.path}`);
+
+		for (const { file: note } of scored) {
+			console.log(`${LOG} link_to_matching_note: inserting embed into ${note.path} (score=${scored.find(m => m.file === note)?.score.toFixed(2)})`);
 			await this.insertEmbed(note, matchLine, action.insertPosition);
 		}
+
+		// Bidirectional: insert backlinks into the companion note
+		if (action.bidirectionalLink && companionPath) {
+			const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
+			if (companionFile instanceof TFile) {
+				for (const { file: matchedNote } of scored) {
+					const backLink = `[[${matchedNote.basename}]]`;
+					await this.insertEmbed(companionFile, backLink, action.insertPosition);
+				}
+			}
+		}
+	}
+
+	private async runTranscribeToPeriodicNote(
+		vaultPath: string,
+		companionPath: string | null | undefined,
+		action: AutomationAction,
+		driveCreatedTime?: string,
+		transcription?: string
+	): Promise<void> {
+		if (!transcription) {
+			console.log(`${LOG} transcribe_to_periodic_note: no transcription available — skipping`);
+			return;
+		}
+
+		const fileName = vaultPath.split("/").pop();
+		if (!fileName) return;
+
+		const dateStr = this.resolveDate(fileName, driveCreatedTime);
+		if (!dateStr) {
+			console.log(`${LOG} transcribe_to_periodic_note: no date found for "${fileName}" — skipping`);
+			return;
+		}
+
+		const period = action.periodicNoteType ?? "daily";
+		const pathTemplate = this.settings.periodicNotesPaths[period];
+		if (!pathTemplate) {
+			console.log(`${LOG} transcribe_to_periodic_note: no path configured for ${period} notes — skipping`);
+			return;
+		}
+
+		const resolvedPath = this.resolveDatePattern(pathTemplate, dateStr);
+		const note = this.findNoteByPath(resolvedPath);
+		if (!note) {
+			console.log(`${LOG} transcribe_to_periodic_note: no ${period} note found for date ${dateStr} ("${resolvedPath}")`);
+			return;
+		}
+
+		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
+		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
+
+		const template = action.transcriptionTemplate
+			?? `\n## Transcription from [[${pdfStem}]]\n\n{{transcription}}`;
+
+		const content = template
+			.replace(/\{\{transcription\}\}/g, transcription)
+			.replace(/\{\{title\}\}/g, pdfStem)
+			.replace(/\{\{date\}\}/g, dateStr)
+			.replace(/\{\{link\}\}/g, `[[${embedTarget}]]`)
+			.replace(/\{\{embed\}\}/g, `![[${embedTarget}]]`);
+
+		console.log(`${LOG} transcribe_to_periodic_note: appending to ${note.path}`);
+		await this.insertEmbed(note, content, action.insertPosition);
 	}
 
 	private async createAndLinkNote(
@@ -309,17 +399,19 @@ export class AutomationEngine {
 	 * Build the full line to insert into the target note.
 	 * If no template is set, falls back to `![[embedTarget]]`.
 	 * Available placeholders:
-	 *   {{embed}}  → ![[embedTarget]]
-	 *   {{link}}   → [[embedTarget]]
-	 *   {{target}} → embedTarget as-is
-	 *   {{title}}  → PDF stem (no extension)
-	 *   {{date}}   → resolved date string, or empty
+	 *   {{embed}}         → ![[embedTarget]]
+	 *   {{link}}          → [[embedTarget]]
+	 *   {{target}}        → embedTarget as-is
+	 *   {{title}}         → PDF stem (no extension)
+	 *   {{date}}          → resolved date string, or empty
+	 *   {{transcription}} → transcription text, or empty
 	 */
 	private buildEmbedLine(
 		template: string | undefined,
 		embedTarget: string,
 		pdfStem: string,
-		dateStr?: string | null
+		dateStr?: string | null,
+		transcription?: string
 	): string {
 		if (!template) return `![[${embedTarget}]]`;
 		const date = dateStr ?? "";
@@ -328,7 +420,8 @@ export class AutomationEngine {
 			.replace(/\{\{link\}\}/g, `[[${embedTarget}]]`)
 			.replace(/\{\{target\}\}/g, embedTarget)
 			.replace(/\{\{title\}\}/g, pdfStem)
-			.replace(/\{\{date\}\}/g, date);
+			.replace(/\{\{date\}\}/g, date)
+			.replace(/\{\{transcription\}\}/g, transcription ?? "");
 	}
 
 	/**
@@ -495,6 +588,53 @@ export class AutomationEngine {
 			this.extractDate(fileName) ??
 			(driveCreatedTime ? this.extractDate(driveCreatedTime) ?? driveCreatedTime.substring(0, 10) : null)
 		);
+	}
+
+	private async runTranscribeToCompanion(
+		companionPath: string | null | undefined,
+		action: AutomationAction,
+		transcription?: string
+	): Promise<void> {
+		if (!transcription) {
+			console.log(`${LOG} transcribe_to_companion: no transcription available — skipping`);
+			return;
+		}
+		if (!companionPath) {
+			console.log(`${LOG} transcribe_to_companion: no companion note for this file — skipping`);
+			return;
+		}
+
+		const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
+		if (!(companionFile instanceof TFile)) {
+			console.log(`${LOG} transcribe_to_companion: companion note not found: ${companionPath}`);
+			return;
+		}
+
+		const content = await this.app.vault.read(companionFile);
+		const header = "## Transcription";
+		const headerNewline = "\n" + header;
+
+		// Build the section content, respecting a custom template if set
+		const template = action.transcriptionTemplate ?? "{{transcription}}";
+		const sectionBody = template.replace(/\{\{transcription\}\}/g, transcription);
+
+		let newContent: string;
+		const sectionIdx = content.indexOf(headerNewline);
+		if (sectionIdx !== -1) {
+			// Replace existing section up to next ## heading or end of file
+			const searchFrom = sectionIdx + 1;
+			const nextSection = content.indexOf("\n## ", searchFrom);
+			const sectionEnd = nextSection !== -1 ? nextSection : content.length;
+			newContent =
+				content.slice(0, sectionIdx) +
+				"\n\n" + header + "\n\n" + sectionBody + "\n" +
+				content.slice(sectionEnd);
+		} else {
+			newContent = content.trimEnd() + "\n\n" + header + "\n\n" + sectionBody + "\n";
+		}
+
+		await this.app.vault.modify(companionFile, newContent);
+		console.log(`${LOG} transcribe_to_companion: transcription written to ${companionPath}`);
 	}
 
 	/**

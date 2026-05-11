@@ -91,18 +91,26 @@ export class CompanionNoteManager {
 	/**
 	 * Create a brand-new companion note from the template.
 	 * Returns the vault path of the created note.
+	 * If `transcription` is provided it will be substituted for {{transcription}} in the template,
+	 * or appended as a ## Transcription section if the template doesn't use that placeholder.
 	 */
 	async create(
 		file: DriveFile,
 		pair: SyncPair,
 		relPath: string,
-		pdfVaultPath: string
+		pdfVaultPath: string,
+		transcription?: string
 	): Promise<string> {
 		const notePath = this.companionPath(pair, relPath, file.name);
 		console.log(`${LOG} Creating companion note: ${notePath}`);
 
 		const template = await this.loadTemplate(pair);
-		const content = this.renderTemplate(template, file, pair, relPath, pdfVaultPath);
+		const templateHasTranscription = template.includes("{{transcription}}");
+		let content = this.renderTemplate(template, file, pair, relPath, pdfVaultPath, transcription);
+
+		if (transcription && !templateHasTranscription) {
+			content = content.trimEnd() + "\n\n## Transcription\n\n" + transcription + "\n";
+		}
 
 		await this.ensureFolder(notePath);
 
@@ -114,6 +122,15 @@ export class CompanionNoteManager {
 			await this.app.vault.create(notePath, content);
 		}
 
+		if (transcription) {
+			const tFile = this.app.vault.getAbstractFileByPath(notePath);
+			if (tFile instanceof TFile) {
+				await this.app.fileManager.processFrontMatter(tFile, (fm) => {
+					fm["transcribed"] = true;
+				});
+			}
+		}
+
 		console.log(`${LOG} Companion note created: ${notePath}`);
 		return notePath;
 	}
@@ -121,8 +138,9 @@ export class CompanionNoteManager {
 	/**
 	 * Update frontmatter of an existing companion note when its PDF is re-downloaded.
 	 * Only touches processed, lastUpdate, syncDate, and pairLabel — preserves the rest of the note.
+	 * If `transcription` is provided, updates or appends the ## Transcription section and sets transcribed: true.
 	 */
-	async update(companionNotePath: string, file: DriveFile, pair: SyncPair): Promise<void> {
+	async update(companionNotePath: string, file: DriveFile, pair: SyncPair, transcription?: string): Promise<void> {
 		console.log(`${LOG} Updating companion note frontmatter: ${companionNotePath}`);
 
 		const tFile = this.app.vault.getAbstractFileByPath(companionNotePath);
@@ -136,7 +154,12 @@ export class CompanionNoteManager {
 			fm["lastUpdate"] = file.modifiedTime;
 			fm["syncDate"] = new Date().toISOString();
 			fm["pairLabel"] = pair.label;
+			if (transcription) fm["transcribed"] = true;
 		});
+
+		if (transcription) {
+			await this.updateTranscriptionSection(tFile, transcription);
+		}
 
 		console.log(`${LOG} Companion note frontmatter updated: ${companionNotePath}`);
 	}
@@ -235,7 +258,8 @@ export class CompanionNoteManager {
 		file: DriveFile,
 		pair: SyncPair,
 		relPath: string,
-		_pdfVaultPath: string
+		_pdfVaultPath: string,
+		transcription?: string
 	): string {
 		const stem = file.name.replace(/\.pdf$/i, "");
 		const syncDate = new Date().toISOString();
@@ -249,7 +273,32 @@ export class CompanionNoteManager {
 			.replaceAll("{{syncDate}}", syncDate)
 			.replaceAll("{{driveFileId}}", file.id)
 			.replaceAll("{{relativePath}}", relPath)
-			.replaceAll("{{pairLabel}}", pair.label);
+			.replaceAll("{{pairLabel}}", pair.label)
+			.replaceAll("{{transcription}}", transcription ?? "");
+	}
+
+	private async updateTranscriptionSection(tFile: TFile, transcription: string): Promise<void> {
+		const content = await this.app.vault.read(tFile);
+		const header = "## Transcription";
+		const headerWithNewline = "\n" + header;
+
+		let newContent: string;
+		const sectionIdx = content.indexOf(headerWithNewline);
+		if (sectionIdx !== -1) {
+			// Replace existing section up to the next ## heading or end of file
+			const searchFrom = sectionIdx + 1;
+			const nextSection = content.indexOf("\n## ", searchFrom);
+			const sectionEnd = nextSection !== -1 ? nextSection : content.length;
+			newContent =
+				content.slice(0, sectionIdx) +
+				"\n\n" + header + "\n\n" + transcription + "\n" +
+				content.slice(sectionEnd);
+		} else {
+			newContent = content.trimEnd() + "\n\n" + header + "\n\n" + transcription + "\n";
+		}
+
+		await this.app.vault.modify(tFile, newContent);
+		console.log(`${LOG} Transcription section updated in: ${tFile.path}`);
 	}
 
 	private async ensureFolder(filePath: string): Promise<void> {

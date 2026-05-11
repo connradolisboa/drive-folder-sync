@@ -1,6 +1,6 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
-import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, SyncPair } from "../types";
+import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, PluginSettings, SyncPair } from "../types";
 
 type TabId = "account" | "sync" | "notes" | "automations";
 
@@ -281,6 +281,77 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						new Notice("Google Drive disconnected.");
 					})
 			);
+
+		// ── Gemini AI ─────────────────────────────────────────────────────────
+		el.createEl("h3", { text: "Gemini AI (optional)" });
+		el.createEl("p", {
+			text:
+				"Use Google's Gemini API to transcribe handwritten or printed text from synced PDFs. " +
+				"Transcription is stored in companion notes and available as {{transcription}} in templates.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(el)
+			.setName("Gemini API key")
+			.setDesc("Your Gemini API key from Google AI Studio (aistudio.google.com). Stored locally.")
+			.addText((text) => {
+				text.inputEl.type = "password";
+				text
+					.setPlaceholder("AIza…")
+					.setValue(this.plugin.settings.geminiApiKey)
+					.onChange(async (val) => {
+						this.plugin.settings.geminiApiKey = val.trim();
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(el)
+			.setName("Enable Gemini transcription")
+			.setDesc("Automatically transcribe PDFs when they are downloaded during sync.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.geminiEnabled)
+					.onChange(async (val) => {
+						this.plugin.settings.geminiEnabled = val;
+						await this.plugin.saveSettings();
+						geminiModelSetting.settingEl.toggle(val);
+						geminiPromptSetting.settingEl.toggle(val);
+					})
+			);
+
+		const geminiModelSetting = new Setting(el)
+			.setName("Model")
+			.setDesc("Gemini model to use for transcription.")
+			.addDropdown((drop) =>
+				drop
+					.addOption("gemini-2.0-flash", "Gemini 2.0 Flash (recommended)")
+					.addOption("gemini-1.5-flash", "Gemini 1.5 Flash")
+					.addOption("gemini-1.5-pro", "Gemini 1.5 Pro")
+					.setValue(this.plugin.settings.geminiModel || "gemini-2.0-flash")
+					.onChange(async (val) => {
+						this.plugin.settings.geminiModel = val;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		const geminiPromptSetting = new Setting(el)
+			.setName("Transcription prompt")
+			.setDesc("Instructions sent to Gemini for each PDF. Customize for your note-taking style.")
+			.addTextArea((text) => {
+				text
+					.setPlaceholder("Transcribe all text visible in this PDF exactly as written…")
+					.setValue(this.plugin.settings.geminiPrompt)
+					.onChange(async (val) => {
+						this.plugin.settings.geminiPrompt = val;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.rows = 4;
+				text.inputEl.style.width = "100%";
+				text.inputEl.style.resize = "vertical";
+			});
+
+		geminiModelSetting.settingEl.toggle(this.plugin.settings.geminiEnabled);
+		geminiPromptSetting.settingEl.toggle(this.plugin.settings.geminiEnabled);
 	}
 
 	private renderSyncTab(el: HTMLElement): void {
@@ -571,7 +642,8 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				"Vault path to a .md file to use as the companion note template. " +
 				"Leave empty to use the built-in default. " +
 				"Available placeholders: {{title}}, {{fileName}}, {{fileLink}}, " +
-				"{{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}, {{pairLabel}}"
+				"{{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}, {{pairLabel}}, " +
+				"{{transcription}} (Gemini transcription text, if enabled)."
 			)
 			.addText((text) =>
 				text
@@ -1078,18 +1150,21 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					"Periodic embeds insert a link into the matching periodic note (path configured in the Notes tab). " +
 					"append_to_note appends to any named note. " +
 					"add_tag_to_companion adds a tag to the companion note's frontmatter. " +
-					"link_to_matching_note finds notes in a folder whose name contains all words of the PDF title and inserts an embed."
+					"link_to_matching_note finds notes in a folder whose name contains all words of the PDF title and inserts an embed. " +
+					"transcribe_to_periodic_note appends the Gemini transcription to a periodic note (requires Gemini enabled)."
 				)
 				.addDropdown((drop) =>
 					drop
-						.addOption("embed_to_daily_note",     "Embed to daily note")
-						.addOption("embed_to_weekly_note",    "Embed to weekly note")
-						.addOption("embed_to_monthly_note",   "Embed to monthly note")
-						.addOption("embed_to_quarterly_note", "Embed to quarterly note")
-						.addOption("embed_to_yearly_note",    "Embed to yearly note")
-						.addOption("append_to_note",          "Append to note")
-						.addOption("add_tag_to_companion",    "Add tag to companion note")
-						.addOption("link_to_matching_note",   "Link to matching note")
+						.addOption("embed_to_daily_note",        "Embed to daily note")
+						.addOption("embed_to_weekly_note",       "Embed to weekly note")
+						.addOption("embed_to_monthly_note",      "Embed to monthly note")
+						.addOption("embed_to_quarterly_note",    "Embed to quarterly note")
+						.addOption("embed_to_yearly_note",       "Embed to yearly note")
+						.addOption("append_to_note",             "Append to note")
+						.addOption("add_tag_to_companion",       "Add tag to companion note")
+						.addOption("link_to_matching_note",      "Link to matching note")
+						.addOption("transcribe_to_periodic_note","Transcribe to periodic note")
+						.addOption("transcribe_to_companion",    "Transcribe to companion note")
 						.setValue(automation.action.type)
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].action.type =
@@ -1216,6 +1291,89 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				);
 			newNoteTemplateSetting.settingEl.toggle(createNoteEnabled);
 
+			// ── link_to_matching_note advanced options ──────────────────────
+			const matchThresholdSetting = new Setting(bodyEl)
+				.setName("Match confidence threshold")
+				.setDesc(
+					"Fraction of PDF title words that must appear in a note name (1.0 = all words). " +
+					"Lower values allow partial matches (e.g. 0.5 = half the words)."
+				)
+				.addSlider((slider) =>
+					slider
+						.setLimits(0.5, 1.0, 0.05)
+						.setValue(automation.action.matchConfidenceThreshold ?? 1.0)
+						.setDynamicTooltip()
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.matchConfidenceThreshold = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const matchAliasesSetting = new Setting(bodyEl)
+				.setName("Match on aliases")
+				.setDesc("Also check note frontmatter aliases fields when searching for a match.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.matchOnAliases ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.matchOnAliases = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const bidirectionalLinkSetting = new Setting(bodyEl)
+				.setName("Bidirectional link")
+				.setDesc("Also add a backlink to the matched note inside the companion note.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.bidirectionalLink ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.bidirectionalLink = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			// ── transcribe_to_periodic_note options ─────────────────────────
+			const periodicNoteTypeSetting = new Setting(bodyEl)
+				.setName("Periodic note type")
+				.setDesc("Which periodic note to append the transcription to.")
+				.addDropdown((drop) =>
+					drop
+						.addOption("daily",     "Daily")
+						.addOption("weekly",    "Weekly")
+						.addOption("monthly",   "Monthly")
+						.addOption("quarterly", "Quarterly")
+						.addOption("yearly",    "Yearly")
+						.setValue(automation.action.periodicNoteType ?? "daily")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.periodicNoteType =
+								val as "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const transcriptionTemplateSetting = new Setting(bodyEl)
+				.setName("Transcription template")
+				.setDesc(
+					"Template for the content inserted into the periodic note. " +
+					"Placeholders: {{transcription}}, {{title}}, {{date}}, {{link}} → [[file]], {{embed}} → ![[file]]. " +
+					"Leave empty to use the default."
+				)
+				.addTextArea((text) => {
+					text
+						.setPlaceholder("## Transcription from [[{{title}}]]\n\n{{transcription}}")
+						.setValue(automation.action.transcriptionTemplate ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.transcriptionTemplate =
+								val.trim() || undefined;
+							await this.plugin.saveSettings();
+						});
+					text.inputEl.rows = 4;
+					text.inputEl.style.width = "100%";
+					text.inputEl.style.fontFamily = "monospace";
+					text.inputEl.style.resize = "vertical";
+				});
+
 			const insertPositionSetting = new Setting(bodyEl)
 				.setName("Insert position")
 				.setDesc("Where in the note to insert the embed.")
@@ -1276,10 +1434,14 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				type === "embed_to_quarterly_note" ||
 				type === "embed_to_yearly_note" ||
 				type === "append_to_note" ||
-				type === "link_to_matching_note";
+				type === "link_to_matching_note" ||
+				type === "transcribe_to_periodic_note";
 
 			const updateActionFieldVisibility = (type: AutomationActionType) => {
 				const isLinkToNote = type === "link_to_matching_note";
+				const isTranscribePeriodicAction = type === "transcribe_to_periodic_note";
+				const isTranscribeCompanionAction = type === "transcribe_to_companion";
+				const isAnyTranscribeAction = isTranscribePeriodicAction || isTranscribeCompanionAction;
 				const createEnabled = this.plugin.settings.automations[i].action.createNoteIfNotFound ?? false;
 				dailyPatternSetting.settingEl.toggle(type === "embed_to_daily_note");
 				targetNoteSetting.settingEl.toggle(type === "append_to_note");
@@ -1288,9 +1450,14 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				createNoteIfNotFoundSetting.settingEl.toggle(isLinkToNote);
 				newNoteFolderSetting.settingEl.toggle(isLinkToNote && createEnabled);
 				newNoteTemplateSetting.settingEl.toggle(isLinkToNote && createEnabled);
+				matchThresholdSetting.settingEl.toggle(isLinkToNote);
+				matchAliasesSetting.settingEl.toggle(isLinkToNote);
+				bidirectionalLinkSetting.settingEl.toggle(isLinkToNote);
+				periodicNoteTypeSetting.settingEl.toggle(isTranscribePeriodicAction);
+				transcriptionTemplateSetting.settingEl.toggle(isAnyTranscribeAction);
 				insertPositionSetting.settingEl.toggle(isEmbedType(type));
-				embedCompanionSetting.settingEl.toggle(isEmbedType(type) && !isLinkToNote);
-				embedTemplateSetting.settingEl.toggle(isEmbedType(type));
+				embedCompanionSetting.settingEl.toggle(isEmbedType(type) && !isLinkToNote && !isAnyTranscribeAction);
+				embedTemplateSetting.settingEl.toggle(isEmbedType(type) && !isAnyTranscribeAction);
 			};
 			updateActionFieldVisibility(automation.action.type);
 		});
