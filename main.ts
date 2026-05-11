@@ -11,6 +11,7 @@ import { DriveSyncSettingTab } from "./settings/SettingsTab";
 import { AutomationEngine } from "./automation/AutomationEngine";
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from "./ui/SyncStatusView";
 import { DryRunModal } from "./ui/DryRunModal";
+import { transcribeCurrentFile } from "./commands/TranscribeCurrentFile";
 import { Automation, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
@@ -20,8 +21,8 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	auth: GoogleAuth;
 	scheduler: Scheduler;
 	lastSyncResult: SyncResult | null = null;
+	manifestStore: SyncManifestStore;
 	private driveSync: DriveSync;
-	private manifestStore: SyncManifestStore;
 	private companionManager: CompanionNoteManager;
 	private automationEngine: AutomationEngine;
 	private syncLogger: SyncLogger;
@@ -117,6 +118,16 @@ export default class DriveFolderSyncPlugin extends Plugin {
 						.then((r) => new Notice(this.formatResult(r)))
 						.catch((e) => new Notice(`Drive sync failed: ${(e as Error).message}`));
 				}).open();
+			},
+		});
+
+		this.addCommand({
+			id: "transcribe-current-file",
+			name: "Transcribe current file…",
+			callback: () => {
+				transcribeCurrentFile(this).catch((e) =>
+					new Notice(`Transcription failed: ${(e as Error).message}`)
+				);
 			},
 		});
 

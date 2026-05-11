@@ -156,26 +156,26 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 **Goal:** Command palette entry that transcribes the currently active file to a chosen destination.
 
 **Tasks:**
-- [ ] Register `drive-sync:transcribe-current-file` in `main.ts`
-- [ ] Create `commands/TranscribeCurrentFile.ts`:
-  - [ ] Get active file via `app.workspace.getActiveFile()`
-  - [ ] Validate file type (PDF for v1; flag images/audio as out-of-scope)
-  - [ ] Modal: choose destination
-    - [ ] Companion note (create if missing)
-    - [ ] Today's daily note
-    - [ ] Pick a file… (`FuzzySuggestModal` over all markdown files)
-  - [ ] If destination already has a transcription, prompt: skip / append / replace
-  - [ ] Call `GeminiClient.transcribePdf()`
-  - [ ] Write to destination using existing helpers (`CompanionNoteManager.update()` for companion path, plain `vault.process()` otherwise)
-- [ ] Resolve daily-note path:
-  - [ ] Try Obsidian's Daily Notes plugin settings first
-  - [ ] Fall back to plugin setting `transcribeDailyNoteFormat` (default: `YYYY-MM-DD.md` in vault root)
+- [x] Register `drive-sync:transcribe-current-file` in `main.ts`
+- [x] Create `commands/TranscribeCurrentFile.ts`:
+  - [x] Get active file via `app.workspace.getActiveFile()`
+  - [x] Validate file type (PDF for v1; flag images/audio as out-of-scope)
+  - [x] Modal: choose destination
+    - [x] Companion note (create if missing)
+    - [x] Today's daily note
+    - [x] Pick a file… (`FuzzySuggestModal` over all markdown files)
+  - [x] If destination already has a transcription, prompt: skip / append / replace
+  - [x] Call `GeminiClient.transcribePdf()`
+  - [x] Write to destination using existing helpers (`CompanionNoteManager.update()` for companion path, plain `vault.process()` otherwise)
+- [x] Resolve daily-note path:
+  - [x] Try Obsidian's Daily Notes plugin settings first
+  - [x] Fall back to plugin setting `transcribeDailyNoteFormat` (default: `YYYY-MM-DD.md` in vault root)
 
 **Files:** `main.ts`, new `commands/TranscribeCurrentFile.ts`, reuses `ai/GeminiClient.ts` + `sync/CompanionNoteManager.ts`.
 
-**Open questions:**
-- [ ] Daily note path/format — read Daily Notes core plugin settings, or expose our own? Decide before implementation.
-- [ ] Non-PDF support (images, audio via Gemini multimodal) — defer to a follow-up?
+**Decisions made:**
+- Daily note path: reads core Daily Notes plugin settings first (format + folder), falls back to `periodicNotesPaths.daily` template, then `YYYY-MM-DD.md` in vault root.
+- Non-PDF support (images, audio): deferred to a follow-up phase.
 
 **Verification:** Open a PDF, run command, pick "Today's daily note" → transcription appears under a heading in today's note. Run again → prompt asks before overwriting.
 
