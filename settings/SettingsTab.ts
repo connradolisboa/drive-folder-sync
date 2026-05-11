@@ -1,4 +1,4 @@
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
 import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, PluginSettings, SyncPair } from "../types";
 
@@ -1044,6 +1044,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 		}
 
 		const TRASH_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`;
+		const RUN_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
 
 		const TOKEN_HINT =
 			"Supports date tokens from the PDF filename: " +
@@ -1062,6 +1063,27 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			this.addCardToggle(controlsEl, automation.enabled, async (val) => {
 				this.plugin.settings.automations[i].enabled = val;
 				await this.plugin.saveSettings();
+			});
+
+			// Run on existing files button
+			this.addCardButton(controlsEl, RUN_ICON, "Run on existing files", () => {
+				const count = this.plugin.countMatchingFilesForAutomation(automation.id);
+				new RunOnExistingFilesModal(this.app, automation.name, count, (force) => {
+					(async () => {
+						const notice = new Notice(`Running "${automation.name}"…`, 0);
+						try {
+							const r = await this.plugin.runAutomationOnExistingFiles(automation.id, { force });
+							notice.hide();
+							new Notice(
+								`"${automation.name}" — ${r.ran} ran, ${r.skipped} skipped` +
+								(r.errors > 0 ? `, ${r.errors} errors` : "")
+							);
+						} catch (err) {
+							notice.hide();
+							new Notice(`Automation failed: ${(err as Error).message}`);
+						}
+					})();
+				}).open();
 			});
 
 			// Delete button
@@ -1465,5 +1487,45 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 
 	private generateId(): string {
 		return Math.random().toString(36).slice(2) + Date.now().toString(36);
+	}
+}
+
+class RunOnExistingFilesModal extends Modal {
+	private force = false;
+
+	constructor(
+		app: App,
+		private automationName: string,
+		private matchedCount: number,
+		private onConfirm: (force: boolean) => void
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: `Run "${this.automationName}"` });
+		contentEl.createEl("p", {
+			text: `This will check ${this.matchedCount} matching file${this.matchedCount !== 1 ? "s" : ""}.`,
+			cls: "setting-item-description",
+		});
+
+		new Setting(contentEl)
+			.setName("Force re-run")
+			.setDesc("Re-run even for files already completed at the current Drive version.")
+			.addToggle((t) => t.setValue(false).onChange((v) => { this.force = v; }));
+
+		new Setting(contentEl)
+			.addButton((b) =>
+				b.setButtonText("Run").setCta().onClick(() => {
+					this.close();
+					this.onConfirm(this.force);
+				})
+			)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }

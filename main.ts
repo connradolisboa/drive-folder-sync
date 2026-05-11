@@ -1,4 +1,4 @@
-import { App, FuzzySuggestModal, Notice, Plugin } from "obsidian";
+import { App, FuzzySuggestModal, Modal, Notice, Plugin, Setting } from "obsidian";
 import * as crypto from "crypto";
 import { GoogleAuth } from "./auth/GoogleAuth";
 import { DriveSync } from "./sync/DriveSync";
@@ -11,7 +11,7 @@ import { DriveSyncSettingTab } from "./settings/SettingsTab";
 import { AutomationEngine } from "./automation/AutomationEngine";
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from "./ui/SyncStatusView";
 import { DryRunModal } from "./ui/DryRunModal";
-import { DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
+import { Automation, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
 
@@ -120,6 +120,69 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "run-automations-all",
+			name: "Run all automations on existing files",
+			callback: () => {
+				const active = this.settings.automations.filter((a) => a.enabled);
+				if (active.length === 0) {
+					new Notice("No active automations configured.");
+					return;
+				}
+				(async () => {
+					const notice = new Notice(
+						`Running ${active.length} automation${active.length !== 1 ? "s" : ""}…`,
+						0
+					);
+					let ran = 0, skipped = 0, errors = 0;
+					try {
+						for (const automation of active) {
+							const r = await this.runAutomationOnExistingFiles(automation.id, { force: false });
+							ran += r.ran;
+							skipped += r.skipped;
+							errors += r.errors;
+						}
+						notice.hide();
+						new Notice(
+							`All automations complete — ${ran} ran, ${skipped} skipped` +
+							(errors > 0 ? `, ${errors} errors` : "")
+						);
+					} catch (e) {
+						notice.hide();
+						new Notice(`Automation run failed: ${(e as Error).message}`);
+					}
+				})();
+			},
+		});
+
+		this.addCommand({
+			id: "run-automation",
+			name: "Run automation on existing files…",
+			callback: () => {
+				const active = this.settings.automations.filter((a) => a.enabled);
+				if (active.length === 0) {
+					new Notice("No active automations configured.");
+					return;
+				}
+				new AutomationPickerModal(this.app, active, (automation, force) => {
+					(async () => {
+						const notice = new Notice(`Running "${automation.name}"…`, 0);
+						try {
+							const r = await this.runAutomationOnExistingFiles(automation.id, { force });
+							notice.hide();
+							new Notice(
+								`"${automation.name}" — ${r.ran} ran, ${r.skipped} skipped` +
+								(r.errors > 0 ? `, ${r.errors} errors` : "")
+							);
+						} catch (e) {
+							notice.hide();
+							new Notice(`Automation failed: ${(e as Error).message}`);
+						}
+					})();
+				}).open();
+			},
+		});
+
 		// Heal manifest when user manually moves/renames a synced file in the vault
 		this.registerEvent(
 			this.app.vault.on("rename", async (file, oldPath) => {
@@ -204,6 +267,17 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		} finally {
 			this.syncing = false;
 		}
+	}
+
+	countMatchingFilesForAutomation(automationId: string): number {
+		return this.automationEngine.countMatchingFiles(automationId);
+	}
+
+	async runAutomationOnExistingFiles(
+		automationId: string,
+		opts: { force?: boolean } = {}
+	): Promise<{ matched: number; ran: number; skipped: number; errors: number }> {
+		return this.automationEngine.runForAllMatchingFiles(automationId, opts);
 	}
 
 	private pushResultToStatusView(result: SyncResult): void {
@@ -301,5 +375,65 @@ class SyncPairPickerModal extends FuzzySuggestModal<SyncPair> {
 
 	onChooseItem(pair: SyncPair): void {
 		this.onChoose(pair);
+	}
+}
+
+class AutomationPickerModal extends FuzzySuggestModal<Automation> {
+	constructor(
+		app: App,
+		private automations: Automation[],
+		private onChoose: (automation: Automation, force: boolean) => void
+	) {
+		super(app);
+		this.setPlaceholder("Pick an automation…");
+	}
+
+	getItems(): Automation[] {
+		return this.automations;
+	}
+
+	getItemText(automation: Automation): string {
+		return automation.name;
+	}
+
+	onChooseItem(automation: Automation): void {
+		new AutomationForceModal(this.app, automation, (force) => {
+			this.onChoose(automation, force);
+		}).open();
+	}
+}
+
+class AutomationForceModal extends Modal {
+	private force = false;
+
+	constructor(
+		app: App,
+		private automation: Automation,
+		private onConfirm: (force: boolean) => void
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: `Run "${this.automation.name}"` });
+
+		new Setting(contentEl)
+			.setName("Force re-run")
+			.setDesc("Re-run even for files already completed at the current Drive version.")
+			.addToggle((t) => t.setValue(false).onChange((v) => { this.force = v; }));
+
+		new Setting(contentEl)
+			.addButton((b) =>
+				b.setButtonText("Run").setCta().onClick(() => {
+					this.close();
+					this.onConfirm(this.force);
+				})
+			)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }

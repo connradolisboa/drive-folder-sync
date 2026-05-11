@@ -124,15 +124,15 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 **Goal:** Apply an existing automation to files already in the vault, without forcing a re-sync.
 
 **Tasks:**
-- [ ] Add `AutomationEngine.runForAllMatchingFiles(automationId, opts: { force?: boolean, dryRun?: boolean })`:
-  - [ ] Iterate every manifest entry
-  - [ ] Filter by automation's `triggerFolderPath` + `scope` + `excluded`
-  - [ ] Apply the §1.1 decision matrix per file
-  - [ ] Call `runAction()` for each match
-  - [ ] Return `{ matched, ran, skipped, errors }`
-- [ ] Add "Run on existing files" button next to each automation row in `settings/SettingsTab.ts`
-- [ ] Confirmation modal shows: "This will check N matching files. Force re-run already-completed files? [No / Yes]"
-- [ ] Progress notice during execution; final summary notice
+- [x] Add `AutomationEngine.runForAllMatchingFiles(automationId, opts: { force?: boolean, dryRun?: boolean })`:
+  - [x] Iterate every manifest entry
+  - [x] Filter by automation's `triggerFolderPath` + `scope` + `excluded`
+  - [x] Apply the §1.1 decision matrix per file
+  - [x] Call `runAction()` for each match
+  - [x] Return `{ matched, ran, skipped, errors }`
+- [x] Add "Run on existing files" button next to each automation row in `settings/SettingsTab.ts`
+- [x] Confirmation modal shows: "This will check N matching files. Force re-run already-completed files? [No / Yes]"
+- [x] Progress notice during execution; final summary notice
 
 **Files:** `automation/AutomationEngine.ts`, `settings/SettingsTab.ts`.
 
@@ -141,9 +141,9 @@ Action plan for the next round of drive-folder-sync features. Implementation is 
 ### 2.2 Command palette: run automations
 
 **Tasks:**
-- [ ] `drive-sync:run-automations-all` → iterates every active automation, calls `runForAllMatchingFiles(id, { force: false })`
-- [ ] `drive-sync:run-automation` → modal picks one automation, then prompt for `force` y/n
-- [ ] Both reuse the Phase 0 modal pattern
+- [x] `drive-sync:run-automations-all` → iterates every active automation, calls `runForAllMatchingFiles(id, { force: false })`
+- [x] `drive-sync:run-automation` → modal picks one automation, then prompt for `force` y/n
+- [x] Both reuse the Phase 0 modal pattern
 
 **Files:** `main.ts`.
 

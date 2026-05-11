@@ -24,6 +24,88 @@ export class AutomationEngine {
 		this.manifest = manifest;
 	}
 
+	countMatchingFiles(automationId: string): number {
+		const automation = this.settings.automations.find((a) => a.id === automationId);
+		if (!automation || !this.manifest) return 0;
+		return this.manifest
+			.entries()
+			.filter(([, entry]) => this.matchesTrigger(automation, entry.vaultPath))
+			.length;
+	}
+
+	async runForAllMatchingFiles(
+		automationId: string,
+		opts: { force?: boolean; dryRun?: boolean } = {}
+	): Promise<{ matched: number; ran: number; skipped: number; errors: number }> {
+		const automation = this.settings.automations.find((a) => a.id === automationId);
+		if (!automation) return { matched: 0, ran: 0, skipped: 0, errors: 0 };
+
+		const entries = this.manifest?.entries() ?? [];
+		let matched = 0, ran = 0, skipped = 0, errors = 0;
+
+		for (const [driveFileId, entry] of entries) {
+			if (!this.matchesTrigger(automation, entry.vaultPath)) continue;
+			matched++;
+
+			const willRun = this.shouldRunAutomation(
+				automation.id,
+				driveFileId,
+				entry.driveModifiedTime,
+				opts.force ?? false
+			);
+
+			if (opts.dryRun) {
+				if (willRun) ran++; else skipped++;
+				continue;
+			}
+
+			if (!willRun) {
+				skipped++;
+				this.manifest?.recordAutomationRun(driveFileId, automation.id, {
+					lastRunAt: new Date().toISOString(),
+					lastRunDriveModifiedTime: entry.driveModifiedTime ?? "",
+					result: "skipped",
+				});
+				continue;
+			}
+
+			console.log(`${LOG} runForAllMatchingFiles: running "${automation.name}" for "${entry.vaultPath}"`);
+			try {
+				await this.runAction(
+					automation.action,
+					entry.vaultPath,
+					entry.companionPath,
+					entry.driveCreatedTime,
+					undefined
+				);
+				this.manifest?.recordAutomationRun(driveFileId, automation.id, {
+					lastRunAt: new Date().toISOString(),
+					lastRunDriveModifiedTime: entry.driveModifiedTime ?? "",
+					result: "success",
+				});
+				ran++;
+			} catch (e) {
+				console.error(
+					`${LOG} runForAllMatchingFiles: "${automation.name}" failed for "${entry.vaultPath}":`,
+					e
+				);
+				this.manifest?.recordAutomationRun(driveFileId, automation.id, {
+					lastRunAt: new Date().toISOString(),
+					lastRunDriveModifiedTime: entry.driveModifiedTime ?? "",
+					result: "error",
+					errorMessage: e instanceof Error ? e.message : String(e),
+				});
+				errors++;
+			}
+		}
+
+		if (!opts.dryRun && (ran > 0 || errors > 0)) {
+			await this.manifest?.save();
+		}
+
+		return { matched, ran, skipped, errors };
+	}
+
 	async runForFile(
 		vaultPath: string,
 		companionPath?: string | null,
