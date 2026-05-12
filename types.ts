@@ -120,6 +120,13 @@ export interface PluginSettings {
 	syncLogEnabled: boolean;
 	syncLogPath: string;
 
+	// Sync activity log (JSON-lines, separate from the markdown sync log)
+	syncActivityLogEnabled: boolean;
+	syncActivityLogLevel: "info" | "warn" | "error";
+
+	// Conflict policy for companion note concurrent edits
+	conflictPolicy: "save-both" | "keep-vault" | "take-drive" | "ask";
+
 	// Automations
 	automations: Automation[];
 
@@ -157,6 +164,9 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	driveArchiveFolderId: "",
 	syncLogEnabled: false,
 	syncLogPath: "Drive Sync/.sync-log.md",
+	syncActivityLogEnabled: false,
+	syncActivityLogLevel: "info",
+	conflictPolicy: "save-both",
 	companionNotesEnabled: false,
 	companionNotesFolder: "",
 	companionNoteTemplatePath: "",

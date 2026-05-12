@@ -36,12 +36,13 @@ export class AutomationEngine {
 	async runForAllMatchingFiles(
 		automationId: string,
 		opts: { force?: boolean; dryRun?: boolean } = {}
-	): Promise<{ matched: number; ran: number; skipped: number; errors: number }> {
+	): Promise<{ matched: number; ran: number; skipped: number; errors: number; preview?: Array<{ vaultPath: string; willRun: boolean; skipReason?: string }> }> {
 		const automation = this.settings.automations.find((a) => a.id === automationId);
 		if (!automation) return { matched: 0, ran: 0, skipped: 0, errors: 0 };
 
 		const entries = this.manifest?.entries() ?? [];
 		let matched = 0, ran = 0, skipped = 0, errors = 0;
+		const preview: Array<{ vaultPath: string; willRun: boolean; skipReason?: string }> = [];
 
 		for (const [driveFileId, entry] of entries) {
 			if (!this.matchesTrigger(automation, entry.vaultPath)) continue;
@@ -55,7 +56,13 @@ export class AutomationEngine {
 			);
 
 			if (opts.dryRun) {
-				if (willRun) ran++; else skipped++;
+				if (willRun) {
+					ran++;
+					preview.push({ vaultPath: entry.vaultPath, willRun: true });
+				} else {
+					skipped++;
+					preview.push({ vaultPath: entry.vaultPath, willRun: false, skipReason: "already ran for this Drive version" });
+				}
 				continue;
 			}
 
@@ -103,7 +110,7 @@ export class AutomationEngine {
 			await this.manifest?.save();
 		}
 
-		return { matched, ran, skipped, errors };
+		return { matched, ran, skipped, errors, ...(opts.dryRun ? { preview } : {}) };
 	}
 
 	async runForFile(
@@ -121,7 +128,32 @@ export class AutomationEngine {
 
 		if (matching.length === 0) return;
 
+		// 6.2: Read skip flags from companion frontmatter
+		let skipAll = false;
+		let skipList: string[] = [];
+		if (companionPath) {
+			const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
+			if (companionFile instanceof TFile) {
+				const cache = this.app.metadataCache.getFileCache(companionFile);
+				const fm = cache?.frontmatter;
+				if (fm?.["drive-sync-skip-all"] === true) skipAll = true;
+				if (Array.isArray(fm?.["drive-sync-skip-automations"])) {
+					skipList = fm["drive-sync-skip-automations"] as string[];
+				}
+			}
+		}
+
+		if (skipAll) {
+			console.log(`${LOG} Skipping all automations for "${vaultPath}" — drive-sync-skip-all: true`);
+			return;
+		}
+
 		for (const automation of matching) {
+			if (skipList.includes(automation.id)) {
+				console.log(`${LOG} Skipping automation "${automation.name}" for "${vaultPath}" — in drive-sync-skip-automations`);
+				continue;
+			}
+
 			const shouldRun = this.shouldRunAutomation(automation.id, driveFileId, driveModifiedTime, force);
 
 			if (!shouldRun) {

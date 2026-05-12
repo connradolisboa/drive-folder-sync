@@ -1,6 +1,7 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
 import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, PluginSettings, SyncPair } from "../types";
+import { AutomationDryRunModal } from "../ui/AutomationDryRunModal";
 
 type TabId = "account" | "sync" | "notes" | "automations";
 
@@ -594,6 +595,43 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 
 		syncLogPathSetting.settingEl.toggle(this.plugin.settings.syncLogEnabled);
 
+		// ── Sync activity log ─────────────────────────────────────────────
+		el.createEl("h3", { text: "Sync activity log" });
+		el.createEl("p", {
+			text: "A rolling JSON-lines log at .obsidian/drive-sync.log. Rotates at 10MB, keeps 3 backups. Use the \"View sync activity log\" command to browse entries.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(el)
+			.setName("Enable sync activity log")
+			.setDesc("Record detailed per-file events to the activity log.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.syncActivityLogEnabled)
+					.onChange(async (val) => {
+						this.plugin.settings.syncActivityLogEnabled = val;
+						await this.plugin.saveSettings();
+						activityLogLevelSetting.settingEl.toggle(val);
+					})
+			);
+
+		const activityLogLevelSetting = new Setting(el)
+			.setName("Log level")
+			.setDesc("Minimum severity level to record.")
+			.addDropdown((drop) =>
+				drop
+					.addOption("info",  "Info — all events")
+					.addOption("warn",  "Warn — warnings and errors only")
+					.addOption("error", "Error — errors only")
+					.setValue(this.plugin.settings.syncActivityLogLevel ?? "info")
+					.onChange(async (val) => {
+						this.plugin.settings.syncActivityLogLevel = val as "info" | "warn" | "error";
+						await this.plugin.saveSettings();
+					})
+			);
+
+		activityLogLevelSetting.settingEl.toggle(this.plugin.settings.syncActivityLogEnabled);
+
 		// ── Manual sync ───────────────────────────────────────────────────
 		el.createEl("h3", { text: "Manual sync" });
 
@@ -719,6 +757,29 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 		companionTitleSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
 		companionTemplateSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
 
+		// ── Conflict resolution ─────────────────────────────────────────────
+		el.createEl("h3", { text: "Conflict resolution" });
+		el.createEl("p", {
+			text: "When Drive Sync detects that you've edited a companion note since the last sync, this policy controls what happens.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(el)
+			.setName("Conflict policy")
+			.setDesc("What to do when a companion note has been edited locally since the last sync.")
+			.addDropdown((drop) =>
+				drop
+					.addOption("save-both",  "Save both — backup local edits, apply Drive update (default)")
+					.addOption("keep-vault", "Keep vault — skip Drive update, preserve local edits")
+					.addOption("take-drive", "Take Drive — overwrite local edits without backup")
+					.addOption("ask",        "Ask — show a dialog for each conflict during sync")
+					.setValue(this.plugin.settings.conflictPolicy ?? "save-both")
+					.onChange(async (val) => {
+						this.plugin.settings.conflictPolicy = val as "save-both" | "keep-vault" | "take-drive" | "ask";
+						await this.plugin.saveSettings();
+					})
+			);
+
 		// ── Periodic Notes ────────────────────────────────────────────────
 		el.createEl("h3", { text: "Periodic Notes" });
 		el.createEl("p", {
@@ -761,6 +822,14 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				"Each automation matches a vault folder path and performs an action on the file.",
 			cls: "setting-item-description",
 		});
+
+		new Setting(el)
+			.setName("Per-file opt-out")
+			.setDesc(
+				'To skip automations on a specific file, add to its companion note frontmatter: ' +
+				'`drive-sync-skip-automations: ["automation-id-1", "automation-id-2"]` ' +
+				'or `drive-sync-skip-all: true` to skip all automations for that file.'
+			);
 
 		const automationsContainer = el.createDiv();
 		this.renderAutomations(automationsContainer);
@@ -1144,6 +1213,22 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						}
 					})();
 				}).open();
+			});
+
+			// Dry run button
+			const DRY_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+			this.addCardButton(controlsEl, DRY_ICON, "Dry run — preview what would happen", () => {
+				(async () => {
+					const notice = new Notice(`Dry run for "${automation.name}"…`, 0);
+					try {
+						const r = await this.plugin.dryRunAutomationOnExistingFiles(automation.id);
+						notice.hide();
+						new AutomationDryRunModal(this.app, automation.name, r.preview ?? []).open();
+					} catch (err) {
+						notice.hide();
+						new Notice(`Dry run failed: ${(err as Error).message}`);
+					}
+				})();
 			});
 
 			// Delete button

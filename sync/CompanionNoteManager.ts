@@ -156,7 +156,7 @@ export class CompanionNoteManager {
 		pdfVaultPath?: string,
 		transcription?: string,
 		knownMtime?: number
-	): Promise<{ conflictPath: string | null }> {
+	): Promise<{ conflictPath: string | null; skipped?: boolean }> {
 		console.log(`${LOG} Updating companion note frontmatter: ${companionNotePath}`);
 
 		const tFile = this.app.vault.getAbstractFileByPath(companionNotePath);
@@ -165,16 +165,26 @@ export class CompanionNoteManager {
 			return { conflictPath: null };
 		}
 
-		// 5.4: Detect concurrent edits — backup if user modified companion since last sync
+		// 5.4 / 6.1: Detect concurrent edits — apply conflict policy
 		let conflictPath: string | null = null;
 		if (knownMtime !== undefined) {
 			const stat = await this.app.vault.adapter.stat(companionNotePath);
 			if (stat && stat.mtime > knownMtime) {
-				conflictPath = companionNotePath.replace(/\.md$/i, `.conflict-${Date.now()}.md`);
-				console.log(`${LOG} Companion edited since last sync — creating conflict backup: ${conflictPath}`);
-				const currentContent = await this.app.vault.read(tFile);
-				await this.ensureFolder(conflictPath);
-				await this.app.vault.create(conflictPath, currentContent);
+				const policy = this.settings.conflictPolicy ?? "save-both";
+				if (policy === "keep-vault") {
+					console.log(`${LOG} Conflict detected — keeping vault version (policy: keep-vault): ${companionNotePath}`);
+					return { conflictPath: null, skipped: true };
+				} else if (policy === "take-drive") {
+					console.log(`${LOG} Conflict detected — taking Drive version (policy: take-drive): ${companionNotePath}`);
+					// proceed without backup
+				} else {
+					// save-both and ask (ask falls back to save-both during sync)
+					conflictPath = companionNotePath.replace(/\.md$/i, `.conflict-${Date.now()}.md`);
+					console.log(`${LOG} Companion edited since last sync — creating conflict backup: ${conflictPath}`);
+					const currentContent = await this.app.vault.read(tFile);
+					await this.ensureFolder(conflictPath);
+					await this.app.vault.create(conflictPath, currentContent);
+				}
 			}
 		}
 

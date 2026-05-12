@@ -7,13 +7,18 @@ import { Scheduler } from "./sync/Scheduler";
 import { SyncManifestStore } from "./sync/SyncManifest";
 import { CompanionNoteManager } from "./sync/CompanionNoteManager";
 import { SyncLogger } from "./sync/SyncLogger";
+import { SyncActivityLog } from "./sync/SyncLog";
 import { DriveSyncSettingTab } from "./settings/SettingsTab";
 import { AutomationEngine } from "./automation/AutomationEngine";
 import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from "./ui/SyncStatusView";
 import { DryRunModal } from "./ui/DryRunModal";
 import { FileTrackerModal } from "./ui/FileTrackerModal";
+import { SyncLogModal } from "./ui/SyncLogModal";
+import { AutomationDryRunModal } from "./ui/AutomationDryRunModal";
+import { ConflictModal } from "./ui/ConflictModal";
 import { TranscriptionStore } from "./ai/TranscriptionStore";
 import { transcribeCurrentFile, openTranscribePickerForFile } from "./commands/TranscribeCurrentFile";
+import { runAudit, AuditModal } from "./commands/Audit";
 import { Automation, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
@@ -29,6 +34,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	private companionManager: CompanionNoteManager;
 	private automationEngine: AutomationEngine;
 	private syncLogger: SyncLogger;
+	private syncActivityLog: SyncActivityLog;
 	private syncing = false;
 
 	async onload() {
@@ -56,6 +62,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		this.companionManager = new CompanionNoteManager(this.app, this.settings);
 		this.automationEngine = new AutomationEngine(this.app, this.settings, this.manifestStore);
 		this.syncLogger = new SyncLogger(this.app, this.settings);
+		this.syncActivityLog = new SyncActivityLog(this.app, this.settings);
 
 		const downloader = new DownloadManager(this.app);
 		this.auth = new GoogleAuth(this.app, this.settings);
@@ -243,6 +250,34 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "view-sync-log",
+			name: "View sync activity log",
+			callback: () => {
+				new SyncLogModal(this.app, this.syncActivityLog).open();
+			},
+		});
+
+		this.addCommand({
+			id: "audit",
+			name: "Run health audit",
+			callback: () => {
+				(async () => {
+					const notice = new Notice("Running audit…", 0);
+					try {
+						const issues = await runAudit(this.app, this.manifestStore, this.settings);
+						notice.hide();
+						new AuditModal(this.app, issues, this.manifestStore, async () => {
+							// nothing extra needed after fix
+						}).open();
+					} catch (e) {
+						notice.hide();
+						new Notice(`Audit failed: ${(e as Error).message}`);
+					}
+				})();
+			},
+		});
+
 		// Heal manifest when user manually moves/renames a synced file in the vault
 		this.registerEvent(
 			this.app.vault.on("rename", async (file, oldPath) => {
@@ -353,6 +388,12 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		return this.automationEngine.runForAllMatchingFiles(automationId, opts);
 	}
 
+	async dryRunAutomationOnExistingFiles(
+		automationId: string
+	): Promise<{ matched: number; ran: number; skipped: number; errors: number; preview?: Array<{ vaultPath: string; willRun: boolean; skipReason?: string }> }> {
+		return this.automationEngine.runForAllMatchingFiles(automationId, { dryRun: true });
+	}
+
 	private pushResultToStatusView(result: SyncResult): void {
 		for (const leaf of this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE)) {
 			if (leaf.view instanceof SyncStatusView) {
@@ -391,6 +432,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		if (this.automationEngine) this.automationEngine.updateSettings(this.settings);
 		if (this.driveSync) this.driveSync.updateSettings(this.settings);
 		if (this.syncLogger) this.syncLogger.updateSettings(this.settings);
+		if (this.syncActivityLog) this.syncActivityLog.updateSettings(this.settings);
 	}
 
 	private migrateLegacySettings(): void {
