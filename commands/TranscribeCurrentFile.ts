@@ -68,6 +68,24 @@ class DestinationPickerModal extends Modal {
 	}
 
 	onOpen(): void {
+		// If a default destination is configured, skip the picker entirely
+		const defaultDest = this.plugin.settings.transcribeDefaultDest ?? "ask";
+		if (defaultDest === "companion") {
+			this.close();
+			void this.proceed({ type: "companion" });
+			return;
+		}
+		if (defaultDest === "daily") {
+			this.close();
+			void this.proceed({ type: "daily" });
+			return;
+		}
+		if (defaultDest === "note") {
+			this.close();
+			new NotePickerModal(this.app, (file) => void this.proceed({ type: "note", file })).open();
+			return;
+		}
+
 		const { contentEl } = this;
 		contentEl.createEl("h3", { text: `Transcribe "${this.pdfFile.basename}" to…` });
 
@@ -116,10 +134,10 @@ class DestinationPickerModal extends Modal {
 		if (hasExisting) {
 			new OverwriteModal(this.app, destFile.name, async (action) => {
 				if (action === "skip") return;
-				await this.runTranscription(destFile, action);
+				await this.runTranscription(destFile, action, dest.type);
 			}).open();
 		} else {
-			await this.runTranscription(destFile, "replace");
+			await this.runTranscription(destFile, "replace", dest.type);
 		}
 	}
 
@@ -147,11 +165,23 @@ class DestinationPickerModal extends Modal {
 			}
 		}
 
-		// Fall back: place companion alongside the PDF
-		const dir = pdfFile.parent ? pdfFile.parent.path : "";
-		const companionPath = normalizePath(
-			dir ? `${dir}/${pdfFile.basename}.md` : `${pdfFile.basename}.md`
-		);
+		// Determine companion path using fallback folder setting
+		const fallbackFolder = plugin.settings.transcribeCompanionFallbackFolder?.trim() ?? "";
+		let companionPath: string;
+
+		if (fallbackFolder === "/") {
+			companionPath = normalizePath(`${pdfFile.basename}.md`);
+		} else if (fallbackFolder) {
+			const resolvedFolder = resolvePathTokens(fallbackFolder, pdfFile.path);
+			companionPath = normalizePath(`${resolvedFolder}/${pdfFile.basename}.md`);
+		} else {
+			// Default: place alongside the PDF
+			const dir = pdfFile.parent ? pdfFile.parent.path : "";
+			companionPath = normalizePath(
+				dir ? `${dir}/${pdfFile.basename}.md` : `${pdfFile.basename}.md`
+			);
+		}
+
 		const existing = app.vault.getAbstractFileByPath(companionPath);
 		if (existing instanceof TFile) return existing;
 
@@ -182,7 +212,11 @@ class DestinationPickerModal extends Modal {
 		}
 	}
 
-	private async runTranscription(destFile: TFile, mode: "append" | "replace"): Promise<void> {
+	private async runTranscription(
+		destFile: TFile,
+		mode: "append" | "replace",
+		destType: "companion" | "daily" | "note"
+	): Promise<void> {
 		const notice = new Notice(`Transcribing "${this.pdfFile.basename}"…`, 0);
 		try {
 			const pdfBytes = await this.app.vault.readBinary(this.pdfFile);
@@ -197,7 +231,9 @@ class DestinationPickerModal extends Modal {
 					);
 			const transcription = await client.transcribePdf(pdfBytes);
 			notice.hide();
-			await writeTranscription(this.app, destFile, transcription, mode, this.pdfFile.name);
+
+			const template = await this.resolveTemplate(destType);
+			await writeTranscription(this.app, destFile, transcription, mode, this.pdfFile.name, template);
 			new Notice(`Transcription written to "${destFile.name}"`);
 			await this.recordTranscription(pdfBytes, destFile);
 		} catch (e) {
@@ -205,6 +241,23 @@ class DestinationPickerModal extends Modal {
 			console.error(LOG, "Transcription failed:", e);
 			new Notice(`Transcription failed: ${(e as Error).message}`);
 		}
+	}
+
+	private async resolveTemplate(destType: "companion" | "daily" | "note"): Promise<string | undefined> {
+		if (destType === "companion") {
+			const filePath = (this.plugin.settings.transcribeCompanionTemplatePath ?? "").trim();
+			if (filePath) {
+				try {
+					const exists = await this.app.vault.adapter.exists(filePath);
+					if (exists) return await this.app.vault.adapter.read(filePath);
+				} catch {}
+			}
+			return (this.plugin.settings.transcribeCompanionTemplate ?? "").trim() || undefined;
+		}
+		if (destType === "daily") {
+			return (this.plugin.settings.transcribeDailyTemplate ?? "").trim() || undefined;
+		}
+		return (this.plugin.settings.transcribeNoteTemplate ?? "").trim() || undefined;
 	}
 
 	private async recordTranscription(pdfBytes: ArrayBuffer, destFile: TFile): Promise<void> {
@@ -327,6 +380,21 @@ function resolveDailyNotePath(app: App, plugin: DriveFolderSyncPlugin): string {
 	return normalizePath(`${moment().format("YYYY-MM-DD")}.md`);
 }
 
+function resolvePathTokens(template: string, vaultFilePath: string): string {
+	const parts = vaultFilePath.split("/");
+	parts.pop(); // strip filename
+	const dirs = parts.filter(Boolean);
+	return template.replace(/\{\{([^}]+)\}\}/g, (match, token: string) => {
+		if (token === "RootFolder") return dirs[0] ?? "";
+		const lm = token.match(/^folderL(\d+)$/);
+		if (lm) {
+			const level = parseInt(lm[1], 10);
+			return dirs[dirs.length - level] ?? "";
+		}
+		return match;
+	});
+}
+
 async function hasTranscriptionSection(app: App, file: TFile): Promise<boolean> {
 	try {
 		const content = await app.vault.read(file);
@@ -341,11 +409,26 @@ async function writeTranscription(
 	file: TFile,
 	transcription: string,
 	mode: "append" | "replace",
-	sourceName: string
+	sourceName: string,
+	template?: string
 ): Promise<void> {
 	await app.vault.process(file, (content) => {
 		const HEADER = "## Transcription";
-		const newSection = `\n\n${HEADER}\n\n*Source: ${sourceName}*\n\n${transcription}`;
+
+		let newBlock: string;
+		if (template) {
+			const stem = sourceName.replace(/\.pdf$/i, "");
+			const date = moment().format("YYYY-MM-DD");
+			newBlock = template
+				.replaceAll("{{transcription}}", transcription)
+				.replaceAll("{{title}}", stem)
+				.replaceAll("{{fileName}}", sourceName)
+				.replaceAll("{{date}}", date)
+				.replaceAll("{{link}}", `[[${stem}]]`)
+				.replaceAll("{{embed}}", `![[${sourceName}]]`);
+		} else {
+			newBlock = `${HEADER}\n\n*Source: ${sourceName}*\n\n${transcription}`;
+		}
 
 		const sectionIdx = content.indexOf("\n" + HEADER);
 
@@ -353,7 +436,7 @@ async function writeTranscription(
 			if (mode === "replace") {
 				const nextSection = content.indexOf("\n## ", sectionIdx + 1);
 				const end = nextSection !== -1 ? nextSection : content.length;
-				return content.slice(0, sectionIdx) + newSection + content.slice(end);
+				return content.slice(0, sectionIdx) + "\n\n" + newBlock + content.slice(end);
 			} else {
 				// append: add a dated sub-entry inside the section
 				const nextSection = content.indexOf("\n## ", sectionIdx + 1);
@@ -365,7 +448,7 @@ async function writeTranscription(
 		}
 
 		// No existing section: append at end
-		return content.trimEnd() + newSection;
+		return content.trimEnd() + "\n\n" + newBlock;
 	});
 }
 

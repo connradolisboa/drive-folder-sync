@@ -3,7 +3,7 @@ import type DriveFolderSyncPlugin from "../main";
 import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, PluginSettings, SyncPair } from "../types";
 import { AutomationDryRunModal } from "../ui/AutomationDryRunModal";
 
-type TabId = "account" | "sync" | "notes" | "automations";
+type TabId = "account" | "sync" | "notes" | "automations" | "transcription";
 
 export class DriveSyncSettingTab extends PluginSettingTab {
 	private activeTab: TabId = "account";
@@ -26,6 +26,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			{ id: "sync", label: "Sync" },
 			{ id: "notes", label: "Notes" },
 			{ id: "automations", label: "Automations" },
+			{ id: "transcription", label: "Transcription" },
 		];
 
 		const panes: Partial<Record<TabId, HTMLElement>> = {};
@@ -54,6 +55,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			else if (tab.id === "sync") this.renderSyncTab(pane);
 			else if (tab.id === "notes") this.renderNotesTab(pane);
 			else if (tab.id === "automations") this.renderAutomationsTab(pane);
+			else if (tab.id === "transcription") this.renderTranscriptionTab(pane);
 		}
 
 		switchTab(this.activeTab);
@@ -812,6 +814,156 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 		}
+	}
+
+	private renderTranscriptionTab(el: HTMLElement): void {
+		// ── Command behavior ───────────────────────────────────────────────────
+		el.createEl("h3", { text: "Command behavior" });
+
+		new Setting(el)
+			.setName("Default destination")
+			.setDesc(
+				"When running \"Transcribe current file\", skip the picker and go straight to the selected destination. " +
+				"\"Ask\" always shows the destination picker."
+			)
+			.addDropdown((drop) =>
+				drop
+					.addOption("ask",       "Ask — always show the picker")
+					.addOption("companion", "Companion note")
+					.addOption("daily",     "Today's daily note")
+					.addOption("note",      "Pick a note — skip intro screen")
+					.setValue(this.plugin.settings.transcribeDefaultDest ?? "ask")
+					.onChange(async (val) => {
+						this.plugin.settings.transcribeDefaultDest = val as "ask" | "companion" | "daily" | "note";
+						await this.plugin.saveSettings();
+					})
+			);
+
+		// ── Companion note template ───────────────────────────────────────────
+		el.createEl("h3", { text: "Companion note template" });
+		el.createEl("p", {
+			text:
+				"Template used when transcribing into a companion note. " +
+				"Supports: {{transcription}}, {{title}} (PDF stem), {{fileName}}, " +
+				"{{date}} (YYYY-MM-DD), {{link}} ([[wikilink]]), {{embed}} (![[embed]]).",
+			cls: "setting-item-description",
+		});
+
+		const companionTemplatePath = (this.plugin.settings.transcribeCompanionTemplatePath ?? "").trim();
+
+		new Setting(el)
+			.setName("Template file path")
+			.setDesc(
+				"Vault path to a .md file to use as the companion note template. " +
+				"When set, overrides the inline template below."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("Templates/transcribe-companion.md")
+					.setValue(this.plugin.settings.transcribeCompanionTemplatePath ?? "")
+					.onChange(async (val) => {
+						this.plugin.settings.transcribeCompanionTemplatePath = val.trim();
+						await this.plugin.saveSettings();
+						companionInlineTemplateSetting.settingEl.toggle(!val.trim());
+					})
+			);
+
+		const companionInlineTemplateSetting = new Setting(el)
+			.setName("Inline template")
+			.setDesc("Used when no template file path is set. Leave empty for the built-in default.")
+			.addTextArea((text) => {
+				text
+					.setPlaceholder("## Transcription\n\n*Source: {{fileName}}*\n\n{{transcription}}")
+					.setValue(this.plugin.settings.transcribeCompanionTemplate ?? "")
+					.onChange(async (val) => {
+						this.plugin.settings.transcribeCompanionTemplate = val;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.rows = 5;
+				text.inputEl.style.width = "100%";
+				text.inputEl.style.fontFamily = "monospace";
+				text.inputEl.style.resize = "vertical";
+			});
+		companionInlineTemplateSetting.settingEl.toggle(!companionTemplatePath);
+
+		// ── Daily note template ───────────────────────────────────────────────
+		el.createEl("h3", { text: "Daily note template" });
+		el.createEl("p", {
+			text:
+				"Template for the content inserted into today's daily note when transcribing. " +
+				"Supports: {{transcription}}, {{title}}, {{fileName}}, {{date}}, {{link}}, {{embed}}.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(el)
+			.setName("Template")
+			.setDesc("Leave empty for the built-in default.")
+			.addTextArea((text) => {
+				text
+					.setPlaceholder("## Transcription from {{link}}\n\n{{transcription}}")
+					.setValue(this.plugin.settings.transcribeDailyTemplate ?? "")
+					.onChange(async (val) => {
+						this.plugin.settings.transcribeDailyTemplate = val;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.rows = 5;
+				text.inputEl.style.width = "100%";
+				text.inputEl.style.fontFamily = "monospace";
+				text.inputEl.style.resize = "vertical";
+			});
+
+		// ── Existing note template ────────────────────────────────────────────
+		el.createEl("h3", { text: "Existing note template" });
+		el.createEl("p", {
+			text:
+				"Template for the content inserted when transcribing into a specific existing note. " +
+				"Supports: {{transcription}}, {{title}}, {{fileName}}, {{date}}, {{link}}, {{embed}}.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(el)
+			.setName("Template")
+			.setDesc("Leave empty for the built-in default.")
+			.addTextArea((text) => {
+				text
+					.setPlaceholder("## Transcription from {{link}}\n\n{{transcription}}")
+					.setValue(this.plugin.settings.transcribeNoteTemplate ?? "")
+					.onChange(async (val) => {
+						this.plugin.settings.transcribeNoteTemplate = val;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.rows = 5;
+				text.inputEl.style.width = "100%";
+				text.inputEl.style.fontFamily = "monospace";
+				text.inputEl.style.resize = "vertical";
+			});
+
+		// ── Companion note placement ──────────────────────────────────────────
+		el.createEl("h3", { text: "Companion note placement" });
+		el.createEl("p", {
+			text:
+				"Where to create the companion note when you run \"Transcribe → Companion note\" " +
+				"and no companion note exists for the PDF yet.",
+			cls: "setting-item-description",
+		});
+
+		new Setting(el)
+			.setName("Fallback folder")
+			.setDesc(
+				"Vault folder where the new companion note is created. " +
+				"Leave empty to place it alongside the PDF. " +
+				"Use \"/\" for the vault root. " +
+				"Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("(empty = alongside PDF)")
+					.setValue(this.plugin.settings.transcribeCompanionFallbackFolder ?? "")
+					.onChange(async (val) => {
+						this.plugin.settings.transcribeCompanionFallbackFolder = val.trim();
+						await this.plugin.saveSettings();
+					})
+			);
 	}
 
 	private renderAutomationsTab(el: HTMLElement): void {

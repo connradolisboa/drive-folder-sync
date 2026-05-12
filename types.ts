@@ -146,6 +146,14 @@ export interface PluginSettings {
 	geminiModel: string;
 	geminiPrompt: string;
 	mistralApiKey: string;
+
+	// Transcribe command settings
+	transcribeDefaultDest: "ask" | "companion" | "daily" | "note";
+	transcribeCompanionTemplate: string;      // inline template; empty = built-in default
+	transcribeCompanionTemplatePath: string;  // vault path to .md template file (overrides inline)
+	transcribeDailyTemplate: string;          // template for "daily note" destination
+	transcribeNoteTemplate: string;           // template for "existing note" destination
+	transcribeCompanionFallbackFolder: string; // where to create companion when none exists; empty = alongside PDF
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -184,6 +192,12 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	geminiModel: "gemini-2.0-flash",
 	geminiPrompt: "Transcribe all text visible in this PDF exactly as written, preserving structure. Return plain text only.",
 	mistralApiKey: "",
+	transcribeDefaultDest: "ask",
+	transcribeCompanionTemplate: "",
+	transcribeCompanionTemplatePath: "",
+	transcribeDailyTemplate: "",
+	transcribeNoteTemplate: "",
+	transcribeCompanionFallbackFolder: "",
 };
 
 // ── Automations ───────────────────────────────────────────────────────────────
