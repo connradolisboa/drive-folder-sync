@@ -1,4 +1,4 @@
-import { App, FuzzySuggestModal, Modal, Notice, Plugin, Setting } from "obsidian";
+import { App, FuzzySuggestModal, Modal, Notice, Plugin, Setting, TFile } from "obsidian";
 import * as crypto from "crypto";
 import { GoogleAuth } from "./auth/GoogleAuth";
 import { DriveSync } from "./sync/DriveSync";
@@ -13,7 +13,7 @@ import { SyncStatusView, SYNC_STATUS_VIEW_TYPE } from "./ui/SyncStatusView";
 import { DryRunModal } from "./ui/DryRunModal";
 import { FileTrackerModal } from "./ui/FileTrackerModal";
 import { TranscriptionStore } from "./ai/TranscriptionStore";
-import { transcribeCurrentFile } from "./commands/TranscribeCurrentFile";
+import { transcribeCurrentFile, openTranscribePickerForFile } from "./commands/TranscribeCurrentFile";
 import { Automation, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
@@ -96,7 +96,10 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		});
 
 		this.addRibbonIcon("file-search", "Drive Sync File Tracker", () => {
-			new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings).open();
+			new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings, (vaultPath) => {
+						const f = this.app.vault.getAbstractFileByPath(vaultPath);
+						if (f instanceof TFile) openTranscribePickerForFile(this.app, this, f);
+					}).open();
 		});
 
 		this.addSettingTab(new DriveSyncSettingTab(this.app, this));
@@ -147,7 +150,10 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			id: "file-tracker",
 			name: "Open file tracker",
 			callback: () => {
-				new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings).open();
+				new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings, (vaultPath) => {
+						const f = this.app.vault.getAbstractFileByPath(vaultPath);
+						if (f instanceof TFile) openTranscribePickerForFile(this.app, this, f);
+					}).open();
 			},
 		});
 

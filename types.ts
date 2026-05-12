@@ -79,6 +79,8 @@ export interface ManifestEntry {
 	userDeletedAt?: string;  // ISO — user deleted from vault; skip re-sync until Drive advances
 	companionMtime?: number; // ms — filesystem mtime when companion was last written (conflict detection)
 	driveTrashed?: boolean;  // true when file is in Drive trash (not permanently deleted)
+	/** When true, automatic AI transcription is skipped for this file during sync. */
+	transcriptionDisabled?: boolean;
 }
 
 export type SyncManifest = Record<string, ManifestEntry>; // key = driveFileId

@@ -5,6 +5,12 @@ import type { PluginSettings } from "../types";
 
 const ONE_DAY_MS = 86_400_000;
 
+const MICRO_BTN =
+	"font-size: 11px; padding: 1px 5px; border-radius: 4px; cursor: pointer; " +
+	"border: 1px solid var(--background-modifier-border); " +
+	"background: var(--background-secondary); color: var(--text-muted); " +
+	"line-height: 1.4; white-space: nowrap;";
+
 type SortCol = "name" | "updated" | "transcribed";
 
 interface Row {
@@ -14,6 +20,8 @@ interface Row {
 	pairId: string;
 	driveModifiedTime: string;
 	ts: TranscriptionEntry | undefined;
+	isPdf: boolean;
+	transcriptionDisabled: boolean;
 }
 
 export class FileTrackerModal extends Modal {
@@ -25,7 +33,8 @@ export class FileTrackerModal extends Modal {
 		app: App,
 		private manifest: SyncManifestStore,
 		private transcriptionStore: TranscriptionStore,
-		private settings: PluginSettings
+		private settings: PluginSettings,
+		private onRetranscribe?: (vaultPath: string) => void
 	) {
 		super(app);
 		this.modalEl.addClass("drive-sync-file-tracker");
@@ -45,6 +54,8 @@ export class FileTrackerModal extends Modal {
 			pairId: entry.pairId,
 			driveModifiedTime: entry.driveModifiedTime,
 			ts: this.transcriptionStore.get(driveFileId),
+			isPdf: entry.vaultPath.toLowerCase().endsWith(".pdf"),
+			transcriptionDisabled: entry.transcriptionDisabled ?? false,
 		}));
 	}
 
@@ -221,31 +232,69 @@ export class FileTrackerModal extends Modal {
 
 		// ── Transcription status ──────────────────────────────────────────────
 		const tdTranscribed = tr.createEl("td");
-		tdTranscribed.style.cssText = "padding: 7px 10px; white-space: nowrap;";
+		tdTranscribed.style.cssText = "padding: 7px 10px;";
+
+		const txWrap = tdTranscribed.createDiv();
+		txWrap.style.cssText = "display: flex; align-items: center; gap: 6px; flex-wrap: nowrap;";
 
 		if (!row.ts) {
-			const badge2 = tdTranscribed.createEl("span", { text: "—" });
+			const badge2 = txWrap.createEl("span", { text: "—" });
 			badge2.style.color = "var(--text-faint)";
 		} else {
-			const currentMtime = row.ts.currentDriveModifiedTime ?? row.ts.lastTranscribedDriveModifiedTime;
 			const driveUpdatedSince = row.driveModifiedTime !== row.ts.lastTranscribedDriveModifiedTime;
 
 			if (driveUpdatedSince) {
-				const chip = tdTranscribed.createEl("span", { text: "⚠ Stale" });
+				const chip = txWrap.createEl("span", { text: "⚠ Stale" });
 				chip.style.cssText =
-					"color: var(--color-orange, #e8a100); font-weight: 500;";
+					"color: var(--color-orange, #e8a100); font-weight: 500; white-space: nowrap;";
 				chip.title =
 					`Transcribed ${row.ts.lastTranscribedAt.slice(0, 10)} ` +
 					`for Drive version ${row.ts.lastTranscribedDriveModifiedTime.slice(0, 10)}, ` +
 					`but Drive file updated ${row.driveModifiedTime.slice(0, 10)}`;
 			} else {
-				const chip = tdTranscribed.createEl("span", {
+				const chip = txWrap.createEl("span", {
 					text: "✓ " + relativeTime(row.ts.lastTranscribedAt),
 				});
 				chip.style.cssText =
-					"color: var(--color-green, var(--interactive-success));";
+					"color: var(--color-green, var(--interactive-success)); white-space: nowrap;";
 				chip.title = `Transcribed: ${row.ts.lastTranscribedAt}`;
 			}
+		}
+
+		if (row.isPdf) {
+			// Re-transcribe button
+			if (this.onRetranscribe) {
+				const btnRetx = txWrap.createEl("button", { text: "↺" });
+				btnRetx.title = "Re-transcribe this file";
+				btnRetx.style.cssText = MICRO_BTN;
+				btnRetx.addEventListener("click", (e) => {
+					e.stopPropagation();
+					this.close();
+					this.onRetranscribe!(row.vaultPath);
+				});
+			}
+
+			// Disable / enable auto-transcription toggle
+			const isOff = row.transcriptionDisabled;
+			const btnToggle = txWrap.createEl("button", {
+				text: isOff ? "Auto: Off" : "Auto: On",
+			});
+			btnToggle.title = isOff
+				? "Automatic transcription is disabled — click to re-enable"
+				: "Click to disable automatic transcription for this file";
+			btnToggle.style.cssText =
+				MICRO_BTN + (isOff ? " opacity: 0.5;" : "");
+			btnToggle.addEventListener("click", async (e) => {
+				e.stopPropagation();
+				const entry = this.manifest.get(row.driveFileId);
+				if (!entry) return;
+				this.manifest.set(row.driveFileId, {
+					...entry,
+					transcriptionDisabled: !isOff,
+				});
+				await this.manifest.save();
+				this.render();
+			});
 		}
 
 		// ── Pages ─────────────────────────────────────────────────────────────

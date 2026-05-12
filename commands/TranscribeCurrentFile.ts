@@ -16,6 +16,10 @@ declare const moment: () => { format(pattern: string): string };
 
 const LOG = "[DriveSync/Transcribe]";
 
+export function openTranscribePickerForFile(app: App, plugin: DriveFolderSyncPlugin, file: TFile): void {
+	new DestinationPickerModal(app, plugin, file).open();
+}
+
 export async function transcribeCurrentFile(plugin: DriveFolderSyncPlugin): Promise<void> {
 	const activeFile = plugin.app.workspace.getActiveFile();
 	if (!activeFile) {

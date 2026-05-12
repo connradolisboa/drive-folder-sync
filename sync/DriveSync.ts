@@ -466,7 +466,8 @@ export class DriveSync {
 					?? this.companion.findCompanionByProperty(vaultPath)
 					?? null;
 				const gemini = this.getTranscriptionClient();
-				if (gemini) {
+				const isAutoTxDisabled = existing?.transcriptionDisabled ?? false;
+				if (gemini && !isAutoTxDisabled) {
 					// Skip transcription if the companion already has a fresh transcription for this Drive version
 					let alreadyTranscribed = false;
 					if (resolvedCompanionPath) {
@@ -533,6 +534,7 @@ export class DriveSync {
 					driveCreatedTime: entry.file.createdTime,
 					pairId: pair.id,
 					companionMtime,
+					transcriptionDisabled: existing?.transcriptionDisabled,
 				});
 
 				// Update transcription tracking store
