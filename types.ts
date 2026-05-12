@@ -154,6 +154,7 @@ export interface PluginSettings {
 	transcribeDailyTemplate: string;          // template for "daily note" destination
 	transcribeNoteTemplate: string;           // template for "existing note" destination
 	transcribeCompanionFallbackFolder: string; // where to create companion when none exists; empty = alongside PDF
+	transcribeDefaultNotePath: string;        // vault path for "specific file" default destination
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -198,6 +199,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	transcribeDailyTemplate: "",
 	transcribeNoteTemplate: "",
 	transcribeCompanionFallbackFolder: "",
+	transcribeDefaultNotePath: "",
 };
 
 // ── Automations ───────────────────────────────────────────────────────────────

@@ -31,38 +31,38 @@ This file is the source of truth for **what's left to build**. Every concrete un
 
 ### 7.1 Audit + relocate
 
-- [ ] List every transcription-related setting currently rendered outside the Transcription tab and move them into `renderTranscriptionTab` (provider, API keys, model, prompt — currently mixed into other panes).
-- [ ] Group settings inside the Transcription tab using `<h3>` subheadings:
-  - [ ] **Provider & credentials** (provider toggle, Gemini API key + model + prompt, Mistral API key)
-  - [ ] **Default behavior** (default destination, fallback companion folder)
-  - [ ] **Templates** (one block per destination type — see §7.2)
-  - [ ] **Page-hash retranscription** (force-full button, store size info)
-- [ ] Add a small "Test connection" button per provider that runs a 1-page dummy call and shows a success/error notice.
+- [x] List every transcription-related setting currently rendered outside the Transcription tab and move them into `renderTranscriptionTab` (provider, API keys, model, prompt — currently mixed into other panes).
+- [x] Group settings inside the Transcription tab using `<h3>` subheadings:
+  - [x] **Provider & credentials** (provider toggle, Gemini API key + model + prompt, Mistral API key)
+  - [x] **Default behavior** (default destination, fallback companion folder)
+  - [x] **Templates** (one block per destination type — see §7.2)
+  - [x] **Page-hash retranscription** (force-full button, store size info)
+- [x] Add a small "Test connection" button per provider that runs a 1-page dummy call and shows a success/error notice.
 
 ### 7.2 Per-destination templates (3 boxes + 1 file picker)
 
 The "Transcribe file" command supports three destinations (companion / daily / arbitrary note). Each gets its own template setting.
 
-- [ ] **Companion-note template** — two inputs that work together:
-  - [ ] Inline textarea (`transcribeCompanionTemplate` — already exists in `types.ts:152`)
-  - [ ] File-path picker (`transcribeCompanionTemplatePath` — already exists in `types.ts:153`). When the path is set and the file exists, it **overrides** the inline value at write time. Show a small "(file overrides inline)" hint when both are populated.
-  - [ ] "Browse…" button next to the path field opens a `FuzzySuggestModal` over markdown files.
-  - [ ] "Preview" button renders the template against a synthetic example (sample title, sample transcription).
-- [ ] **Daily-note template** (`transcribeDailyTemplate`) — single textarea, no file picker.
-- [ ] **Other-note template** (`transcribeNoteTemplate`) — single textarea, no file picker.
-- [ ] Document supported tokens **inline below each textarea** (don't make users hunt): `{{transcription}}`, `{{title}}`, `{{fileName}}`, `{{date}}`, `{{link}}`, `{{embed}}`, `{{sourcePath}}`, `{{pairLabel}}`.
-- [ ] Add `{{sourcePath}}` and `{{pairLabel}}` as **new** tokens — they don't exist yet (see `commands/TranscribeCurrentFile.ts:419-428`). Implement in `writeTranscription()`.
+- [x] **Companion-note template** — two inputs that work together:
+  - [x] Inline textarea (`transcribeCompanionTemplate` — already exists in `types.ts:152`)
+  - [x] File-path picker (`transcribeCompanionTemplatePath` — already exists in `types.ts:153`). When the path is set and the file exists, it **overrides** the inline value at write time. Show a small "(file overrides inline)" hint when both are populated.
+  - [x] "Browse…" button next to the path field opens a `FuzzySuggestModal` over markdown files.
+  - [x] "Preview" button renders the template against a synthetic example (sample title, sample transcription).
+- [x] **Daily-note template** (`transcribeDailyTemplate`) — single textarea, no file picker.
+- [x] **Other-note template** (`transcribeNoteTemplate`) — single textarea, no file picker.
+- [x] Document supported tokens **inline below each textarea** (don't make users hunt): `{{transcription}}`, `{{title}}`, `{{fileName}}`, `{{date}}`, `{{link}}`, `{{embed}}`, `{{sourcePath}}`, `{{pairLabel}}`.
+- [x] Add `{{sourcePath}}` and `{{pairLabel}}` as **new** tokens — they don't exist yet (see `commands/TranscribeCurrentFile.ts:419-428`). Implement in `writeTranscription()`.
 
 ### 7.3 Default-destination companion fallback folder
 
-- [ ] Promote `transcribeCompanionFallbackFolder` (already in `types.ts:156`) to a top-level setting under "Default behavior".
-- [ ] Add a help line: "When transcribing into a companion note that doesn't exist yet, create it here. Empty = alongside the source file. Supports `{{RootFolder}}`, `{{folderL1}}`, `{{folderL2}}` tokens."
-- [ ] Surface a live preview line: "Example: `<sourcePath>` → `<resolvedCompanionPath>`" using the active file (or a stub).
+- [x] Promote `transcribeCompanionFallbackFolder` (already in `types.ts:156`) to a top-level setting under "Default behavior".
+- [x] Add a help line: "When transcribing into a companion note that doesn't exist yet, create it here. Empty = alongside the source file. Supports `{{RootFolder}}`, `{{folderL1}}`, `{{folderL2}}` tokens."
+- [x] Surface a live preview line: "Example: `<sourcePath>` → `<resolvedCompanionPath>`" using the active file (or a stub).
 
 ### 7.4 Default-destination behavior tweaks
 
-- [ ] Replace the existing dropdown options (`ask` / `companion` / `daily` / `note`) with the same set, but rename "note" → "specific file" for clarity in the UI.
-- [ ] When `default = "specific file"` is selected, immediately reveal a file picker for the **default note** (new setting `transcribeDefaultNotePath: string`). Without it, the option behaves like "ask".
+- [x] Replace the existing dropdown options (`ask` / `companion` / `daily` / `note`) with the same set, but rename "note" → "specific file" for clarity in the UI.
+- [x] When `default = "specific file"` is selected, immediately reveal a file picker for the **default note** (new setting `transcribeDefaultNotePath: string`). Without it, the option behaves like "ask".
 
 ### 7.5 Verification
 

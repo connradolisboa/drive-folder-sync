@@ -1,4 +1,4 @@
-import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, FuzzySuggestModal, Modal, Notice, PluginSettingTab, requestUrl, Setting, TFile } from "obsidian";
 import type DriveFolderSyncPlugin from "../main";
 import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, PluginSettings, SyncPair } from "../types";
 import { AutomationDryRunModal } from "../ui/AutomationDryRunModal";
@@ -285,121 +285,6 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					})
 			);
 
-		// ── AI Transcription ──────────────────────────────────────────────────
-		el.createEl("h3", { text: "AI Transcription (optional)" });
-		el.createEl("p", {
-			text:
-				"Transcribe handwritten or printed text from synced PDFs using an AI API. " +
-				"Output is stored in companion notes and available as {{transcription}} in templates.",
-			cls: "setting-item-description",
-		});
-
-		const provider = this.plugin.settings.transcriptionProvider ?? "gemini";
-
-		new Setting(el)
-			.setName("Enable AI transcription")
-			.setDesc("Automatically transcribe PDFs when they are downloaded during sync.")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.geminiEnabled)
-					.onChange(async (val) => {
-						this.plugin.settings.geminiEnabled = val;
-						await this.plugin.saveSettings();
-						providerSetting.settingEl.toggle(val);
-						geminiApiKeySetting.settingEl.toggle(val && currentProvider() === "gemini");
-						geminiModelSetting.settingEl.toggle(val && currentProvider() === "gemini");
-						geminiPromptSetting.settingEl.toggle(val && currentProvider() === "gemini");
-						mistralApiKeySetting.settingEl.toggle(val && currentProvider() === "mistral");
-					})
-			);
-
-		const currentProvider = () => this.plugin.settings.transcriptionProvider ?? "gemini";
-
-		const providerSetting = new Setting(el)
-			.setName("Provider")
-			.setDesc("Which AI service to use for transcription.")
-			.addDropdown((drop) =>
-				drop
-					.addOption("gemini", "Google Gemini")
-					.addOption("mistral", "Mistral OCR")
-					.setValue(provider)
-					.onChange(async (val) => {
-						this.plugin.settings.transcriptionProvider = val as "gemini" | "mistral";
-						await this.plugin.saveSettings();
-						const isGemini = val === "gemini";
-						geminiApiKeySetting.settingEl.toggle(isGemini);
-						geminiModelSetting.settingEl.toggle(isGemini);
-						geminiPromptSetting.settingEl.toggle(isGemini);
-						mistralApiKeySetting.settingEl.toggle(!isGemini);
-					})
-			);
-
-		const geminiApiKeySetting = new Setting(el)
-			.setName("Gemini API key")
-			.setDesc("From Google AI Studio (aistudio.google.com). Free tier available.")
-			.addText((text) => {
-				text.inputEl.type = "password";
-				text
-					.setPlaceholder("AIza…")
-					.setValue(this.plugin.settings.geminiApiKey)
-					.onChange(async (val) => {
-						this.plugin.settings.geminiApiKey = val.trim();
-						await this.plugin.saveSettings();
-					});
-			});
-
-		const geminiModelSetting = new Setting(el)
-			.setName("Model")
-			.setDesc("Gemini model to use for transcription.")
-			.addDropdown((drop) =>
-				drop
-					.addOption("gemini-2.0-flash", "Gemini 2.0 Flash (recommended)")
-					.addOption("gemini-1.5-flash", "Gemini 1.5 Flash")
-					.addOption("gemini-1.5-pro", "Gemini 1.5 Pro")
-					.setValue(this.plugin.settings.geminiModel || "gemini-2.0-flash")
-					.onChange(async (val) => {
-						this.plugin.settings.geminiModel = val;
-						await this.plugin.saveSettings();
-					})
-			);
-
-		const geminiPromptSetting = new Setting(el)
-			.setName("Transcription prompt")
-			.setDesc("Instructions sent to Gemini for each PDF. Customize for your note-taking style.")
-			.addTextArea((text) => {
-				text
-					.setPlaceholder("Transcribe all text visible in this PDF exactly as written…")
-					.setValue(this.plugin.settings.geminiPrompt)
-					.onChange(async (val) => {
-						this.plugin.settings.geminiPrompt = val;
-						await this.plugin.saveSettings();
-					});
-				text.inputEl.rows = 4;
-				text.inputEl.style.width = "100%";
-				text.inputEl.style.resize = "vertical";
-			});
-
-		const mistralApiKeySetting = new Setting(el)
-			.setName("Mistral API key")
-			.setDesc("From console.mistral.ai. Uses the mistral-ocr-latest model.")
-			.addText((text) => {
-				text.inputEl.type = "password";
-				text
-					.setPlaceholder("…")
-					.setValue(this.plugin.settings.mistralApiKey)
-					.onChange(async (val) => {
-						this.plugin.settings.mistralApiKey = val.trim();
-						await this.plugin.saveSettings();
-					});
-			});
-
-		const enabled = this.plugin.settings.geminiEnabled;
-		const isGemini = currentProvider() === "gemini";
-		providerSetting.settingEl.toggle(enabled);
-		geminiApiKeySetting.settingEl.toggle(enabled && isGemini);
-		geminiModelSetting.settingEl.toggle(enabled && isGemini);
-		geminiPromptSetting.settingEl.toggle(enabled && isGemini);
-		mistralApiKeySetting.settingEl.toggle(enabled && !isGemini);
 	}
 
 	private renderSyncTab(el: HTMLElement): void {
@@ -817,8 +702,174 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 	}
 
 	private renderTranscriptionTab(el: HTMLElement): void {
-		// ── Command behavior ───────────────────────────────────────────────────
-		el.createEl("h3", { text: "Command behavior" });
+		// ── Provider & credentials ──────────────────────────────────────────────
+		el.createEl("h3", { text: "Provider & credentials" });
+
+		const currentProvider = () => this.plugin.settings.transcriptionProvider ?? "gemini";
+
+		new Setting(el)
+			.setName("Enable AI transcription")
+			.setDesc("Automatically transcribe PDFs when they are downloaded during sync.")
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.geminiEnabled)
+					.onChange(async (val) => {
+						this.plugin.settings.geminiEnabled = val;
+						await this.plugin.saveSettings();
+						updateProviderVisibility(currentProvider(), val);
+					})
+			);
+
+		const providerSetting = new Setting(el)
+			.setName("Provider")
+			.setDesc("Which AI service to use for transcription.")
+			.addDropdown((drop) =>
+				drop
+					.addOption("gemini", "Google Gemini")
+					.addOption("mistral", "Mistral OCR")
+					.setValue(currentProvider())
+					.onChange(async (val) => {
+						this.plugin.settings.transcriptionProvider = val as "gemini" | "mistral";
+						await this.plugin.saveSettings();
+						updateProviderVisibility(val as "gemini" | "mistral", this.plugin.settings.geminiEnabled);
+					})
+			);
+
+		const geminiApiKeySetting = new Setting(el)
+			.setName("Gemini API key")
+			.setDesc("From Google AI Studio (aistudio.google.com). Free tier available.")
+			.addText((text) => {
+				text.inputEl.type = "password";
+				text
+					.setPlaceholder("AIza…")
+					.setValue(this.plugin.settings.geminiApiKey)
+					.onChange(async (val) => {
+						this.plugin.settings.geminiApiKey = val.trim();
+						await this.plugin.saveSettings();
+					});
+			});
+
+		const geminiModelSetting = new Setting(el)
+			.setName("Gemini model")
+			.setDesc("Gemini model to use for transcription.")
+			.addDropdown((drop) =>
+				drop
+					.addOption("gemini-2.0-flash", "Gemini 2.0 Flash (recommended)")
+					.addOption("gemini-1.5-flash", "Gemini 1.5 Flash")
+					.addOption("gemini-1.5-pro", "Gemini 1.5 Pro")
+					.setValue(this.plugin.settings.geminiModel || "gemini-2.0-flash")
+					.onChange(async (val) => {
+						this.plugin.settings.geminiModel = val;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		const geminiPromptSetting = new Setting(el)
+			.setName("Transcription prompt")
+			.setDesc("Instructions sent to Gemini for each PDF. Customize for your note-taking style.")
+			.addTextArea((text) => {
+				text
+					.setPlaceholder("Transcribe all text visible in this PDF exactly as written…")
+					.setValue(this.plugin.settings.geminiPrompt)
+					.onChange(async (val) => {
+						this.plugin.settings.geminiPrompt = val;
+						await this.plugin.saveSettings();
+					});
+				text.inputEl.rows = 4;
+				text.inputEl.style.width = "100%";
+				text.inputEl.style.resize = "vertical";
+			});
+
+		const geminiTestSetting = new Setting(el)
+			.setName("Test Gemini connection")
+			.setDesc("Send a minimal request to verify your API key is valid.")
+			.addButton((btn) =>
+				btn.setButtonText("Test connection").onClick(async () => {
+					const key = this.plugin.settings.geminiApiKey;
+					const model = this.plugin.settings.geminiModel || "gemini-2.0-flash";
+					if (!key) { new Notice("Enter a Gemini API key first."); return; }
+					btn.setButtonText("Testing…").setDisabled(true);
+					try {
+						const res = await requestUrl({
+							url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+							method: "POST",
+							headers: { "Content-Type": "application/json" },
+							throw: false,
+							body: JSON.stringify({ contents: [{ parts: [{ text: "Reply with the single word: ok" }] }] }),
+						});
+						if (res.status === 200) {
+							new Notice("Gemini connection successful!");
+						} else {
+							const msg = (res.json?.error?.message as string | undefined) ?? res.text.slice(0, 200);
+							new Notice(`Gemini error ${res.status}: ${msg}`);
+						}
+					} catch (e) {
+						new Notice(`Gemini test failed: ${(e as Error).message}`);
+					} finally {
+						btn.setButtonText("Test connection").setDisabled(false);
+					}
+				})
+			);
+
+		const mistralApiKeySetting = new Setting(el)
+			.setName("Mistral API key")
+			.setDesc("From console.mistral.ai. Uses the mistral-ocr-latest model.")
+			.addText((text) => {
+				text.inputEl.type = "password";
+				text
+					.setPlaceholder("…")
+					.setValue(this.plugin.settings.mistralApiKey)
+					.onChange(async (val) => {
+						this.plugin.settings.mistralApiKey = val.trim();
+						await this.plugin.saveSettings();
+					});
+			});
+
+		const mistralTestSetting = new Setting(el)
+			.setName("Test Mistral connection")
+			.setDesc("Verify your Mistral API key is valid.")
+			.addButton((btn) =>
+				btn.setButtonText("Test connection").onClick(async () => {
+					const key = this.plugin.settings.mistralApiKey;
+					if (!key) { new Notice("Enter a Mistral API key first."); return; }
+					btn.setButtonText("Testing…").setDisabled(true);
+					try {
+						const res = await requestUrl({
+							url: "https://api.mistral.ai/v1/models",
+							method: "GET",
+							headers: { "Authorization": `Bearer ${key}` },
+							throw: false,
+						});
+						if (res.status === 200) {
+							new Notice("Mistral connection successful!");
+						} else {
+							const msg = (res.json?.message as string | undefined) ?? res.text.slice(0, 200);
+							new Notice(`Mistral error ${res.status}: ${msg}`);
+						}
+					} catch (e) {
+						new Notice(`Mistral test failed: ${(e as Error).message}`);
+					} finally {
+						btn.setButtonText("Test connection").setDisabled(false);
+					}
+				})
+			);
+
+		const updateProviderVisibility = (prov: "gemini" | "mistral", enabled: boolean) => {
+			const isGemini = prov === "gemini";
+			providerSetting.settingEl.toggle(enabled);
+			geminiApiKeySetting.settingEl.toggle(enabled && isGemini);
+			geminiModelSetting.settingEl.toggle(enabled && isGemini);
+			geminiPromptSetting.settingEl.toggle(enabled && isGemini);
+			geminiTestSetting.settingEl.toggle(enabled && isGemini);
+			mistralApiKeySetting.settingEl.toggle(enabled && !isGemini);
+			mistralTestSetting.settingEl.toggle(enabled && !isGemini);
+		};
+		updateProviderVisibility(currentProvider(), this.plugin.settings.geminiEnabled);
+
+		// ── Default behavior ────────────────────────────────────────────────────
+		el.createEl("h3", { text: "Default behavior" });
+
+		let defaultNotePathSetting: Setting;
 
 		new Setting(el)
 			.setName("Default destination")
@@ -831,31 +882,90 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					.addOption("ask",       "Ask — always show the picker")
 					.addOption("companion", "Companion note")
 					.addOption("daily",     "Today's daily note")
-					.addOption("note",      "Pick a note — skip intro screen")
+					.addOption("note",      "Specific file")
 					.setValue(this.plugin.settings.transcribeDefaultDest ?? "ask")
 					.onChange(async (val) => {
 						this.plugin.settings.transcribeDefaultDest = val as "ask" | "companion" | "daily" | "note";
 						await this.plugin.saveSettings();
+						defaultNotePathSetting.settingEl.toggle(val === "note");
 					})
 			);
 
-		// ── Companion note template ───────────────────────────────────────────
-		el.createEl("h3", { text: "Companion note template" });
+		defaultNotePathSetting = new Setting(el)
+			.setName("Default note path")
+			.setDesc(
+				"Vault path to the note used as the transcription destination when \"Specific file\" is selected. " +
+				"If not set or the file doesn't exist, the note picker opens instead."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("Notes/Transcriptions.md")
+					.setValue(this.plugin.settings.transcribeDefaultNotePath ?? "")
+					.onChange(async (val) => {
+						this.plugin.settings.transcribeDefaultNotePath = val.trim();
+						await this.plugin.saveSettings();
+					})
+			)
+			.addButton((btn) =>
+				btn.setButtonText("Browse…").onClick(() => {
+					new NoteFilePicker(this.app, (file) => {
+						this.plugin.settings.transcribeDefaultNotePath = file.path;
+						void this.plugin.saveSettings();
+						this.display();
+					}).open();
+				})
+			);
+		defaultNotePathSetting.settingEl.toggle(
+			(this.plugin.settings.transcribeDefaultDest ?? "ask") === "note"
+		);
+
+		const fallbackVal = (this.plugin.settings.transcribeCompanionFallbackFolder ?? "").trim();
+
+		const fallbackSetting = new Setting(el)
+			.setName("Companion fallback folder")
+			.setDesc(
+				"Where to create the companion note when you run \"Transcribe → Companion note\" and none exists. " +
+				"Empty = alongside the PDF. \"/\" = vault root. " +
+				"Supports {{RootFolder}}, {{folderL1}}, {{folderL2}} tokens."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("(empty = alongside PDF)")
+					.setValue(fallbackVal)
+					.onChange(async (val) => {
+						this.plugin.settings.transcribeCompanionFallbackFolder = val.trim();
+						await this.plugin.saveSettings();
+						fallbackPreviewEl.textContent = this.buildFallbackPreview(val.trim());
+					})
+			);
+
+		const fallbackPreviewEl = fallbackSetting.settingEl.createEl("div", {
+			text: this.buildFallbackPreview(fallbackVal),
+			cls: "setting-item-description",
+		});
+		fallbackPreviewEl.style.marginTop = "4px";
+		fallbackPreviewEl.style.fontStyle = "italic";
+
+		// ── Templates ────────────────────────────────────────────────────────────
+		el.createEl("h3", { text: "Templates" });
 		el.createEl("p", {
-			text:
-				"Template used when transcribing into a companion note. " +
-				"Supports: {{transcription}}, {{title}} (PDF stem), {{fileName}}, " +
-				"{{date}} (YYYY-MM-DD), {{link}} ([[wikilink]]), {{embed}} (![[embed]]).",
+			text: "Leave any template empty to use the built-in default (a simple ## Transcription block).",
 			cls: "setting-item-description",
 		});
 
-		const companionTemplatePath = (this.plugin.settings.transcribeCompanionTemplatePath ?? "").trim();
+		const TOKEN_DOCS = "Tokens: {{transcription}}, {{title}}, {{fileName}}, {{date}}, {{link}}, {{embed}}, {{sourcePath}}, {{pairLabel}}";
 
-		new Setting(el)
-			.setName("Template file path")
+		// Companion note template
+		el.createEl("h4", { text: "Companion note" });
+
+		const companionPathVal = (this.plugin.settings.transcribeCompanionTemplatePath ?? "").trim();
+		let companionInlineSetting: Setting;
+
+		const companionPathSetting = new Setting(el)
+			.setName("Template file")
 			.setDesc(
-				"Vault path to a .md file to use as the companion note template. " +
-				"When set, overrides the inline template below."
+				"Vault path to a .md file used as the companion note template. " +
+				"When set and the file exists, it overrides the inline template."
 			)
 			.addText((text) =>
 				text
@@ -864,13 +974,47 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					.onChange(async (val) => {
 						this.plugin.settings.transcribeCompanionTemplatePath = val.trim();
 						await this.plugin.saveSettings();
-						companionInlineTemplateSetting.settingEl.toggle(!val.trim());
+						companionInlineSetting.settingEl.toggle(!val.trim());
+						const hasInline = !!(this.plugin.settings.transcribeCompanionTemplate ?? "").trim();
+						overrideHint.style.display = (!!val.trim() && hasInline) ? "" : "none";
 					})
+			)
+			.addButton((btn) =>
+				btn.setButtonText("Browse…").onClick(() => {
+					new NoteFilePicker(this.app, (file) => {
+						this.plugin.settings.transcribeCompanionTemplatePath = file.path;
+						void this.plugin.saveSettings();
+						this.display();
+					}).open();
+				})
+			)
+			.addButton((btn) =>
+				btn.setButtonText("Preview").onClick(async () => {
+					const filePath = (this.plugin.settings.transcribeCompanionTemplatePath ?? "").trim();
+					let template: string | undefined;
+					if (filePath) {
+						try {
+							const exists = await this.app.vault.adapter.exists(filePath);
+							if (exists) template = await this.app.vault.adapter.read(filePath);
+						} catch {}
+					}
+					if (!template) {
+						template = (this.plugin.settings.transcribeCompanionTemplate ?? "").trim() || undefined;
+					}
+					new TemplatePreviewModal(this.app, template).open();
+				})
 			);
 
-		const companionInlineTemplateSetting = new Setting(el)
+		const overrideHint = companionPathSetting.settingEl.createEl("small", {
+			text: "(file overrides inline)",
+		});
+		overrideHint.style.display = (companionPathVal && !!(this.plugin.settings.transcribeCompanionTemplate ?? "").trim()) ? "" : "none";
+		overrideHint.style.color = "var(--text-accent)";
+		overrideHint.style.marginLeft = "8px";
+
+		companionInlineSetting = new Setting(el)
 			.setName("Inline template")
-			.setDesc("Used when no template file path is set. Leave empty for the built-in default.")
+			.setDesc("Used when no template file is set.")
 			.addTextArea((text) => {
 				text
 					.setPlaceholder("## Transcription\n\n*Source: {{fileName}}*\n\n{{transcription}}")
@@ -878,26 +1022,23 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					.onChange(async (val) => {
 						this.plugin.settings.transcribeCompanionTemplate = val;
 						await this.plugin.saveSettings();
+						const filePath = (this.plugin.settings.transcribeCompanionTemplatePath ?? "").trim();
+						overrideHint.style.display = (filePath && !!val.trim()) ? "" : "none";
 					});
 				text.inputEl.rows = 5;
 				text.inputEl.style.width = "100%";
 				text.inputEl.style.fontFamily = "monospace";
 				text.inputEl.style.resize = "vertical";
 			});
-		companionInlineTemplateSetting.settingEl.toggle(!companionTemplatePath);
+		companionInlineSetting.settingEl.toggle(!companionPathVal);
 
-		// ── Daily note template ───────────────────────────────────────────────
-		el.createEl("h3", { text: "Daily note template" });
-		el.createEl("p", {
-			text:
-				"Template for the content inserted into today's daily note when transcribing. " +
-				"Supports: {{transcription}}, {{title}}, {{fileName}}, {{date}}, {{link}}, {{embed}}.",
-			cls: "setting-item-description",
-		});
+		el.createEl("p", { text: TOKEN_DOCS, cls: "setting-item-description" });
+
+		// Daily note template
+		el.createEl("h4", { text: "Daily note" });
 
 		new Setting(el)
 			.setName("Template")
-			.setDesc("Leave empty for the built-in default.")
 			.addTextArea((text) => {
 				text
 					.setPlaceholder("## Transcription from {{link}}\n\n{{transcription}}")
@@ -912,18 +1053,13 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				text.inputEl.style.resize = "vertical";
 			});
 
-		// ── Existing note template ────────────────────────────────────────────
-		el.createEl("h3", { text: "Existing note template" });
-		el.createEl("p", {
-			text:
-				"Template for the content inserted when transcribing into a specific existing note. " +
-				"Supports: {{transcription}}, {{title}}, {{fileName}}, {{date}}, {{link}}, {{embed}}.",
-			cls: "setting-item-description",
-		});
+		el.createEl("p", { text: TOKEN_DOCS, cls: "setting-item-description" });
+
+		// Specific note template
+		el.createEl("h4", { text: "Specific note" });
 
 		new Setting(el)
 			.setName("Template")
-			.setDesc("Leave empty for the built-in default.")
 			.addTextArea((text) => {
 				text
 					.setPlaceholder("## Transcription from {{link}}\n\n{{transcription}}")
@@ -938,32 +1074,95 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				text.inputEl.style.resize = "vertical";
 			});
 
-		// ── Companion note placement ──────────────────────────────────────────
-		el.createEl("h3", { text: "Companion note placement" });
+		el.createEl("p", { text: TOKEN_DOCS, cls: "setting-item-description" });
+
+		// ── Page-hash retranscription ──────────────────────────────────────────
+		el.createEl("h3", { text: "Page-hash retranscription" });
+
+		const store = this.plugin.transcriptionStore;
+		const entryCount = store ? store.entries().length : 0;
+
 		el.createEl("p", {
-			text:
-				"Where to create the companion note when you run \"Transcribe → Companion note\" " +
-				"and no companion note exists for the PDF yet.",
+			text: `${entryCount} file${entryCount !== 1 ? "s" : ""} have transcription records. Clearing a hash forces re-transcription even when the PDF content hasn't changed.`,
 			cls: "setting-item-description",
 		});
 
 		new Setting(el)
-			.setName("Fallback folder")
-			.setDesc(
-				"Vault folder where the new companion note is created. " +
-				"Leave empty to place it alongside the PDF. " +
-				"Use \"/\" for the vault root. " +
-				"Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}."
-			)
-			.addText((text) =>
-				text
-					.setPlaceholder("(empty = alongside PDF)")
-					.setValue(this.plugin.settings.transcribeCompanionFallbackFolder ?? "")
-					.onChange(async (val) => {
-						this.plugin.settings.transcribeCompanionFallbackFolder = val.trim();
-						await this.plugin.saveSettings();
+			.setName("Force re-transcribe active file")
+			.setDesc("Clear the page hash for the currently open file so it's re-transcribed on the next sync.")
+			.addButton((btn) =>
+				btn.setButtonText("Clear hash").onClick(async () => {
+					const activeFile = this.app.workspace.getActiveFile();
+					if (!activeFile) { new Notice("No file is currently open."); return; }
+					if (!store) { new Notice("Transcription store not available."); return; }
+					const entry = store.findByVaultPath(activeFile.path);
+					if (!entry) {
+						new Notice(`No transcription record found for "${activeFile.name}".`);
+						return;
+					}
+					const [driveFileId, rec] = entry;
+					rec.pdfHash = "";
+					store.set(driveFileId, rec);
+					await store.save();
+					new Notice(`Hash cleared for "${activeFile.name}". It will be re-transcribed on the next sync.`);
+				})
+			);
+
+		new Setting(el)
+			.setName("Clear all transcription records")
+			.setDesc("Remove all stored page hashes and transcription history. All PDFs will be re-transcribed on the next sync.")
+			.addButton((btn) =>
+				btn
+					.setButtonText("Clear all")
+					.setWarning()
+					.onClick(async () => {
+						if (!store) { new Notice("Transcription store not available."); return; }
+						const count = store.entries().length;
+						if (count === 0) { new Notice("No transcription records to clear."); return; }
+						new ConfirmClearTranscriptionsModal(this.app, count, async () => {
+							for (const [id] of store.entries()) {
+								store.delete(id);
+							}
+							await store.save();
+							new Notice(`Cleared ${count} transcription record${count !== 1 ? "s" : ""}.`);
+							this.display();
+						}).open();
 					})
 			);
+	}
+
+	private buildFallbackPreview(folder: string): string {
+		const activeFile = this.app.workspace.getActiveFile();
+		const sourcePath = activeFile?.path ?? "Drive Sync/Example/Example Document.pdf";
+		const stem = sourcePath.replace(/\.pdf$/i, "").split("/").pop() ?? "Example";
+
+		let companionPath: string;
+		if (folder === "/") {
+			companionPath = `${stem}.md`;
+		} else if (folder) {
+			const resolved = this.resolveCompanionPathTokens(folder, sourcePath);
+			companionPath = `${resolved}/${stem}.md`;
+		} else {
+			const dir = sourcePath.substring(0, sourcePath.lastIndexOf("/"));
+			companionPath = dir ? `${dir}/${stem}.md` : `${stem}.md`;
+		}
+
+		return `Example: ${sourcePath} → ${companionPath}`;
+	}
+
+	private resolveCompanionPathTokens(template: string, vaultFilePath: string): string {
+		const parts = vaultFilePath.split("/");
+		parts.pop();
+		const dirs = parts.filter(Boolean);
+		return template.replace(/\{\{([^}]+)\}\}/g, (match, token: string) => {
+			if (token === "RootFolder") return dirs[0] ?? "";
+			const lm = token.match(/^folderL(\d+)$/);
+			if (lm) {
+				const level = parseInt(lm[1], 10);
+				return dirs[dirs.length - level] ?? "";
+			}
+			return match;
+		});
 	}
 
 	private renderAutomationsTab(el: HTMLElement): void {
@@ -1784,6 +1983,106 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 
 	private generateId(): string {
 		return Math.random().toString(36).slice(2) + Date.now().toString(36);
+	}
+}
+
+class NoteFilePicker extends FuzzySuggestModal<TFile> {
+	constructor(app: App, private onChoose: (file: TFile) => void) {
+		super(app);
+		this.setPlaceholder("Pick a markdown file…");
+	}
+
+	getItems(): TFile[] {
+		return this.app.vault.getMarkdownFiles();
+	}
+
+	getItemText(file: TFile): string {
+		return file.path;
+	}
+
+	onChooseItem(file: TFile): void {
+		this.onChoose(file);
+	}
+}
+
+class TemplatePreviewModal extends Modal {
+	constructor(app: App, private template: string | undefined) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: "Template preview" });
+
+		const sampleTitle = "Example Document";
+		const sampleFile = "Example Document.pdf";
+		const sampleDate = new Date().toISOString().slice(0, 10);
+		const sampleTranscription = "This is a sample transcription.\n\nSecond paragraph of content.";
+
+		let rendered: string;
+		if (this.template) {
+			rendered = this.template
+				.replaceAll("{{transcription}}", sampleTranscription)
+				.replaceAll("{{title}}", sampleTitle)
+				.replaceAll("{{fileName}}", sampleFile)
+				.replaceAll("{{date}}", sampleDate)
+				.replaceAll("{{link}}", `[[${sampleTitle}]]`)
+				.replaceAll("{{embed}}", `![[${sampleFile}]]`)
+				.replaceAll("{{sourcePath}}", "Drive Sync/Example/Example Document.pdf")
+				.replaceAll("{{pairLabel}}", "My Pair");
+		} else {
+			rendered = `## Transcription\n\n*Source: ${sampleFile}*\n\n${sampleTranscription}`;
+		}
+
+		contentEl.createEl("p", {
+			text: "Rendered using synthetic example data:",
+			cls: "setting-item-description",
+		});
+
+		const pre = contentEl.createEl("pre");
+		pre.style.cssText = "background:var(--background-secondary);padding:12px;border-radius:4px;white-space:pre-wrap;font-family:monospace;font-size:var(--font-ui-smaller);overflow:auto;max-height:400px;";
+		pre.textContent = rendered;
+
+		new Setting(contentEl)
+			.addButton((b) => b.setButtonText("Close").onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+class ConfirmClearTranscriptionsModal extends Modal {
+	constructor(
+		app: App,
+		private count: number,
+		private onConfirm: () => void
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: "Clear all transcription records?" });
+		contentEl.createEl("p", {
+			text: `This will delete ${this.count} transcription record${this.count !== 1 ? "s" : ""}. All PDFs will be re-transcribed on the next sync. This cannot be undone.`,
+		});
+
+		new Setting(contentEl)
+			.addButton((b) =>
+				b
+					.setButtonText("Clear all")
+					.setWarning()
+					.onClick(() => {
+						this.close();
+						this.onConfirm();
+					})
+			)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
 	}
 }
 

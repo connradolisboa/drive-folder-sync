@@ -82,6 +82,14 @@ class DestinationPickerModal extends Modal {
 		}
 		if (defaultDest === "note") {
 			this.close();
+			const defaultNotePath = (this.plugin.settings.transcribeDefaultNotePath ?? "").trim();
+			if (defaultNotePath) {
+				const defaultNoteFile = this.app.vault.getAbstractFileByPath(defaultNotePath);
+				if (defaultNoteFile instanceof TFile) {
+					void this.proceed({ type: "note", file: defaultNoteFile });
+					return;
+				}
+			}
 			new NotePickerModal(this.app, (file) => void this.proceed({ type: "note", file })).open();
 			return;
 		}
@@ -233,7 +241,12 @@ class DestinationPickerModal extends Modal {
 			notice.hide();
 
 			const template = await this.resolveTemplate(destType);
-			await writeTranscription(this.app, destFile, transcription, mode, this.pdfFile.name, template);
+			const manifestEntry = this.plugin.manifestStore.findByVaultPath(this.pdfFile.path);
+			const pairId = manifestEntry ? manifestEntry[1].pairId : null;
+			const pairLabel = pairId
+				? (this.plugin.settings.syncPairs.find((p) => p.id === pairId)?.label ?? "")
+				: "";
+			await writeTranscription(this.app, destFile, transcription, mode, this.pdfFile.name, template, this.pdfFile.path, pairLabel);
 			new Notice(`Transcription written to "${destFile.name}"`);
 			await this.recordTranscription(pdfBytes, destFile);
 		} catch (e) {
@@ -410,7 +423,9 @@ async function writeTranscription(
 	transcription: string,
 	mode: "append" | "replace",
 	sourceName: string,
-	template?: string
+	template?: string,
+	sourcePath?: string,
+	pairLabel?: string
 ): Promise<void> {
 	await app.vault.process(file, (content) => {
 		const HEADER = "## Transcription";
@@ -425,7 +440,9 @@ async function writeTranscription(
 				.replaceAll("{{fileName}}", sourceName)
 				.replaceAll("{{date}}", date)
 				.replaceAll("{{link}}", `[[${stem}]]`)
-				.replaceAll("{{embed}}", `![[${sourceName}]]`);
+				.replaceAll("{{embed}}", `![[${sourceName}]]`)
+				.replaceAll("{{sourcePath}}", sourcePath ?? sourceName)
+				.replaceAll("{{pairLabel}}", pairLabel ?? "");
 		} else {
 			newBlock = `${HEADER}\n\n*Source: ${sourceName}*\n\n${transcription}`;
 		}
