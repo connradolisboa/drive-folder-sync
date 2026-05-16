@@ -16,6 +16,7 @@ import { FileTrackerModal } from "./ui/FileTrackerModal";
 import { SyncLogModal } from "./ui/SyncLogModal";
 import { AutomationDryRunModal } from "./ui/AutomationDryRunModal";
 import { ConflictModal } from "./ui/ConflictModal";
+import { FileStatusModal } from "./ui/FileStatusModal";
 import { TranscriptionStore } from "./ai/TranscriptionStore";
 import { transcribeCurrentFile, openTranscribePickerForFile } from "./commands/TranscribeCurrentFile";
 import { runAudit, AuditModal } from "./commands/Audit";
@@ -31,7 +32,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	manifestStore: SyncManifestStore;
 	transcriptionStore: TranscriptionStore;
 	private driveSync: DriveSync;
-	private companionManager: CompanionNoteManager;
+	companionManager: CompanionNoteManager;
 	private automationEngine: AutomationEngine;
 	private syncLogger: SyncLogger;
 	private syncActivityLog: SyncActivityLog;
@@ -303,6 +304,97 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			})
 		);
 
+		// File-explorer right-click menu
+		this.registerEvent(
+			this.app.workspace.on("file-menu", (menu, abstractFile) => {
+				if (!(abstractFile instanceof TFile)) return;
+				const file = abstractFile;
+
+				const manifestEntry = this.manifestStore.findByVaultPath(file.path);
+				const isPdf = file.path.toLowerCase().endsWith(".pdf");
+				const providerEnabled =
+					this.settings.geminiEnabled || !!this.settings.mistralApiKey;
+
+				// ── Transcription items (PDF + provider enabled) ──────────────────
+				if (isPdf && providerEnabled) {
+					menu.addItem((item) =>
+						item
+							.setTitle("Transcribe…")
+							.setIcon("mic")
+							.setSection("drive-sync")
+							.onClick(() => openTranscribePickerForFile(this.app, this, file))
+					);
+					menu.addItem((item) =>
+						item
+							.setTitle("Transcribe to companion note")
+							.setIcon("mic")
+							.setSection("drive-sync")
+							.onClick(() => openTranscribePickerForFile(this.app, this, file, "companion"))
+					);
+					menu.addItem((item) =>
+						item
+							.setTitle("Transcribe to today's daily note")
+							.setIcon("mic")
+							.setSection("drive-sync")
+							.onClick(() => openTranscribePickerForFile(this.app, this, file, "daily"))
+					);
+				}
+
+				// ── Companion note (any file) ─────────────────────────────────────
+				menu.addItem((item) =>
+					item
+						.setTitle("Create companion note")
+						.setIcon("file-plus")
+						.setSection("drive-sync")
+						.onClick(() => new CreateCompanionModal(this.app, file, this.companionManager).open())
+				);
+
+				// ── Drive Sync status (any file) ──────────────────────────────────
+				menu.addItem((item) =>
+					item
+						.setTitle("Show Drive Sync status…")
+						.setIcon("info")
+						.setSection("drive-sync")
+						.onClick(() => new FileStatusModal(this.app, this, file).open())
+				);
+
+				// ── Tracked-file-only items ───────────────────────────────────────
+				if (manifestEntry) {
+					const [driveFileId, entry] = manifestEntry;
+
+					menu.addItem((item) =>
+						item
+							.setTitle("Sync this pair now")
+							.setIcon("refresh-cw")
+							.setSection("drive-sync")
+							.onClick(() => {
+								this.runSyncForPair(entry.pairId)
+									.then((r) => new Notice(this.formatResult(r)))
+									.catch((e) => new Notice(`Drive sync failed: ${(e as Error).message}`));
+							})
+					);
+
+					if (isPdf) {
+						menu.addItem((item) =>
+							item
+								.setTitle("Force full re-transcription")
+								.setIcon("rotate-ccw")
+								.setSection("drive-sync")
+								.onClick(() => {
+									this.transcriptionStore.delete(driveFileId);
+									this.transcriptionStore.save().catch((e) =>
+										console.error(`${LOG} Failed to save transcription store:`, e)
+									);
+									new Notice(
+										`Transcription record cleared for "${file.basename}". Re-sync to re-transcribe.`
+									);
+								})
+						);
+					}
+				}
+			})
+		);
+
 		const isAuthorized = await this.auth.isAuthorized();
 		console.log(`${LOG} Authorized: ${isAuthorized}`);
 
@@ -546,6 +638,65 @@ class AutomationForceModal extends Modal {
 				})
 			)
 			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+class CreateCompanionModal extends Modal {
+	constructor(
+		app: App,
+		private file: TFile,
+		private companionManager: CompanionNoteManager
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl, file } = this;
+		contentEl.createEl("h3", { text: `Create companion note for "${file.basename}"` });
+		contentEl.createEl("p", {
+			text: "Choose where to place the companion note:",
+			cls: "setting-item-description",
+		});
+
+		new Setting(contentEl)
+			.setName("Alongside the file")
+			.setDesc(`Place note in: ${file.parent?.path || "(vault root)"}`)
+			.addButton((b) =>
+				b.setButtonText("Create here").setCta().onClick(async () => {
+					this.close();
+					await this.create("alongside");
+				})
+			);
+
+		new Setting(contentEl)
+			.setName("Vault root")
+			.setDesc("Place note in the top-level vault folder")
+			.addButton((b) =>
+				b.setButtonText("Create in root").onClick(async () => {
+					this.close();
+					await this.create("root");
+				})
+			);
+
+		new Setting(contentEl)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	private async create(placement: "alongside" | "root"): Promise<void> {
+		try {
+			const path = await this.companionManager.createForArbitraryFile(this.file, placement);
+			new Notice(`Companion note created: ${path}`);
+			const created = this.app.vault.getAbstractFileByPath(path);
+			if (created instanceof TFile) {
+				this.app.workspace.getLeaf(false).openFile(created);
+			}
+		} catch (e) {
+			new Notice(`Failed to create companion note: ${(e as Error).message}`);
+		}
 	}
 
 	onClose(): void {

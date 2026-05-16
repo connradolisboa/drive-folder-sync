@@ -358,6 +358,47 @@ export class CompanionNoteManager {
 	}
 
 	/**
+	 * Create a companion note for any vault file — not just Drive-tracked PDFs.
+	 * The note gets frontmatter: companion, companion-of, sourceVaultPath, created.
+	 *
+	 * @param file      The vault file to create a companion for.
+	 * @param placement "alongside" = same folder as file; "root" = vault root.
+	 * @returns         The vault path of the created (or adopted) companion note.
+	 */
+	async createForArbitraryFile(file: TFile, placement: "alongside" | "root"): Promise<string> {
+		const stem = file.basename;
+		let notePath: string;
+
+		if (placement === "root") {
+			notePath = `${stem}.md`;
+		} else {
+			const dir = file.parent?.path ?? "";
+			notePath = dir ? `${dir}/${stem}.md` : `${stem}.md`;
+		}
+
+		await this.ensureFolder(notePath);
+
+		const exists = await this.app.vault.adapter.exists(notePath);
+		if (exists) {
+			const tFile = this.app.vault.getAbstractFileByPath(notePath);
+			if (tFile instanceof TFile) {
+				await this.app.fileManager.processFrontMatter(tFile, (fm) => {
+					fm["companion"] = `[[${file.name}]]`;
+					fm["companion-of"] = `[[${stem}]]`;
+					fm["sourceVaultPath"] = file.path;
+				});
+			}
+		} else {
+			const content =
+				`---\ncompanion: "[[${file.name}]]"\ncompanion-of: "[[${stem}]]"\nsourceVaultPath: "${file.path}"\ncreated: "${new Date().toISOString()}"\n---\n\n# ${stem}\n\n## Notes\n\n`;
+			await this.app.vault.create(notePath, content);
+		}
+
+		console.log(`${LOG} Companion note created for arbitrary file: ${notePath}`);
+		return notePath;
+	}
+
+	/**
 	 * Scan vault notes for one that declares itself a companion of the given PDF
 	 * via the `companion` frontmatter property, e.g. companion: "[[Link File.pdf]]".
 	 * Matches by filename (with or without extension) or full vault path.

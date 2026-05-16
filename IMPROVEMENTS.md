@@ -80,37 +80,38 @@ The "Transcribe file" command supports three destinations (companion / daily / a
 
 ### 8.1 Wire `file-menu` event in main.ts
 
-- [ ] In `main.ts`, register `this.app.workspace.on("file-menu", (menu, file) => { … })` and add a top-level **"Drive Sync"** submenu when the file matches **any** of the entry conditions below.
-- [ ] Use `menu.addItem(item => item.setTitle("Drive Sync").setIcon("refresh-cw").setSection("drive-sync")…)` and chain a sub-`Menu` so all options are nested under one entry (avoid polluting the menu).
+- [x] In `main.ts`, register `this.app.workspace.on("file-menu", (menu, file) => { … })` and add Drive Sync items grouped under the `"drive-sync"` section.
+- [x] Items are filtered by file type (PDF) and tracking status (manifest entry).
 
 ### 8.2 Items inside the submenu
 
 For PDFs (or any file the user might want to transcribe):
-- [ ] **"Transcribe…"** — opens the existing `DestinationPickerModal`. Hidden when the active provider is disabled.
-- [ ] **"Transcribe to companion note"** — fast path; skips the picker.
-- [ ] **"Transcribe to today's daily note"** — fast path.
+- [x] **"Transcribe…"** — opens the existing `DestinationPickerModal`. Hidden when the active provider is disabled.
+- [x] **"Transcribe to companion note"** — fast path; skips the picker.
+- [x] **"Transcribe to today's daily note"** — fast path.
 
-For any file (PDF or otherwise) — the "automation on any file" surface from Phase 9:
-- [ ] **"Run automation on this file…"** — opens `AutomationPickerModal`, then runs `runForFileAdHoc(file.path, automationId, { force: false, ignoreFolderTrigger: true })`.
-- [ ] **"Create companion note"** — calls `companionManager.create()` against this file, even if it's not Drive-tracked. (Implement in §9.3.)
+For any file (PDF or otherwise):
+- [x] **"Create companion note"** — opens `CreateCompanionModal` to pick placement (alongside / root). Calls `companionManager.createForArbitraryFile()`.
+
+For any file:
+- [x] **"Show Drive Sync status…"** — opens `FileStatusModal` (see §8.3).
 
 For tracked files (those present in the manifest):
-- [ ] **"Show Drive Sync status…"** — opens a new `FileStatusModal` (see §8.3).
-- [ ] **"Force full re-transcription"** — same behavior as the existing command, but scoped to this file.
-- [ ] **"Sync this pair now"** — runs `runSyncForPair(entry.pairId)` for the file's owning pair.
+- [x] **"Sync this pair now"** — runs `runSyncForPair(entry.pairId)` for the file's owning pair.
+- [x] **"Force full re-transcription"** — clears transcription store entry; scoped to this file (PDF only).
 
 ### 8.3 `FileStatusModal` — single-file inspector
 
-This is the per-file view of the global FileTracker.
+- [x] New file `ui/FileStatusModal.ts`. Constructor: `(app, plugin, file: TFile)`.
+- [x] Display sections (only show ones with data):
+  - [x] **Drive metadata**: `driveFileId`, `driveModifiedTime`, `pairId` + label, trashed flag, user-deleted flag.
+  - [x] **Companion**: companion path (clickable → opens the note), exists yes/no, last written timestamp.
+  - [x] **Transcription**: store entry hash, page count, per-destination history.
+  - [x] **Automation runs**: each `automationRuns[]` row — id, name, last run at, last result, outputs, error message.
+  - [x] **Untracked**: when no manifest entry exists, shows "Not tracked by Drive Sync." with action buttons (transcribe, create companion).
+- [x] Action row at the bottom: same buttons as the right-click submenu, for parity.
 
-- [ ] New file `ui/FileStatusModal.ts`. Constructor: `(app, plugin, file: TFile)`.
-- [ ] Display sections (only show ones with data):
-  - [ ] **Drive metadata**: `driveFileId`, `driveModifiedTime`, `pairId` + label, trashed flag, user-deleted flag.
-  - [ ] **Companion**: companion path (clickable → opens the note), exists yes/no, last conflict timestamp.
-  - [ ] **Transcription**: store entry hash, page count, per-destination history.
-  - [ ] **Automation runs**: each `automationRuns[]` row — id, name, last run at, last result, output count, error message.
-  - [ ] **Untracked**: when no manifest entry exists, show a single line: "Not tracked by Drive Sync." with action buttons for what's possible (transcribe, create companion, run ad-hoc automation).
-- [ ] Action row at the bottom: same buttons as the right-click submenu, for parity.
+**Decisions made:** "Run automation on this file…" deferred to Phase 9 (requires `runForFileAdHoc` not yet implemented). `CreateCompanionModal` lives in `main.ts` alongside other local modal classes.
 
 ### 8.4 Verification
 

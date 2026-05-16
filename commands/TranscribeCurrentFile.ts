@@ -16,8 +16,13 @@ declare const moment: () => { format(pattern: string): string };
 
 const LOG = "[DriveSync/Transcribe]";
 
-export function openTranscribePickerForFile(app: App, plugin: DriveFolderSyncPlugin, file: TFile): void {
-	new DestinationPickerModal(app, plugin, file).open();
+export function openTranscribePickerForFile(
+	app: App,
+	plugin: DriveFolderSyncPlugin,
+	file: TFile,
+	fastPath?: "companion" | "daily"
+): void {
+	new DestinationPickerModal(app, plugin, file, fastPath).open();
 }
 
 export async function transcribeCurrentFile(plugin: DriveFolderSyncPlugin): Promise<void> {
@@ -62,12 +67,25 @@ class DestinationPickerModal extends Modal {
 	constructor(
 		app: App,
 		private plugin: DriveFolderSyncPlugin,
-		private pdfFile: TFile
+		private pdfFile: TFile,
+		private fastPath?: "companion" | "daily"
 	) {
 		super(app);
 	}
 
 	onOpen(): void {
+		// Fast-path from right-click menu — skip picker entirely
+		if (this.fastPath === "companion") {
+			this.close();
+			void this.proceed({ type: "companion" });
+			return;
+		}
+		if (this.fastPath === "daily") {
+			this.close();
+			void this.proceed({ type: "daily" });
+			return;
+		}
+
 		// If a default destination is configured, skip the picker entirely
 		const defaultDest = this.plugin.settings.transcribeDefaultDest ?? "ask";
 		if (defaultDest === "companion") {
