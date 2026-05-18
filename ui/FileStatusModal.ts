@@ -194,6 +194,13 @@ export class FileStatusModal extends Modal {
 			});
 		}
 
+		if (this.plugin.settings.automations.some((a) => a.enabled)) {
+			this.actionBtn(row, "Run automation on this file…", () => {
+				this.plugin.openAdHocAutomationPicker(file);
+				this.close();
+			});
+		}
+
 		this.actionBtn(row, "Create companion note (alongside)", async () => {
 			try {
 				const path = await this.plugin.companionManager.createForArbitraryFile(file, "alongside");
@@ -251,6 +258,13 @@ export class FileStatusModal extends Modal {
 				new Notice(
 					`Transcription record cleared for "${file.basename}". Re-sync to re-transcribe.`
 				);
+				this.close();
+			});
+		}
+
+		if (this.plugin.settings.automations.some((a) => a.enabled)) {
+			this.actionBtn(row, "Run automation on this file…", () => {
+				this.plugin.openAdHocAutomationPicker(file);
 				this.close();
 			});
 		}

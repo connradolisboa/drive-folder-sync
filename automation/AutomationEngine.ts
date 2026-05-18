@@ -4,6 +4,25 @@ import type { SyncManifestStore } from "../sync/SyncManifest";
 
 const LOG = "[DriveSync/Automation]";
 
+export interface RunForFileOptions {
+	vaultPath: string;
+	companionPath?: string | null;
+	driveCreatedTime?: string;
+	transcription?: string;
+	driveFileId?: string;
+	driveModifiedTime?: string;
+	force?: boolean;
+	/** When true, skip the trigger-folder filter and consider every active automation a candidate. */
+	ignoreFolderTrigger?: boolean;
+}
+
+export interface AdHocRunResult {
+	ran: boolean;
+	skippedReason?: string;
+	error?: string;
+	outputs?: string[];
+}
+
 // Obsidian bundles moment.js as a global
 declare const moment: (date: string, format: string) => { format(pattern: string): string };
 
@@ -113,17 +132,20 @@ export class AutomationEngine {
 		return { matched, ran, skipped, errors, ...(opts.dryRun ? { preview } : {}) };
 	}
 
-	async runForFile(
-		vaultPath: string,
-		companionPath?: string | null,
-		driveCreatedTime?: string,
-		transcription?: string,
-		driveFileId?: string,
-		driveModifiedTime?: string,
-		force = false
-	): Promise<void> {
+	async runForFile(opts: RunForFileOptions): Promise<void> {
+		const {
+			vaultPath,
+			companionPath,
+			driveCreatedTime,
+			transcription,
+			driveFileId,
+			driveModifiedTime,
+			force = false,
+			ignoreFolderTrigger = false,
+		} = opts;
+
 		const matching = this.settings.automations.filter(
-			(a) => a.enabled && this.matchesTrigger(a, vaultPath)
+			(a) => a.enabled && (ignoreFolderTrigger || this.matchesTrigger(a, vaultPath))
 		);
 
 		if (matching.length === 0) return;
@@ -189,6 +211,111 @@ export class AutomationEngine {
 					});
 				}
 			}
+		}
+	}
+
+	/**
+	 * Run a single automation against any vault file on demand, bypassing the trigger-folder filter.
+	 *
+	 * Untracked files (no manifest entry) skip the decision matrix entirely — every invocation runs
+	 * the action because there's no driveFileId to record history against. Re-running on the same
+	 * untracked file is therefore not idempotent at the matrix level; callers that need idempotency
+	 * should rely on the actions themselves (which generally check before inserting).
+	 */
+	async runForFileAdHoc(
+		vaultPath: string,
+		automationId: string,
+		opts: { force?: boolean; dryRun?: boolean } = {}
+	): Promise<AdHocRunResult> {
+		const automation = this.settings.automations.find((a) => a.id === automationId);
+		if (!automation) return { ran: false, skippedReason: "automation not found" };
+		if (!automation.enabled) return { ran: false, skippedReason: "automation disabled" };
+
+		const file = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (!(file instanceof TFile)) {
+			return { ran: false, skippedReason: `file not found in vault: ${vaultPath}` };
+		}
+
+		const entry = this.manifest?.findByVaultPath(vaultPath);
+		const tracked = !!entry;
+
+		// Honor skip flags from companion frontmatter (when we have a known companion).
+		let companionPath: string | null = null;
+		let driveCreatedTime: string | undefined;
+		let driveFileId: string | undefined;
+		let driveModifiedTime: string | undefined;
+
+		if (entry) {
+			const [id, manifestEntry] = entry;
+			driveFileId = id;
+			companionPath = manifestEntry.companionPath;
+			driveCreatedTime = manifestEntry.driveCreatedTime;
+			driveModifiedTime = manifestEntry.driveModifiedTime;
+
+			if (companionPath) {
+				const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
+				if (companionFile instanceof TFile) {
+					const cache = this.app.metadataCache.getFileCache(companionFile);
+					const fm = cache?.frontmatter;
+					if (fm?.["drive-sync-skip-all"] === true) {
+						return { ran: false, skippedReason: "drive-sync-skip-all: true" };
+					}
+					if (Array.isArray(fm?.["drive-sync-skip-automations"]) &&
+						(fm["drive-sync-skip-automations"] as string[]).includes(automationId)) {
+						return { ran: false, skippedReason: "in drive-sync-skip-automations" };
+					}
+				}
+			}
+		} else {
+			// Synthetic context for untracked files: no Drive ID, mtime from vault filesystem.
+			driveModifiedTime = new Date(file.stat.mtime).toISOString();
+		}
+
+		// Matrix only applies to tracked files; untracked are always treated as force.
+		const force = opts.force === true || !tracked;
+		const shouldRun = this.shouldRunAutomation(automationId, driveFileId, driveModifiedTime, force);
+
+		if (!shouldRun) {
+			if (driveFileId && !opts.dryRun) {
+				this.manifest?.recordAutomationRun(driveFileId, automationId, {
+					lastRunAt: new Date().toISOString(),
+					lastRunDriveModifiedTime: driveModifiedTime ?? "",
+					result: "skipped",
+				});
+				await this.manifest?.save();
+			}
+			return { ran: false, skippedReason: "already ran for this Drive version" };
+		}
+
+		if (opts.dryRun) {
+			return { ran: true };
+		}
+
+		console.log(`${LOG} runForFileAdHoc: running "${automation.name}" for "${vaultPath}" (tracked=${tracked})`);
+		try {
+			await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, undefined);
+			if (driveFileId) {
+				this.manifest?.recordAutomationRun(driveFileId, automationId, {
+					lastRunAt: new Date().toISOString(),
+					lastRunDriveModifiedTime: driveModifiedTime ?? "",
+					result: "success",
+				});
+				await this.manifest?.save();
+			}
+			return { ran: true };
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : String(e);
+			console.error(`${LOG} runForFileAdHoc: "${automation.name}" failed for "${vaultPath}":`, e);
+			if (driveFileId) {
+				this.manifest?.recordAutomationRun(driveFileId, automationId, {
+					lastRunAt: new Date().toISOString(),
+					lastRunDriveModifiedTime: driveModifiedTime ?? "",
+					result: "error",
+					errorMessage: msg,
+				});
+				await this.manifest?.save();
+			}
+			return { ran: false, error: msg };
 		}
 	}
 

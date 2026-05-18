@@ -33,7 +33,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	transcriptionStore: TranscriptionStore;
 	private driveSync: DriveSync;
 	companionManager: CompanionNoteManager;
-	private automationEngine: AutomationEngine;
+	automationEngine: AutomationEngine;
 	private syncLogger: SyncLogger;
 	private syncActivityLog: SyncActivityLog;
 	private syncing = false;
@@ -252,6 +252,45 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: "run-automation-on-active-file",
+			name: "Run automation on active file…",
+			callback: () => {
+				const active = this.app.workspace.getActiveFile();
+				if (!active) {
+					new Notice("Open a file first.");
+					return;
+				}
+				this.openAdHocAutomationPicker(active);
+			},
+		});
+
+		this.addCommand({
+			id: "run-all-automations-on-active-file",
+			name: "Run all automations on active file",
+			callback: () => {
+				const active = this.app.workspace.getActiveFile();
+				if (!active) {
+					new Notice("Open a file first.");
+					return;
+				}
+				this.runAllAutomationsAdHoc(active);
+			},
+		});
+
+		this.addCommand({
+			id: "create-companion-for-active-file",
+			name: "Create companion note for active file",
+			callback: () => {
+				const active = this.app.workspace.getActiveFile();
+				if (!active) {
+					new Notice("Open a file first.");
+					return;
+				}
+				new CreateCompanionModal(this.app, active, this.companionManager).open();
+			},
+		});
+
+		this.addCommand({
 			id: "view-sync-log",
 			name: "View sync activity log",
 			callback: () => {
@@ -357,6 +396,17 @@ export default class DriveFolderSyncPlugin extends Plugin {
 						.setSection("drive-sync")
 						.onClick(() => new FileStatusModal(this.app, this, file).open())
 				);
+
+				// ── Run automation on this file (any file) ────────────────────────
+				if (this.settings.automations.some((a) => a.enabled)) {
+					menu.addItem((item) =>
+						item
+							.setTitle("Run automation on this file…")
+							.setIcon("zap")
+							.setSection("drive-sync")
+							.onClick(() => this.openAdHocAutomationPicker(file))
+					);
+				}
 
 				// ── Tracked-file-only items ───────────────────────────────────────
 				if (manifestEntry) {
@@ -484,6 +534,66 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		automationId: string
 	): Promise<{ matched: number; ran: number; skipped: number; errors: number; preview?: Array<{ vaultPath: string; willRun: boolean; skipReason?: string }> }> {
 		return this.automationEngine.runForAllMatchingFiles(automationId, { dryRun: true });
+	}
+
+	openAdHocAutomationPicker(file: TFile): void {
+		const active = this.settings.automations.filter((a) => a.enabled);
+		if (active.length === 0) {
+			new Notice("No active automations configured.");
+			return;
+		}
+		new AutomationPickerModal(this.app, active, (automation, force) => {
+			(async () => {
+				const notice = new Notice(`Running "${automation.name}" on "${file.basename}"…`, 0);
+				try {
+					const r = await this.automationEngine.runForFileAdHoc(file.path, automation.id, { force });
+					notice.hide();
+					if (r.ran) {
+						new Notice(`"${automation.name}" ran on "${file.basename}".`);
+					} else if (r.error) {
+						new Notice(`"${automation.name}" failed: ${r.error}`);
+					} else {
+						new Notice(`"${automation.name}" skipped: ${r.skippedReason ?? "no reason"}.`);
+					}
+				} catch (e) {
+					notice.hide();
+					new Notice(`Automation failed: ${(e as Error).message}`);
+				}
+			})();
+		}).open();
+	}
+
+	runAllAutomationsAdHoc(file: TFile): void {
+		const active = this.settings.automations.filter((a) => a.enabled);
+		if (active.length === 0) {
+			new Notice("No active automations configured.");
+			return;
+		}
+		new RunAllAutomationsConfirmModal(this.app, file, active, (force) => {
+			(async () => {
+				const notice = new Notice(
+					`Running ${active.length} automation${active.length !== 1 ? "s" : ""} on "${file.basename}"…`,
+					0
+				);
+				let ran = 0, skipped = 0, errors = 0;
+				try {
+					for (const automation of active) {
+						const r = await this.automationEngine.runForFileAdHoc(file.path, automation.id, { force });
+						if (r.ran) ran++;
+						else if (r.error) errors++;
+						else skipped++;
+					}
+					notice.hide();
+					new Notice(
+						`Done on "${file.basename}" — ${ran} ran, ${skipped} skipped` +
+						(errors > 0 ? `, ${errors} errors` : "")
+					);
+				} catch (e) {
+					notice.hide();
+					new Notice(`Run-all failed: ${(e as Error).message}`);
+				}
+			})();
+		}).open();
 	}
 
 	private pushResultToStatusView(result: SyncResult): void {
@@ -633,6 +743,51 @@ class AutomationForceModal extends Modal {
 		new Setting(contentEl)
 			.addButton((b) =>
 				b.setButtonText("Run").setCta().onClick(() => {
+					this.close();
+					this.onConfirm(this.force);
+				})
+			)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+class RunAllAutomationsConfirmModal extends Modal {
+	private force = false;
+
+	constructor(
+		app: App,
+		private file: TFile,
+		private automations: Automation[],
+		private onConfirm: (force: boolean) => void
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl, file, automations } = this;
+		contentEl.createEl("h3", { text: `Run all automations on "${file.basename}"` });
+		contentEl.createEl("p", {
+			text: `The following ${automations.length} automation${automations.length !== 1 ? "s" : ""} will run on this file (folder triggers bypassed):`,
+			cls: "setting-item-description",
+		});
+
+		const list = contentEl.createEl("ul");
+		for (const a of automations) {
+			list.createEl("li", { text: `${a.name} — ${a.action.type}` });
+		}
+
+		new Setting(contentEl)
+			.setName("Force re-run")
+			.setDesc("Re-run even for tracked files already completed at the current Drive version.")
+			.addToggle((t) => t.setValue(false).onChange((v) => { this.force = v; }));
+
+		new Setting(contentEl)
+			.addButton((b) =>
+				b.setButtonText("Run all").setCta().onClick(() => {
 					this.close();
 					this.onConfirm(this.force);
 				})
