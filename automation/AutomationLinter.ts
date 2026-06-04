@@ -11,7 +11,11 @@ export interface LintIssue {
  * Phase 13.10 — validate automation configuration. Pure-read; no side effects.
  * Runs on settings save and inside the audit command.
  */
-export function lintAutomations(app: App, automations: Automation[]): LintIssue[] {
+export function lintAutomations(
+	app: App,
+	automations: Automation[],
+	opts: { mistralConfigured?: boolean } = {}
+): LintIssue[] {
 	const issues: LintIssue[] = [];
 	const folderExists = (p: string) => p === "" || app.vault.getAbstractFileByPath(p) instanceof TFolder;
 	const noteExists = (p: string) => app.vault.getAbstractFileByPath(p) instanceof TFile;
@@ -39,6 +43,12 @@ export function lintAutomations(app: App, automations: Automation[]): LintIssue[
 		if (action.matchConfidenceThreshold !== undefined) {
 			const t = action.matchConfidenceThreshold;
 			if (t < 0 || t > 1) push("error", `matchConfidenceThreshold must be in [0, 1] (got ${t}).`);
+		}
+		if (action.dailyNoteTemplatePath && !noteExists(action.dailyNoteTemplatePath)) {
+			push("error", `Daily note template does not exist: "${action.dailyNoteTemplatePath}"`);
+		}
+		if (a.enabled && action.type === "split_pages_to_daily_notes" && opts.mistralConfigured === false) {
+			push("warn", "split_pages_to_daily_notes needs a Mistral API key (Settings → Transcription) — it will no-op until one is set.");
 		}
 	}
 

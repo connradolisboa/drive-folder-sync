@@ -1795,7 +1795,8 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					"append_to_note appends to any named note. " +
 					"add_tag_to_companion adds a tag to the companion note's frontmatter. " +
 					"link_to_matching_note finds notes in a folder whose name contains all words of the PDF title and inserts an embed. " +
-					"transcribe_to_periodic_note appends the Gemini transcription to a periodic note (requires Gemini enabled)."
+					"transcribe_to_periodic_note appends the Gemini transcription to a periodic note (requires Gemini enabled). " +
+					"split_pages_to_daily_notes OCRs each page of a multi-page PDF, reads the handwritten date on it, and embeds that exact page into the matching daily note (requires Mistral OCR)."
 				)
 				.addDropdown((drop) =>
 					drop
@@ -1809,6 +1810,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.addOption("link_to_matching_note",      "Link to matching note")
 						.addOption("transcribe_to_periodic_note","Transcribe to periodic note")
 						.addOption("transcribe_to_companion",    "Transcribe to companion note")
+						.addOption("split_pages_to_daily_notes", "Split PDF pages to daily notes (handwritten date)")
 						.setValue(automation.action.type)
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].action.type =
@@ -2018,6 +2020,58 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					text.inputEl.style.resize = "vertical";
 				});
 
+			// ── split_pages_to_daily_notes options ──────────────────────────
+			const createDailyNoteSetting = new Setting(bodyEl)
+				.setName("Create daily note if missing")
+				.setDesc(
+					"When a page's handwritten date has no existing daily note, create one " +
+					"(using the daily note path above, or the core Daily Notes settings). " +
+					"Turn off to only embed into daily notes that already exist."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.createDailyNoteIfMissing ?? true)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.createDailyNoteIfMissing = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const dailyNoteTemplateSetting = new Setting(bodyEl)
+				.setName("Daily note template")
+				.setDesc("Vault path to a template note copied into a newly created daily note. Leave empty to create a blank note.")
+				.addText((text) =>
+					text
+						.setPlaceholder("Templates/Daily Note.md")
+						.setValue(automation.action.dailyNoteTemplatePath ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.dailyNoteTemplatePath = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const pageEmbedTemplateSetting = new Setting(bodyEl)
+				.setName("Page embed template")
+				.setDesc(
+					"Template for the line inserted into each daily note. Supports multiple lines. " +
+					"Leave empty for the default ({{embed}}). Placeholders: " +
+					"{{embed}} → ![[file.pdf#page=N]], {{pagelink}} → [[file.pdf#page=N]], " +
+					"{{link}} → [[file.pdf]], {{page}} → N, {{title}} → PDF stem, {{date}} → YYYY-MM-DD."
+				)
+				.addTextArea((text) => {
+					text
+						.setPlaceholder("> [!journal] {{date}}\n> {{embed}}")
+						.setValue(automation.action.pageEmbedTemplate ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.pageEmbedTemplate = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						});
+					text.inputEl.rows = 4;
+					text.inputEl.style.width = "100%";
+					text.inputEl.style.fontFamily = "monospace";
+					text.inputEl.style.resize = "vertical";
+				});
+
 			const insertPositionSetting = new Setting(bodyEl)
 				.setName("Insert position")
 				.setDesc("Where in the note to insert the embed.")
@@ -2086,8 +2140,9 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				const isTranscribePeriodicAction = type === "transcribe_to_periodic_note";
 				const isTranscribeCompanionAction = type === "transcribe_to_companion";
 				const isAnyTranscribeAction = isTranscribePeriodicAction || isTranscribeCompanionAction;
+				const isSplitPages = type === "split_pages_to_daily_notes";
 				const createEnabled = this.plugin.settings.automations[i].action.createNoteIfNotFound ?? false;
-				dailyPatternSetting.settingEl.toggle(type === "embed_to_daily_note");
+				dailyPatternSetting.settingEl.toggle(type === "embed_to_daily_note" || isSplitPages);
 				targetNoteSetting.settingEl.toggle(type === "append_to_note");
 				tagNameSetting.settingEl.toggle(type === "add_tag_to_companion");
 				searchFolderSetting.settingEl.toggle(isLinkToNote);
@@ -2099,7 +2154,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				bidirectionalLinkSetting.settingEl.toggle(isLinkToNote);
 				periodicNoteTypeSetting.settingEl.toggle(isTranscribePeriodicAction);
 				transcriptionTemplateSetting.settingEl.toggle(isAnyTranscribeAction);
-				insertPositionSetting.settingEl.toggle(isEmbedType(type));
+				createDailyNoteSetting.settingEl.toggle(isSplitPages);
+				dailyNoteTemplateSetting.settingEl.toggle(isSplitPages);
+				pageEmbedTemplateSetting.settingEl.toggle(isSplitPages);
+				insertPositionSetting.settingEl.toggle(isEmbedType(type) || isSplitPages);
 				embedCompanionSetting.settingEl.toggle(isEmbedType(type) && !isLinkToNote && !isAnyTranscribeAction);
 				embedTemplateSetting.settingEl.toggle(isEmbedType(type) && !isAnyTranscribeAction);
 			};

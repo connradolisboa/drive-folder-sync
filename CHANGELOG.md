@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Split journal pages to daily notes** — a new `split_pages_to_daily_notes` automation
+  action. Per-page OCR (Mistral) reads the handwritten date at the top of each page of a
+  multi-page PDF and embeds that exact page (`![[file.pdf#page=N]]`) into the matching daily
+  note, creating the note when missing. The inserted line is customizable (e.g. a callout).
+
 ## 1.1.0
 
 Architecture, observability and safety-net upgrades (Phases 11–13).

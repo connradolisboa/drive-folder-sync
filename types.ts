@@ -248,7 +248,8 @@ export type AutomationActionType =
 	| "add_tag_to_companion"
 	| "link_to_matching_note"
 	| "transcribe_to_periodic_note"
-	| "transcribe_to_companion";
+	| "transcribe_to_companion"
+	| "split_pages_to_daily_notes";
 
 export interface AutomationAction {
 	type: AutomationActionType;
@@ -290,6 +291,20 @@ export interface AutomationAction {
 	periodicNoteType?: "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
 	/** For transcribe_to_periodic_note: template for the content inserted. Supports {{transcription}}, {{title}}, {{date}}, {{link}}, {{embed}}. */
 	transcriptionTemplate?: string;
+	/**
+	 * For split_pages_to_daily_notes: when true (the default), create the daily note if one
+	 * does not already exist for a page's date. When false, pages with no existing daily note are skipped.
+	 */
+	createDailyNoteIfMissing?: boolean;
+	/** For split_pages_to_daily_notes: vault path to a template note copied into a newly created daily note. */
+	dailyNoteTemplatePath?: string;
+	/**
+	 * For split_pages_to_daily_notes: template for the line inserted into each daily note.
+	 * Placeholders: {{embed}} → ![[file.pdf#page=N]], {{pagelink}} → [[file.pdf#page=N]],
+	 *               {{link}} → [[file.pdf]], {{page}} → N, {{title}} → PDF stem, {{date}} → YYYY-MM-DD.
+	 * Leave empty to use the default: {{embed}}.
+	 */
+	pageEmbedTemplate?: string;
 }
 
 export interface Automation {

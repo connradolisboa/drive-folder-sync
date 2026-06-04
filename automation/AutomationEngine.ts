@@ -2,6 +2,7 @@ import { App, getAllTags, TFile } from "obsidian";
 import { Automation, AutomationAction, AutomationRunRecord, PeriodicNotesPaths, PluginSettings } from "../types";
 import type { SyncManifestStore } from "../sync/SyncManifest";
 import type { EventBus } from "../events/EventBus";
+import { MistralClient } from "../ai/MistralClient";
 
 const LOG = "[DriveSync/Automation]";
 
@@ -421,7 +422,170 @@ export class AutomationEngine {
 			await this.runTranscribeToPeriodicNote(vaultPath, companionPath, action, driveCreatedTime, transcription);
 		} else if (action.type === "transcribe_to_companion") {
 			await this.runTranscribeToCompanion(companionPath, action, transcription);
+		} else if (action.type === "split_pages_to_daily_notes") {
+			await this.splitPagesToDailyNotes(vaultPath, action);
 		}
+	}
+
+	/**
+	 * Per-page OCR a multi-page PDF (e.g. a monthly journal), read the handwritten date
+	 * at the top of each page, and embed that exact PDF page into the matching daily note.
+	 * Uses Mistral OCR, which returns real per-page text so page→date mapping is exact.
+	 */
+	private async splitPagesToDailyNotes(
+		vaultPath: string,
+		action: AutomationAction
+	): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (!(file instanceof TFile)) {
+			console.log(`${LOG} split_pages_to_daily_notes: file not found: ${vaultPath}`);
+			return;
+		}
+		if (file.extension.toLowerCase() !== "pdf") {
+			console.log(`${LOG} split_pages_to_daily_notes: not a PDF — skipping: ${vaultPath}`);
+			return;
+		}
+		if (!this.settings.mistralApiKey) {
+			console.warn(`${LOG} split_pages_to_daily_notes: requires a Mistral API key (Settings → Transcription). Skipping.`);
+			return;
+		}
+
+		let pages: { page: number; text: string }[];
+		try {
+			const bytes = await this.app.vault.readBinary(file);
+			const client = new MistralClient(this.settings.mistralApiKey);
+			pages = await client.transcribePdfByPage(bytes);
+		} catch (e) {
+			console.error(`${LOG} split_pages_to_daily_notes: OCR failed for "${vaultPath}":`, e);
+			return;
+		}
+
+		const fileName = file.name;
+		const pdfStem = file.basename;
+		const pattern = action.dailyNoteNamePattern || this.settings.periodicNotesPaths.daily;
+		const createMissing = action.createDailyNoteIfMissing !== false;
+
+		let embedded = 0;
+		for (const { page, text } of pages) {
+			const dateStr = this.extractDate(text);
+			if (!dateStr) {
+				console.log(`${LOG} split_pages_to_daily_notes: no date found on page ${page} of "${fileName}" — skipping`);
+				continue;
+			}
+
+			let note = pattern
+				? this.findNoteByPattern(dateStr, pattern)
+				: this.findDailyNoteByFrontmatter(dateStr);
+
+			if (!note && createMissing) {
+				note = await this.createDailyNoteForDate(dateStr, pattern, action.dailyNoteTemplatePath);
+			}
+
+			if (!note) {
+				console.log(`${LOG} split_pages_to_daily_notes: no daily note for ${dateStr} (page ${page}) — skipping`);
+				continue;
+			}
+
+			const line = this.buildPageEmbedLine(action.pageEmbedTemplate, fileName, pdfStem, page, dateStr);
+			await this.insertEmbed(note, line, action.insertPosition);
+			embedded++;
+		}
+
+		console.log(`${LOG} split_pages_to_daily_notes: embedded ${embedded}/${pages.length} pages of "${fileName}"`);
+	}
+
+	/**
+	 * Build the line inserted into a daily note for one PDF page.
+	 * Placeholders: {{embed}} → ![[file#page=N]], {{pagelink}} → [[file#page=N]],
+	 *               {{link}} → [[file]], {{page}} → N, {{title}} → stem, {{date}} → YYYY-MM-DD.
+	 * Default (no template): {{embed}}.
+	 */
+	private buildPageEmbedLine(
+		template: string | undefined,
+		fileName: string,
+		pdfStem: string,
+		page: number,
+		dateStr: string
+	): string {
+		const embed = `![[${fileName}#page=${page}]]`;
+		const tpl = template && template.trim() ? template : "{{embed}}";
+		return tpl
+			.replace(/\{\{embed\}\}/g, embed)
+			.replace(/\{\{pagelink\}\}/g, `[[${fileName}#page=${page}]]`)
+			.replace(/\{\{link\}\}/g, `[[${fileName}]]`)
+			.replace(/\{\{page\}\}/g, String(page))
+			.replace(/\{\{title\}\}/g, pdfStem)
+			.replace(/\{\{date\}\}/g, dateStr);
+	}
+
+	/**
+	 * Create (and return) the daily note for a given date.
+	 * Path resolution: the action/global daily pattern first, else the core Daily Notes
+	 * plugin's folder + format. Seeds content from a template note when provided.
+	 */
+	private async createDailyNoteForDate(
+		dateStr: string,
+		pattern: string | undefined,
+		templatePath?: string
+	): Promise<TFile | null> {
+		let notePath: string | null = null;
+		if (pattern) {
+			notePath = this.resolveDatePattern(pattern, dateStr);
+		} else {
+			notePath = this.resolveCoreDailyNotePath(dateStr);
+		}
+		if (!notePath) {
+			console.log(`${LOG} createDailyNoteForDate: could not resolve a path for ${dateStr} — set a daily note path in Settings → Notes.`);
+			return null;
+		}
+		if (!notePath.endsWith(".md")) notePath += ".md";
+
+		const existing = this.app.vault.getAbstractFileByPath(notePath);
+		if (existing instanceof TFile) return existing;
+
+		let content = "";
+		if (templatePath) {
+			const templateFile = this.app.vault.getAbstractFileByPath(templatePath);
+			if (templateFile instanceof TFile) {
+				content = await this.app.vault.read(templateFile);
+			} else {
+				console.warn(`${LOG} createDailyNoteForDate: template not found: ${templatePath}`);
+			}
+		}
+
+		// Ensure parent folders exist.
+		const dir = notePath.substring(0, notePath.lastIndexOf("/"));
+		if (dir) {
+			const parts = dir.split("/").filter(Boolean);
+			let partial = "";
+			for (const seg of parts) {
+				partial = partial ? `${partial}/${seg}` : seg;
+				if (!(await this.app.vault.adapter.exists(partial))) {
+					await this.app.vault.createFolder(partial);
+				}
+			}
+		}
+
+		const note = await this.app.vault.create(notePath, content);
+		console.log(`${LOG} createDailyNoteForDate: created daily note "${notePath}" for ${dateStr}`);
+		return note;
+	}
+
+	/** Resolve a daily note path from the core Daily Notes plugin's folder + format settings. */
+	private resolveCoreDailyNotePath(dateStr: string): string | null {
+		try {
+			const dp = (this.app as any).internalPlugins?.getPluginById?.("daily-notes");
+			if (dp?.enabled) {
+				const opts = dp.instance?.options ?? {};
+				const format: string = opts.format || "YYYY-MM-DD";
+				const folder: string = (opts.folder ?? "").trim();
+				const name = moment(dateStr, "YYYY-MM-DD").format(format);
+				return folder ? `${folder}/${name}` : name;
+			}
+		} catch {
+			// fall through
+		}
+		return null;
 	}
 
 	private async embedToDailyNote(

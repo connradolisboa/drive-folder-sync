@@ -920,7 +920,9 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		if (this.errorReporter) this.errorReporter.updateSettings(this.settings);
 
 		// Phase 13.10 — surface automation-config problems on save.
-		const lint = lintAutomations(this.app, this.settings.automations);
+		const lint = lintAutomations(this.app, this.settings.automations, {
+			mistralConfigured: !!this.settings.mistralApiKey,
+		});
 		const errors = lint.filter((l) => l.severity === "error");
 		if (errors.length > 0) {
 			console.warn(`${LOG} Automation lint: ${errors.length} error(s)`, errors);
