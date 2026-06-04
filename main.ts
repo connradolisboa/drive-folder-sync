@@ -4,7 +4,7 @@ import { GoogleAuth } from "./auth/GoogleAuth";
 import { DriveSync } from "./sync/DriveSync";
 import { DownloadManager } from "./sync/DownloadManager";
 import { Scheduler } from "./sync/Scheduler";
-import { SyncManifestStore } from "./sync/SyncManifest";
+import { SyncManifestStore, createManifestStore } from "./sync/SyncManifest";
 import { CompanionNoteManager } from "./sync/CompanionNoteManager";
 import { SyncLogger } from "./sync/SyncLogger";
 import { SyncActivityLog } from "./sync/SyncLog";
@@ -18,6 +18,15 @@ import { AutomationDryRunModal } from "./ui/AutomationDryRunModal";
 import { ConflictModal } from "./ui/ConflictModal";
 import { FileStatusModal } from "./ui/FileStatusModal";
 import { TranscriptionStore } from "./ai/TranscriptionStore";
+import { EventBus, BusRecord } from "./events/EventBus";
+import { CacheManager } from "./sync/CacheManager";
+import { HeavyWorkerClient } from "./workers/heavyWorker";
+import { Recycle } from "./sync/Recycle";
+import { verifyIntegrity, VerifyIntegrityModal } from "./commands/VerifyIntegrity";
+import { ErrorReporter } from "./telemetry/ErrorReporter";
+import { ChangelogModal, parseChangelog, isNewer } from "./ui/ChangelogModal";
+import { checkDiskSpace } from "./sync/DiskSpaceCheck";
+import { lintAutomations } from "./automation/AutomationLinter";
 import { transcribeCurrentFile, openTranscribePickerForFile } from "./commands/TranscribeCurrentFile";
 import { runAudit, AuditModal } from "./commands/Audit";
 import { Automation, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
@@ -31,6 +40,15 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	lastSyncResult: SyncResult | null = null;
 	manifestStore: SyncManifestStore;
 	transcriptionStore: TranscriptionStore;
+	bus: EventBus;
+	cacheManager?: CacheManager;
+	heavyWorker?: HeavyWorkerClient;
+	recycle: Recycle;
+	errorReporter: ErrorReporter;
+	/** Ring buffer of the last 50 bus events, for the live activity ticker (Phase 12.1). */
+	recentEvents: BusRecord[] = [];
+	/** Per-pair sync history for the health badge (Phase 12.2). Resets each session. */
+	private pairHistory = new Map<string, Array<{ at: number; errors: number }>>();
 	private driveSync: DriveSync;
 	companionManager: CompanionNoteManager;
 	automationEngine: AutomationEngine;
@@ -51,7 +69,8 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			hasClientSecret: !!this.settings.clientSecret,
 		});
 
-		this.manifestStore = new SyncManifestStore(this.app);
+		this.bus = new EventBus();
+		this.manifestStore = createManifestStore(this.app, this.settings, this.bus);
 		// Load manifest at startup so vault rename events are healable immediately
 		await this.manifestStore.load().catch((e) =>
 			console.error(`${LOG} Failed to pre-load manifest:`, e)
@@ -61,12 +80,19 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			console.error(`${LOG} Failed to pre-load transcription store:`, e)
 		);
 		this.companionManager = new CompanionNoteManager(this.app, this.settings);
-		this.automationEngine = new AutomationEngine(this.app, this.settings, this.manifestStore);
+		this.automationEngine = new AutomationEngine(this.app, this.settings, this.manifestStore, this.bus);
 		this.syncLogger = new SyncLogger(this.app, this.settings);
 		this.syncActivityLog = new SyncActivityLog(this.app, this.settings);
 
-		const downloader = new DownloadManager(this.app);
-		this.auth = new GoogleAuth(this.app, this.settings);
+		this.cacheManager = this.settings.downloadCacheEnabled
+			? new CacheManager(this.app, this.settings.downloadCacheMaxMb * 1024 * 1024)
+			: undefined;
+		const downloader = new DownloadManager(this.app, this.cacheManager);
+		this.heavyWorker = this.settings.offThreadHashing ? new HeavyWorkerClient() : undefined;
+		this.recycle = new Recycle(this.app, this.bus);
+		this.errorReporter = new ErrorReporter(this.settings, this.manifest.version);
+		this.errorReporter.install();
+		this.auth = new GoogleAuth(this.app, this.settings, this.bus);
 		this.driveSync = new DriveSync(
 			this.auth,
 			downloader,
@@ -75,8 +101,13 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			this.manifestStore,
 			this.companionManager,
 			this.automationEngine,
-			this.transcriptionStore
+			this.transcriptionStore,
+			this.bus,
+			this.heavyWorker,
+			this.recycle
 		);
+
+		this.wireEventBus();
 		this.scheduler = new Scheduler();
 
 		this.registerView(SYNC_STATUS_VIEW_TYPE, (leaf) => new SyncStatusView(leaf, this));
@@ -318,6 +349,46 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			},
 		});
 
+		this.addCommand({
+			id: "verify-integrity",
+			name: "Verify manifest integrity",
+			callback: () => this.runVerifyIntegrity(),
+		});
+
+		this.addCommand({
+			id: "restore-manifest",
+			name: "Restore manifest from backup…",
+			callback: () => this.openRestoreManifest(),
+		});
+
+		this.addCommand({
+			id: "open-recycle",
+			name: "Open recycle bin",
+			callback: () => this.openRecycleFolder(),
+		});
+
+		this.addCommand({
+			id: "undo-last-sync",
+			name: "Undo last sync",
+			callback: () => this.undoLastSync(),
+		});
+
+		this.addCommand({
+			id: "test-sync-pair",
+			name: "Test sync against a sandbox subfolder…",
+			callback: () => {
+				if (this.settings.syncPairs.length === 0) { new Notice("No sync pairs configured."); return; }
+				new SyncPairPickerModal(this.app, this.settings.syncPairs, (pair) => {
+					new TextPromptModal(this.app, "Sandbox subfolder", "Subfolder path within the pair (e.g. \"2026/Inbox\")", "", (sub) => {
+						this.testSyncPair(pair.id, sub);
+					}).open();
+				}).open();
+			},
+		});
+
+		// Phase 12.3 — show the changelog once after an update.
+		this.maybeShowChangelog();
+
 		// Heal manifest when user manually moves/renames a synced file in the vault
 		this.registerEvent(
 			this.app.vault.on("rename", async (file, oldPath) => {
@@ -452,7 +523,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			console.log(
 				`${LOG} Starting scheduler — interval: ${this.settings.syncIntervalMinutes} min`
 			);
-			this.scheduler.start(this.settings.syncIntervalMinutes, () =>
+			this.scheduler.start(this.effectiveInterval(), () =>
 				this.runSync()
 			);
 			if (this.settings.syncOnStartup) {
@@ -471,6 +542,9 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	onunload() {
 		console.log(`${LOG} Unloading plugin — stopping scheduler`);
 		this.scheduler.stop();
+		this.bus?.clear();
+		this.heavyWorker?.terminate();
+		this.errorReporter?.uninstall();
 	}
 
 	async runSync(dryRun = false): Promise<SyncResult> {
@@ -483,12 +557,14 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		try {
 			const result = await this.driveSync.sync(dryRun);
 			console.log(`${LOG} Sync finished:`, result);
+			if (this.driveSync.consumeSettingsDirty()) await this.saveSettings();
 			if (dryRun) {
 				new DryRunModal(this.app, result).open();
 			} else {
 				this.lastSyncResult = result;
 				this.pushResultToStatusView(result);
 				await this.syncLogger.append(result);
+				await this.gcCache();
 			}
 			return result;
 		} catch (e) {
@@ -509,6 +585,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		try {
 			const result = await this.driveSync.syncSinglePair(pairId);
 			console.log(`${LOG} Single-pair sync finished:`, result);
+			if (this.driveSync.consumeSettingsDirty()) await this.saveSettings();
 			await this.syncLogger.append(result);
 			return result;
 		} catch (e) {
@@ -596,12 +673,217 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		}).open();
 	}
 
-	private pushResultToStatusView(result: SyncResult): void {
-		for (const leaf of this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE)) {
-			if (leaf.view instanceof SyncStatusView) {
-				leaf.view.updateResult(result);
+	/**
+	 * Phase 11.5 — subscribe the status view, activity log and notice handlers to the
+	 * event bus instead of being called directly. Adding a new subscriber (e.g. a badge)
+	 * requires zero changes in the producers.
+	 */
+	private wireEventBus(): void {
+		// Live activity ticker buffer (Phase 12.1) — keep the last 50 events.
+		this.bus.onAny((rec) => {
+			this.recentEvents.push(rec);
+			if (this.recentEvents.length > 50) {
+				this.recentEvents.splice(0, this.recentEvents.length - 50);
 			}
+			this.refreshStatusViews((v) => v.onBusEvent(rec));
+		});
+
+		// Status view subscribes to whole-run results rather than a direct call.
+		this.bus.on("sync-complete", ({ result }) => {
+			this.recordPairHistory(result);
+			this.refreshStatusViews((v) => v.updateResult(result));
+		});
+
+		// Mirror selected events into the activity log.
+		this.bus.on("conflict", (p) => {
+			void this.syncActivityLog.log({
+				level: "warn", syncId: "bus", file: p.vaultPath,
+				action: "conflict", result: p.resolution ?? "save-both",
+				details: p.backupPath,
+			});
+		});
+		this.bus.on("auth-failed", (p) => {
+			void this.syncActivityLog.log({
+				level: "error", syncId: "bus", action: "auth-failed", result: "expired", details: p.reason,
+			});
+		});
+
+		// Surface auth failures as a persistent, non-auto-dismissing notice + pause the
+		// scheduler until re-auth (Phase 13.8).
+		this.bus.on("auth-failed", (p) => {
+			new Notice(`Drive Sync: authentication expired — ${p.reason}. Re-authenticate in settings.`, 0);
+			this.scheduler.stop();
+		});
+		this.bus.on("auth-restored", () => {
+			new Notice("Drive Sync: authentication restored — resuming scheduled syncs.");
+			this.scheduler.start(this.effectiveInterval(), () => this.runSync());
+		});
+	}
+
+	/** Phase 13.3 — clamp the user's interval to a 60s floor. */
+	effectiveInterval(): number {
+		const min = 1 / 60; // 60 seconds expressed in minutes
+		if (this.settings.syncIntervalMinutes < min) {
+			console.warn(`${LOG} syncIntervalMinutes below 60s floor — clamping.`);
+			return min;
 		}
+		return this.settings.syncIntervalMinutes;
+	}
+
+	private refreshStatusViews(fn: (view: SyncStatusView) => void): void {
+		for (const leaf of this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE)) {
+			if (leaf.view instanceof SyncStatusView) fn(leaf.view);
+		}
+	}
+
+	private pushResultToStatusView(result: SyncResult): void {
+		this.bus.emit("sync-complete", { result });
+	}
+
+	// ── Phase 13 action methods (used by the Advanced settings tab + commands) ──
+
+	async runVerifyIntegrity(): Promise<void> {
+		const notice = new Notice("Verifying manifest integrity…", 0);
+		try {
+			const report = await verifyIntegrity(this.app, this.manifestStore);
+			notice.hide();
+			new VerifyIntegrityModal(this.app, report, this.manifestStore, () => undefined).open();
+		} catch (e) {
+			notice.hide();
+			new Notice(`Verify failed: ${(e as Error).message}`);
+		}
+	}
+
+	async openRestoreManifest(): Promise<void> {
+		const backups = await this.manifestStore.listBackups();
+		if (backups.length === 0) { new Notice("No manifest backups found yet."); return; }
+		new RestoreManifestModal(this.app, backups, (name) => {
+			new ConfirmModal(
+				this.app,
+				"Restore manifest?",
+				`This replaces the current manifest with backup "${name}". A fresh backup of the current state is taken first. Continue?`,
+				async () => {
+					try {
+						await this.manifestStore.restoreBackup(name);
+						new Notice(`Manifest restored from ${name}.`);
+					} catch (e) {
+						new Notice(`Restore failed: ${(e as Error).message}`);
+					}
+				}
+			).open();
+		}).open();
+	}
+
+	async openRecycleFolder(): Promise<void> {
+		const path = this.recycle.folderPath;
+		if (!(await this.app.vault.adapter.exists(path))) await this.app.vault.adapter.mkdir(path);
+		try { await navigator.clipboard.writeText(path); } catch { /* ignore */ }
+		new Notice(`Recycle bin: ${path}\n(path copied to clipboard)`);
+	}
+
+	async undoLastSync(): Promise<void> {
+		const runs = await this.recycle.listRunIds();
+		if (runs.length === 0) { new Notice("Nothing to undo — recycle bin is empty."); return; }
+		const latest = runs[0];
+		new ConfirmModal(
+			this.app,
+			"Undo last sync?",
+			`Restore ${latest.count} file(s) recycled in the most recent run (${new Date(latest.at).toLocaleString()})?`,
+			async () => {
+				const n = await this.recycle.restoreRun(latest.syncRunId);
+				new Notice(`Restored ${n} file(s) from the recycle bin.`);
+			}
+		).open();
+	}
+
+	async testSyncPair(pairId: string, subfolder: string): Promise<void> {
+		if (this.syncing) { new Notice("Sync already in progress…"); return; }
+		this.syncing = true;
+		const notice = new Notice(`Test sync of "${subfolder || "(root)"}"…`, 0);
+		try {
+			const result = await this.driveSync.testSync(pairId, subfolder);
+			notice.hide();
+			new ConfirmModal(
+				this.app,
+				"Test sync complete",
+				this.formatResult(result),
+				() => undefined
+			).open();
+		} catch (e) {
+			notice.hide();
+			new Notice(`Test sync failed: ${(e as Error).message}`);
+		} finally {
+			this.syncing = false;
+		}
+	}
+
+	previewErrorReport(): void {
+		const sample = this.errorReporter.build(new Error("Sample error for preview at drive-folder-sync"));
+		new ErrorReportPreviewModal(this.app, JSON.stringify(sample, null, 2), async () => {
+			await this.errorReporter.report(new Error("Test report from drive-folder-sync"));
+			new Notice(this.settings.errorReportingEndpoint ? "Test report sent." : "No endpoint set — nothing sent.");
+		}).open();
+	}
+
+	private async maybeShowChangelog(): Promise<void> {
+		const current = this.manifest.version;
+		if (!isNewer(current, this.settings.lastSeenVersion)) return;
+		try {
+			const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/CHANGELOG.md`;
+			if (!(await this.app.vault.adapter.exists(path))) return;
+			const md = await this.app.vault.adapter.read(path);
+			const entries = parseChangelog(md).filter((e) => isNewer(e.version, this.settings.lastSeenVersion));
+			if (entries.length === 0) return;
+			new ChangelogModal(this.app, this, current, entries).open();
+		} catch (e) {
+			console.error(`${LOG} Failed to show changelog:`, e);
+		}
+	}
+
+	private async gcCache(): Promise<void> {
+		if (!this.cacheManager) return;
+		const referenced = new Set<string>();
+		for (const [, entry] of this.manifestStore.entries()) {
+			if (entry.driveMd5) referenced.add(entry.driveMd5);
+		}
+		await this.cacheManager.gc(referenced);
+	}
+
+	private recordPairHistory(result: SyncResult): void {
+		const now = Date.now();
+		const pairs = result.pairs ?? {};
+		// When a whole-vault sync ran, attribute the aggregate to every pair touched.
+		for (const [pairId, pr] of Object.entries(pairs)) {
+			const hist = this.pairHistory.get(pairId) ?? [];
+			hist.push({ at: now, errors: pr.errors });
+			// Keep last 10 runs + anything within the last hour.
+			const cutoff = now - 60 * 60 * 1000;
+			const trimmed = hist.filter((h, i) => i >= hist.length - 10 || h.at >= cutoff);
+			this.pairHistory.set(pairId, trimmed);
+		}
+	}
+
+	/** Phase 12.2 — compute a green/yellow/red health badge for a pair. */
+	getPairHealth(pairId: string): { level: "green" | "yellow" | "red" | "unknown"; color: string; tooltip: string } {
+		const hist = this.pairHistory.get(pairId) ?? [];
+		if (hist.length === 0) {
+			return { level: "unknown", color: "var(--text-faint)", tooltip: "No sync recorded this session." };
+		}
+		const now = Date.now();
+		const intervalMs = Math.max(1, this.settings.syncIntervalMinutes) * 60 * 1000;
+		const last = hist[hist.length - 1];
+		const errorsInHour = hist.filter((h) => h.at >= now - 60 * 60 * 1000 && h.errors > 0).length;
+		const last3 = hist.slice(-3);
+		const last3AllFailed = last3.length === 3 && last3.every((h) => h.errors > 0);
+		const stale = now - last.at > 2 * intervalMs;
+
+		const tip = (lvl: string) =>
+			`${lvl} — last sync ${Math.round((now - last.at) / 1000)}s ago, ` +
+			`${errorsInHour} run(s) with errors in last hour, ${hist.length} run(s) tracked.`;
+
+		if (last3AllFailed) return { level: "red", color: "#e5534b", tooltip: tip("Red: last 3 syncs failed") };
+		if (errorsInHour > 0 || stale) return { level: "yellow", color: "#d29922", tooltip: tip("Yellow") };
+		return { level: "green", color: "#3fb950", tooltip: tip("Green") };
 	}
 
 	private async activateStatusView(): Promise<void> {
@@ -635,6 +917,14 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		if (this.driveSync) this.driveSync.updateSettings(this.settings);
 		if (this.syncLogger) this.syncLogger.updateSettings(this.settings);
 		if (this.syncActivityLog) this.syncActivityLog.updateSettings(this.settings);
+		if (this.errorReporter) this.errorReporter.updateSettings(this.settings);
+
+		// Phase 13.10 — surface automation-config problems on save.
+		const lint = lintAutomations(this.app, this.settings.automations);
+		const errors = lint.filter((l) => l.severity === "error");
+		if (errors.length > 0) {
+			console.warn(`${LOG} Automation lint: ${errors.length} error(s)`, errors);
+		}
 	}
 
 	private migrateLegacySettings(): void {
@@ -857,4 +1147,105 @@ class CreateCompanionModal extends Modal {
 	onClose(): void {
 		this.contentEl.empty();
 	}
+}
+
+// ── Phase 13 modals ────────────────────────────────────────────────────────
+
+class ConfirmModal extends Modal {
+	constructor(
+		app: App,
+		private title: string,
+		private body: string,
+		private onConfirm: () => void | Promise<void>
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: this.title });
+		contentEl.createEl("p", { text: this.body, cls: "setting-item-description" });
+		new Setting(contentEl)
+			.addButton((b) =>
+				b.setButtonText("Confirm").setCta().onClick(async () => {
+					this.close();
+					await this.onConfirm();
+				})
+			)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	onClose(): void { this.contentEl.empty(); }
+}
+
+class TextPromptModal extends Modal {
+	private value: string;
+	constructor(
+		app: App,
+		private title: string,
+		private desc: string,
+		initial: string,
+		private onSubmit: (value: string) => void
+	) {
+		super(app);
+		this.value = initial;
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: this.title });
+		new Setting(contentEl)
+			.setName(this.desc)
+			.addText((t) =>
+				t.setValue(this.value).onChange((v) => { this.value = v; })
+			);
+		new Setting(contentEl)
+			.addButton((b) =>
+				b.setButtonText("Run").setCta().onClick(() => {
+					this.close();
+					this.onSubmit(this.value.trim());
+				})
+			)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+	}
+
+	onClose(): void { this.contentEl.empty(); }
+}
+
+class RestoreManifestModal extends FuzzySuggestModal<string> {
+	constructor(app: App, private backups: string[], private onChoose: (name: string) => void) {
+		super(app);
+		this.setPlaceholder("Pick a manifest backup to restore…");
+	}
+	getItems(): string[] { return this.backups.slice().reverse(); } // newest first
+	getItemText(name: string): string { return name; }
+	onChooseItem(name: string): void { this.onChoose(name); }
+}
+
+class ErrorReportPreviewModal extends Modal {
+	constructor(app: App, private json: string, private onSend: () => void | Promise<void>) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: "Error report preview" });
+		contentEl.createEl("p", {
+			text: "This is exactly what would be sent. Paths, file names and long literals are stripped.",
+			cls: "setting-item-description",
+		});
+		const pre = contentEl.createEl("pre");
+		pre.style.cssText = "max-height:50vh; overflow:auto; font-size:12px; white-space:pre-wrap;";
+		pre.textContent = this.json;
+		new Setting(contentEl)
+			.addButton((b) =>
+				b.setButtonText("Send test report").setCta().onClick(async () => {
+					this.close();
+					await this.onSend();
+				})
+			)
+			.addButton((b) => b.setButtonText("Close").onClick(() => this.close()));
+	}
+
+	onClose(): void { this.contentEl.empty(); }
 }

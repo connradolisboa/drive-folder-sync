@@ -5,6 +5,7 @@ export interface DriveFile {
 	createdTime?: string; // ISO 8601 — used as date fallback in automations
 	size?: string;
 	trashed?: boolean;   // true when file is in Drive trash
+	md5Checksum?: string; // Phase 13.9 — present for binary files; absent for Google-native types
 }
 
 export interface DriveFolder {
@@ -59,6 +60,10 @@ export interface SyncPair {
 	companionNoteTemplatePath?: string;
 	/** Override global companionNoteTitle for this pair. Supports {{title}}, {{fileName}}, {{pairLabel}}, {{relativePath}}. */
 	companionNoteTitle?: string;
+	/** Phase 11.1 — per-pair changes-API cursor (set on bootstrap). */
+	driveStartPageToken?: string;
+	/** Phase 11.1 — per-pair override for the global useChangesApi toggle. */
+	useChangesApi?: boolean;
 }
 
 export interface AutomationRunRecord {
@@ -81,6 +86,10 @@ export interface ManifestEntry {
 	driveTrashed?: boolean;  // true when file is in Drive trash (not permanently deleted)
 	/** When true, automatic AI transcription is skipped for this file during sync. */
 	transcriptionDisabled?: boolean;
+	/** Phase 13.9 — Drive md5Checksum at last sync; primary change-detection signal for binary files. */
+	driveMd5?: string;
+	/** Phase 11.3 — sha256 of downloaded bytes; lets moves/renames skip re-download via the cache. */
+	contentHash?: string;
 }
 
 export type SyncManifest = Record<string, ManifestEntry>; // key = driveFileId
@@ -155,6 +164,23 @@ export interface PluginSettings {
 	transcribeNoteTemplate: string;           // template for "existing note" destination
 	transcribeCompanionFallbackFolder: string; // where to create companion when none exists; empty = alongside PDF
 	transcribeDefaultNotePath: string;        // vault path for "specific file" default destination
+
+	// ── Phase 11–13 infrastructure toggles ──────────────────────────────────
+	/** Phase 11.2 — opt into the SQLite-backed manifest (deferred; falls back to JSON for now). */
+	useSqliteManifest: boolean;
+	/** Phase 11.1 — use the Drive changes API instead of full folder polling. */
+	useChangesApi: boolean;
+	/** Phase 11.3 — content-addressed download cache for move/rename dedup. */
+	downloadCacheEnabled: boolean;
+	/** Phase 11.3 — cache size cap in MB. */
+	downloadCacheMaxMb: number;
+	/** Phase 11.4 — run hashing/PDF parsing off the UI thread when a Worker is available. */
+	offThreadHashing: boolean;
+	/** Phase 12.3 — last plugin version whose changelog the user saw. */
+	lastSeenVersion: string;
+	/** Phase 13.6 — opt-in anonymous error reporting. */
+	errorReportingEnabled: boolean;
+	errorReportingEndpoint: string;
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -200,6 +226,14 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	transcribeNoteTemplate: "",
 	transcribeCompanionFallbackFolder: "",
 	transcribeDefaultNotePath: "",
+	useSqliteManifest: false,
+	useChangesApi: false,
+	downloadCacheEnabled: false,
+	downloadCacheMaxMb: 2048,
+	offThreadHashing: true,
+	lastSeenVersion: "",
+	errorReportingEnabled: false,
+	errorReportingEndpoint: "",
 };
 
 // ── Automations ───────────────────────────────────────────────────────────────

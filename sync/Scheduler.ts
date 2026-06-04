@@ -5,7 +5,13 @@ export class Scheduler {
 		this.stop();
 		if (intervalMinutes <= 0) return;
 
-		const ms = intervalMinutes * 60 * 1000;
+		// Phase 13.3 — enforce a hard 60-second floor regardless of the configured value.
+		const MIN_MS = 60 * 1000;
+		let ms = intervalMinutes * 60 * 1000;
+		if (ms < MIN_MS) {
+			console.warn(`[DriveSync] Sync interval below 60s — clamping to 60s.`);
+			ms = MIN_MS;
+		}
 		this.intervalId = window.setInterval(async () => {
 			try {
 				await callback();

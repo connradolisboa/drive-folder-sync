@@ -1,13 +1,19 @@
 import { App, TFile } from "obsidian";
 import { GoogleAuth } from "../auth/GoogleAuth";
 import { DownloadManager } from "./DownloadManager";
-import { SyncManifestStore } from "./SyncManifest";
+import type { SyncManifestStore } from "./SyncManifest";
 import { CompanionNoteManager } from "./CompanionNoteManager";
 import { AutomationEngine } from "../automation/AutomationEngine";
 import { GeminiClient } from "../ai/GeminiClient";
 import { MistralClient } from "../ai/MistralClient";
 import { TranscriptionStore } from "../ai/TranscriptionStore";
-import { analyzePdf } from "../ai/PdfPageHasher";
+import { analyzePdf, PdfInfo } from "../ai/PdfPageHasher";
+import type { EventBus } from "../events/EventBus";
+import type { HeavyWorkerClient } from "../workers/heavyWorker";
+import { DriveChangesClient } from "./DriveChanges";
+import type { Recycle } from "./Recycle";
+import { newSyncRunId } from "./Recycle";
+import { checkDiskSpace } from "./DiskSpaceCheck";
 import {
 	DeletionBehavior,
 	DriveFile,
@@ -24,6 +30,9 @@ const LOG = "[DriveSync/Sync]";
 
 export class DriveSync {
 	private transcriptionClient: GeminiClient | MistralClient | null = null;
+	private changesClient?: DriveChangesClient;
+	/** Set when DriveSync mutates a pair (e.g. changes-API token); the plugin persists after sync. */
+	private settingsDirty = false;
 
 	constructor(
 		private auth: GoogleAuth,
@@ -33,12 +42,83 @@ export class DriveSync {
 		private manifest: SyncManifestStore,
 		private companion: CompanionNoteManager,
 		private automationEngine?: AutomationEngine,
-		private transcriptionStore?: TranscriptionStore
+		private transcriptionStore?: TranscriptionStore,
+		private bus?: EventBus,
+		private heavyWorker?: HeavyWorkerClient,
+		private recycle?: Recycle
 	) {}
+
+	/** Groups recycle-bin entries written during one sync run (Phase 13.5). */
+	private currentSyncRunId = newSyncRunId();
+	/** Phase 13.3 — per-pair token bucket: timestamps of recent runs for rate-limiting. */
+	private pairRunTimestamps = new Map<string, number[]>();
+
+	/** Phase 13.3 — returns false (and logs) when a pair exceeds 30 runs/hour. */
+	private withinRateLimit(pairId: string): boolean {
+		const now = Date.now();
+		const hourAgo = now - 60 * 60 * 1000;
+		const recent = (this.pairRunTimestamps.get(pairId) ?? []).filter((t) => t >= hourAgo);
+		if (recent.length >= 30) {
+			console.warn(`${LOG} Rate cap: pair ${pairId} exceeded 30 runs/hour — skipping this run.`);
+			this.pairRunTimestamps.set(pairId, recent);
+			return false;
+		}
+		recent.push(now);
+		this.pairRunTimestamps.set(pairId, recent);
+		return true;
+	}
+
+	/** Phase 11.4 — analyze PDF bytes off-thread when enabled, else synchronously. */
+	private async analyzeBytes(bytes: ArrayBuffer): Promise<PdfInfo> {
+		if (this.heavyWorker && this.settings.offThreadHashing) {
+			return this.heavyWorker.analyze(bytes);
+		}
+		return analyzePdf(bytes);
+	}
 
 	updateSettings(settings: PluginSettings): void {
 		this.settings = settings;
 		this.transcriptionClient = null; // invalidate cached client on settings change
+	}
+
+	/** Phase 11.1 — the plugin calls this after a sync to persist any pair-token mutations. */
+	consumeSettingsDirty(): boolean {
+		const wasDirty = this.settingsDirty;
+		this.settingsDirty = false;
+		return wasDirty;
+	}
+
+	private getChangesClient(): DriveChangesClient {
+		if (!this.changesClient) this.changesClient = new DriveChangesClient(this.auth);
+		return this.changesClient;
+	}
+
+	/**
+	 * Phase 11.1 — cheap pre-walk probe. Returns true when the changes feed proves the
+	 * account is idle since this pair's stored token, so the full folder walk can be skipped.
+	 * Bootstraps the token on first use and advances it on every call. Conservative: any
+	 * change at all (or a structural folder change) returns false and we fall back to a
+	 * full scan, which is always correct.
+	 */
+	private async pairIsIdleViaChanges(pair: SyncPair): Promise<boolean> {
+		const useChanges = pair.useChangesApi ?? this.settings.useChangesApi;
+		if (!useChanges) return false;
+		try {
+			const client = this.getChangesClient();
+			if (!pair.driveStartPageToken) {
+				pair.driveStartPageToken = await client.getStartPageToken();
+				this.settingsDirty = true;
+				return false; // first run — must full-scan to populate the manifest
+			}
+			const res = await client.listChanges(pair.driveStartPageToken);
+			pair.driveStartPageToken = res.newStartPageToken;
+			this.settingsDirty = true;
+			// Only skip when nothing changed account-wide since the token. Any change → full scan.
+			return res.changedFileIds.size === 0;
+		} catch (e) {
+			console.warn(`${LOG} changes-API probe failed for "${pair.label}" — falling back to full scan:`, e);
+			return false;
+		}
 	}
 
 	private getTranscriptionClient(): GeminiClient | MistralClient | null {
@@ -70,6 +150,8 @@ export class DriveSync {
 
 	async sync(dryRun = false): Promise<SyncResult> {
 		await this.manifest.load();
+		this.changesClient?.resetRunCache();
+		this.currentSyncRunId = newSyncRunId();
 
 		console.log(`${LOG} Fetching access token`);
 		const token = await this.auth.getValidAccessToken();
@@ -176,6 +258,8 @@ export class DriveSync {
 
 	async syncSinglePair(pairId: string): Promise<SyncResult> {
 		await this.manifest.load();
+		this.changesClient?.resetRunCache();
+		this.currentSyncRunId = newSyncRunId();
 
 		console.log(`${LOG} Fetching access token for single-pair sync`);
 		const token = await this.auth.getValidAccessToken();
@@ -205,6 +289,41 @@ export class DriveSync {
 		return result;
 	}
 
+	/**
+	 * Phase 12.5 — sandbox "test sync". Runs one sync round limited to a single subfolder
+	 * of the pair, with no deletion pass, so a config can be proven on a small slice first.
+	 */
+	async testSync(pairId: string, subfolderPath: string): Promise<SyncResult> {
+		await this.manifest.load();
+		const token = await this.auth.getValidAccessToken();
+		const pair = this.settings.syncPairs.find((p) => p.id === pairId);
+		if (!pair) throw new Error(`Sync pair not found: ${pairId}`);
+
+		const norm = subfolderPath.replace(/^\/+|\/+$/g, "");
+		const all = await this.collectFiles(
+			pair.driveFolderId, "", token, pair.excludedSubfolders ?? [], false, false
+		);
+		const scoped = all.filter(
+			(e) => !e.file.trashed && (e.relPath === norm || e.relPath.startsWith(`${norm}/`))
+		);
+		console.log(`${LOG} Test sync: ${scoped.length} file(s) under "${norm}" in pair "${pair.label}"`);
+
+		const companionEnabled = pair.companionNotesEnabled ?? this.settings.companionNotesEnabled;
+		const result: SyncResult = { downloaded: 0, skipped: 0, errors: 0, removed: 0, moved: 0, archived: 0, timestamp: Date.now() };
+		for (const entry of scoped) {
+			const r = await this.processEntry(entry, pair, token, companionEnabled);
+			result.downloaded += r.downloaded;
+			result.skipped += r.skipped;
+			result.moved! += r.moved ?? 0;
+			result.errors += r.errors;
+			if (r.conflicts?.length) result.conflicts = [...(result.conflicts ?? []), ...r.conflicts];
+		}
+
+		await this.manifest.save();
+		await this.transcriptionStore?.save();
+		return result;
+	}
+
 	// ── Phase 1: collect + process files ──────────────────────────────────────
 
 	private async syncPairFiles(
@@ -224,6 +343,25 @@ export class DriveSync {
 
 		const effectiveCompanionEnabled =
 			pair.companionNotesEnabled ?? this.settings.companionNotesEnabled;
+
+		// Phase 13.3 — per-pair rate cap. Mark all tracked files as "seen" so the deletion
+		// pass never mistakes a skipped run for missing files.
+		if (!dryRun && !this.withinRateLimit(pair.id)) {
+			const tracked = this.manifest.allForPair(pair.id);
+			pairResult.skipped = tracked.length;
+			return { pairResult, seenIds: new Set(tracked.map(([id]) => id)), trashedIds: new Set<string>() };
+		}
+
+		// Phase 11.1 — skip the full folder walk when the changes feed shows the account
+		// is idle since this pair's last sync. All tracked files are reported as "seen" so
+		// the deletion pass does not mistake the shortcut for missing files.
+		if (!dryRun && (await this.pairIsIdleViaChanges(pair))) {
+			const tracked = this.manifest.allForPair(pair.id);
+			console.log(`${LOG} Changes-API: pair "${pair.label}" idle — skipping full walk (${tracked.length} tracked)`);
+			pairResult.skipped = tracked.length;
+			const seenIds = new Set(tracked.map(([id]) => id));
+			return { pairResult, seenIds, trashedIds: new Set<string>() };
+		}
 
 		console.log(`${LOG} Collecting files from Drive folder: ${pair.driveFolderId}`);
 		const allDriveEntries = await this.collectFiles(
@@ -254,6 +392,24 @@ export class DriveSync {
 				}
 			}
 			return { pairResult, seenIds, trashedIds };
+		}
+
+		// Phase 13.1 — disk-space pre-flight. Estimate the bytes for files that actually need
+		// downloading and abort the pair before any write if 2× that won't fit.
+		let expectedBytes = 0;
+		for (const e of driveEntries) {
+			const existing = this.manifest.get(e.file.id);
+			const willDownload = !existing ||
+				(e.file.md5Checksum && existing.driveMd5
+					? e.file.md5Checksum !== existing.driveMd5
+					: e.file.modifiedTime !== existing.driveModifiedTime);
+			if (willDownload) expectedBytes += parseInt(e.file.size ?? "0", 10) || 0;
+		}
+		const space = await checkDiskSpace(expectedBytes);
+		if (!space.ok) {
+			this.bus?.emit("error", { message: `Disk-space pre-flight aborted pair "${pair.label}": ${space.reason}`, context: "disk-space" });
+			console.error(`${LOG} ${space.reason} — aborting pair "${pair.label}"`);
+			throw new Error(`Insufficient disk space for "${pair.label}": ${space.reason}`);
 		}
 
 		const concurrency = Math.max(1, Math.min(this.settings.downloadConcurrency ?? 5, 10));
@@ -326,6 +482,7 @@ export class DriveSync {
 				try {
 					await this.removeEntry(entry, pair, archiveBehavior, effectiveArchiveFolder);
 					this.manifest.delete(driveId);
+					this.bus?.emit("removed", { vaultPath: entry.vaultPath, pairId: pair.id, behavior: `drive-archived:${archiveBehavior}` });
 					result.archived!++;
 				} catch (e) {
 					console.error(`${LOG} Failed to remove archived "${entry.vaultPath}":`, e);
@@ -350,6 +507,7 @@ export class DriveSync {
 			try {
 				await this.removeEntry(entry, pair, effectiveDeletionBehavior, effectiveArchiveFolder);
 				this.manifest.delete(driveId);
+				this.bus?.emit("removed", { vaultPath: entry.vaultPath, pairId: pair.id, behavior: effectiveDeletionBehavior });
 				result.removed++;
 			} catch (e) {
 				console.error(`${LOG} Failed to remove "${entry.vaultPath}":`, e);
@@ -447,11 +605,18 @@ export class DriveSync {
 				this.manifest.clearUserDeleted(entry.file.id);
 			}
 
-			const needsDownload = !existing || entry.file.modifiedTime !== existing.driveModifiedTime;
+			// Phase 13.9 — prefer Drive's md5Checksum for change detection (skips wasted
+			// re-downloads/Gemini calls when modifiedTime bumps but content is identical).
+			// Fall back to modifiedTime when md5 is unavailable (e.g. Google-native types).
+			const contentChanged =
+				entry.file.md5Checksum && existing?.driveMd5
+					? entry.file.md5Checksum !== existing.driveMd5
+					: entry.file.modifiedTime !== existing?.driveModifiedTime;
+			const needsDownload = !existing || contentChanged;
 
 			if (needsDownload) {
 				console.log(`${LOG} Downloading: ${displayPath}`);
-				const vaultPath = await this.downloader.download(
+				const { path: vaultPath, cacheHit } = await this.downloader.download(
 					entry.file,
 					token,
 					pair.vaultDestFolder,
@@ -527,6 +692,11 @@ export class DriveSync {
 					}
 				}
 
+				// Phase 11.3/13.4 — record the content sha256 when we have the bytes in hand
+				// (computed off-thread via the heavy worker when enabled).
+				const info: PdfInfo | null = pdfBytes ? await this.analyzeBytes(pdfBytes) : null;
+				const contentHash = info?.hash ?? existing?.contentHash;
+
 				this.manifest.set(entry.file.id, {
 					vaultPath,
 					companionPath,
@@ -535,11 +705,12 @@ export class DriveSync {
 					pairId: pair.id,
 					companionMtime,
 					transcriptionDisabled: existing?.transcriptionDisabled,
+					driveMd5: entry.file.md5Checksum,
+					contentHash,
 				});
 
 				// Update transcription tracking store
-				if (this.transcriptionStore && pdfBytes) {
-					const info = analyzePdf(pdfBytes);
+				if (this.transcriptionStore && info) {
 					if (transcription !== undefined) {
 						// A fresh transcription ran — record full details
 						const finalCompanionPath = companionPath ?? resolvedCompanionPath;
@@ -572,10 +743,17 @@ export class DriveSync {
 					});
 				}
 
-				console.log(`${LOG} Downloaded: ${displayPath}`);
+				console.log(`${LOG} Downloaded: ${displayPath}${cacheHit ? " (cache hit)" : ""}`);
+				this.bus?.emit("downloaded", { vaultPath, pairId: pair.id, driveFileId: entry.file.id, cacheHit });
+				if (r.conflicts?.length) {
+					for (const cp of r.conflicts) {
+						this.bus?.emit("conflict", { vaultPath, backupPath: cp });
+					}
+				}
 				r.downloaded++;
 			} else if (existing && existing.vaultPath !== expectedVaultPath) {
 				// Pure move — no content change, just relocated
+				this.bus?.emit("moved", { fromPath: existing.vaultPath, toPath: expectedVaultPath, pairId: pair.id });
 				r.moved!++;
 			} else {
 				// Clear driveTrashed if file was previously in trash but is now active and unchanged
@@ -583,6 +761,7 @@ export class DriveSync {
 					this.manifest.set(entry.file.id, { ...existing, driveTrashed: undefined });
 				}
 				console.log(`${LOG} Up to date, skipping: ${displayPath}`);
+				this.bus?.emit("skipped", { vaultPath: existing?.vaultPath ?? expectedVaultPath, pairId: pair.id, reason: "up to date" });
 				r.skipped++;
 			}
 		} catch (e) {
@@ -688,6 +867,17 @@ export class DriveSync {
 		archiveFolder: string
 	): Promise<void> {
 		if (deletionBehavior === "delete") {
+			// Phase 13.5 — back up the bytes before the (destructive) trash.
+			if (this.recycle) {
+				try {
+					const bytes = await this.app.vault.adapter.readBinary(filePath);
+					await this.recycle.backup(filePath, bytes, {
+						driveFileId: null, pairId: pair.id, action: "delete", syncRunId: this.currentSyncRunId,
+					});
+				} catch (e) {
+					console.error(`${LOG} Recycle backup before trash failed for "${filePath}":`, e);
+				}
+			}
 			console.log(`${LOG} Trashing: ${filePath}`);
 			await this.app.vault.trash(file, true);
 		} else if (deletionBehavior === "archive") {
@@ -737,7 +927,7 @@ export class DriveSync {
 			this.listItems<DriveFile>(
 				token,
 				`'${folderId}' in parents and mimeType='application/pdf'`,
-				"files(id,name,modifiedTime,createdTime,size,trashed)"
+				"files(id,name,modifiedTime,createdTime,size,trashed,md5Checksum)"
 			),
 			rootFilesOnly && !isRoot
 				? Promise.resolve([] as DriveFolder[])

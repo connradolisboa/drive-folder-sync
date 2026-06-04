@@ -8,6 +8,9 @@ var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getProtoOf = Object.getPrototypeOf;
 var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __esm = (fn, res) => function __init() {
+  return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
+};
 var __export = (target, all) => {
   for (var name in all)
     __defProp(target, name, { get: all[name], enumerable: true });
@@ -30,14 +33,43 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
+// ai/PdfPageHasher.ts
+var PdfPageHasher_exports = {};
+__export(PdfPageHasher_exports, {
+  analyzePdf: () => analyzePdf
+});
+function analyzePdf(pdfBytes) {
+  const buf = Buffer.from(pdfBytes);
+  const hash = crypto2.createHash("sha256").update(buf).digest("hex");
+  const pageCount = extractPageCount(buf);
+  return { hash, pageCount };
+}
+function extractPageCount(buf) {
+  const str = buf.toString("latin1");
+  const pageMatches = str.match(/\/Type\s*\/Page(?!\s*s)/g);
+  if (pageMatches && pageMatches.length > 0)
+    return pageMatches.length;
+  const countMatches = [...str.matchAll(/\/Count\s+(\d+)/g)];
+  if (countMatches.length > 0) {
+    return Math.max(...countMatches.map((m) => parseInt(m[1], 10)));
+  }
+  return 0;
+}
+var crypto2;
+var init_PdfPageHasher = __esm({
+  "ai/PdfPageHasher.ts"() {
+    crypto2 = __toESM(require("crypto"));
+  }
+});
+
 // main.ts
 var main_exports = {};
 __export(main_exports, {
   default: () => DriveFolderSyncPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian11 = require("obsidian");
-var crypto2 = __toESM(require("crypto"));
+var import_obsidian20 = require("obsidian");
+var crypto5 = __toESM(require("crypto"));
 
 // auth/GoogleAuth.ts
 var crypto = __toESM(require("crypto"));
@@ -52,12 +84,29 @@ var AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 var SCOPE = "https://www.googleapis.com/auth/drive.readonly";
 var LOG = "[DriveSync/Auth]";
 var GoogleAuth = class {
-  constructor(app, settings) {
+  constructor(app, settings, bus) {
     this.app = app;
     this.settings = settings;
+    this.bus = bus;
+    /** Phase 13.8 — current auth health, surfaced to the scheduler/ribbon/UI. */
+    this.state = "ok";
   }
   updateSettings(settings) {
     this.settings = settings;
+  }
+  markExpired(reason) {
+    var _a;
+    if (this.state !== "expired") {
+      this.state = "expired";
+      (_a = this.bus) == null ? void 0 : _a.emit("auth-failed", { reason });
+    }
+  }
+  markOk() {
+    var _a;
+    if (this.state === "expired") {
+      this.state = "ok";
+      (_a = this.bus) == null ? void 0 : _a.emit("auth-restored", {});
+    }
   }
   async isAuthorized() {
     const creds = await this.loadCredentials();
@@ -148,6 +197,7 @@ var GoogleAuth = class {
       access_token: data.access_token,
       expiry: Date.now() + data.expires_in * 1e3
     });
+    this.markOk();
   }
   async refreshAccessToken(refreshToken) {
     console.log(`${LOG} POST ${TOKEN_URL} (grant_type=refresh_token)`);
@@ -164,6 +214,7 @@ var GoogleAuth = class {
     if (!resp.ok) {
       const body = await resp.text();
       console.error(`${LOG} Token refresh failed \u2014 status ${resp.status}:`, body);
+      this.markExpired(`token refresh failed (HTTP ${resp.status})`);
       throw new Error(`Token refresh failed: ${resp.status} ${body}`);
     }
     const data = await resp.json();
@@ -174,6 +225,7 @@ var GoogleAuth = class {
       expiry: Date.now() + data.expires_in * 1e3
     };
     await this.saveCredentials(newCreds);
+    this.markOk();
     return newCreds.access_token;
   }
   waitForAuthCode() {
@@ -343,10 +395,276 @@ var MistralClient = class {
 };
 
 // sync/DriveSync.ts
+init_PdfPageHasher();
+
+// sync/DriveChanges.ts
+var CHANGES_API = "https://www.googleapis.com/drive/v3/changes";
+var LOG4 = "[DriveSync/Changes]";
+var DriveChangesClient = class {
+  constructor(auth) {
+    this.auth = auth;
+    this.cache = /* @__PURE__ */ new Map();
+  }
+  /** Reset the per-run cache. Call at the start of each sync. */
+  resetRunCache() {
+    this.cache.clear();
+  }
+  async getStartPageToken() {
+    const token = await this.auth.getValidAccessToken();
+    const resp = await fetch(`${CHANGES_API}/startPageToken`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!resp.ok)
+      throw new Error(`changes.getStartPageToken failed: HTTP ${resp.status}`);
+    const data = await resp.json();
+    return data.startPageToken;
+  }
+  /** List changes since `pageToken`, paging to completion. Cached per token within a run. */
+  listChanges(pageToken) {
+    const cached = this.cache.get(pageToken);
+    if (cached)
+      return cached;
+    const promise = this.listChangesUncached(pageToken);
+    this.cache.set(pageToken, promise);
+    return promise;
+  }
+  async listChangesUncached(pageToken) {
+    var _a, _b;
+    const accessToken = await this.auth.getValidAccessToken();
+    const changedFileIds = /* @__PURE__ */ new Set();
+    let hasFolderChange = false;
+    let cursor = pageToken;
+    let newStartPageToken = pageToken;
+    do {
+      const params = new URLSearchParams({
+        pageToken: cursor,
+        pageSize: "1000",
+        fields: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,mimeType,trashed,parents))",
+        includeRemoved: "true",
+        spaces: "drive"
+      });
+      const resp = await fetch(`${CHANGES_API}?${params}`, {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      if (!resp.ok)
+        throw new Error(`changes.list failed: HTTP ${resp.status}`);
+      const data = await resp.json();
+      for (const change of (_a = data.changes) != null ? _a : []) {
+        if (change.fileId)
+          changedFileIds.add(change.fileId);
+        if (((_b = change.file) == null ? void 0 : _b.mimeType) === "application/vnd.google-apps.folder")
+          hasFolderChange = true;
+      }
+      if (data.newStartPageToken)
+        newStartPageToken = data.newStartPageToken;
+      cursor = data.nextPageToken;
+    } while (cursor);
+    console.log(`${LOG4} ${changedFileIds.size} change(s) since token; folderChange=${hasFolderChange}`);
+    return { changedFileIds, hasFolderChange, newStartPageToken };
+  }
+};
+
+// sync/Recycle.ts
+var crypto3 = __toESM(require("crypto"));
+var RECYCLE_DIR = ".obsidian/drive-sync-recycle";
+var LOG5 = "[DriveSync/Recycle]";
+var DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024;
+var RETAIN_MS = 7 * 24 * 60 * 60 * 1e3;
+var MAX_TOTAL_BYTES = 500 * 1024 * 1024;
+var Recycle = class {
+  constructor(app, bus, maxFileBytes = DEFAULT_MAX_FILE_BYTES) {
+    this.app = app;
+    this.bus = bus;
+    this.maxFileBytes = maxFileBytes;
+  }
+  sanitize(p) {
+    return p.replace(/[/\\:*?"<>|]/g, "_");
+  }
+  /** Back up `bytes` for `originalPath` before it is overwritten/deleted. */
+  async backup(originalPath, bytes, meta) {
+    var _a;
+    if (bytes.byteLength > this.maxFileBytes) {
+      console.warn(`${LOG5} Skipping recycle backup (>${this.maxFileBytes} bytes): ${originalPath}`);
+      return null;
+    }
+    try {
+      const pairDir = `${RECYCLE_DIR}/${this.sanitize(meta.pairId || "default")}`;
+      await this.ensureDir(pairDir);
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      const base = `${ts}-${this.sanitize(originalPath)}`;
+      const dataPath = `${pairDir}/${base}`;
+      const sha256 = crypto3.createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+      await this.app.vault.adapter.writeBinary(dataPath, bytes);
+      const sidecar = {
+        originalPath,
+        driveFileId: meta.driveFileId,
+        pairId: meta.pairId,
+        action: meta.action,
+        timestamp: new Date().toISOString(),
+        sha256,
+        syncRunId: meta.syncRunId,
+        restoreInstructions: `Copy "${dataPath}" back to "${originalPath}" to restore.`
+      };
+      await this.app.vault.adapter.write(`${dataPath}.json`, JSON.stringify(sidecar, null, 2));
+      (_a = this.bus) == null ? void 0 : _a.emit("recycle-write", { originalPath, recyclePath: dataPath, action: meta.action });
+      await this.gc();
+      return dataPath;
+    } catch (e) {
+      console.error(`${LOG5} Recycle backup failed for "${originalPath}":`, e);
+      return null;
+    }
+  }
+  get folderPath() {
+    return RECYCLE_DIR;
+  }
+  /** Distinct sync run ids present in the recycle bin, newest first. */
+  async listRunIds() {
+    const sidecars = await this.readSidecars();
+    const byRun = /* @__PURE__ */ new Map();
+    for (const s of sidecars) {
+      const cur = byRun.get(s.syncRunId);
+      if (cur) {
+        cur.count++;
+        if (s.timestamp > cur.at)
+          cur.at = s.timestamp;
+      } else
+        byRun.set(s.syncRunId, { at: s.timestamp, count: 1 });
+    }
+    return [...byRun.entries()].map(([syncRunId, v]) => ({ syncRunId, ...v })).sort((a, b) => b.at.localeCompare(a.at));
+  }
+  /** Restore every file recycled under `syncRunId`. Returns count restored. */
+  async restoreRun(syncRunId) {
+    const sidecars = await this.readSidecars();
+    let restored = 0;
+    for (const { sidecar, dataPath } of sidecars.map((s) => ({ sidecar: s, dataPath: this.dataPathFor(s) }))) {
+      if (sidecar.syncRunId !== syncRunId)
+        continue;
+      try {
+        const bytes = await this.app.vault.adapter.readBinary(dataPath);
+        await this.ensureDir(sidecar.originalPath.substring(0, sidecar.originalPath.lastIndexOf("/")));
+        const exists = await this.app.vault.adapter.exists(sidecar.originalPath);
+        if (exists)
+          await this.app.vault.adapter.writeBinary(sidecar.originalPath, bytes);
+        else
+          await this.app.vault.createBinary(sidecar.originalPath, bytes);
+        restored++;
+      } catch (e) {
+        console.error(`${LOG5} Failed to restore "${sidecar.originalPath}":`, e);
+      }
+    }
+    return restored;
+  }
+  dataPathFor(s) {
+    var _a;
+    return (_a = s.__dataPath) != null ? _a : s.originalPath;
+  }
+  async readSidecars() {
+    const out = [];
+    if (!await this.app.vault.adapter.exists(RECYCLE_DIR))
+      return out;
+    const stack = [RECYCLE_DIR];
+    while (stack.length) {
+      const dir = stack.pop();
+      const listing = await this.app.vault.adapter.list(dir);
+      stack.push(...listing.folders);
+      for (const f of listing.files) {
+        if (!f.endsWith(".json"))
+          continue;
+        try {
+          const raw = await this.app.vault.adapter.read(f);
+          const sidecar = JSON.parse(raw);
+          out.push({ ...sidecar, __dataPath: f.slice(0, -".json".length) });
+        } catch (e) {
+        }
+      }
+    }
+    return out;
+  }
+  async gc() {
+    var _a;
+    try {
+      const sidecars = await this.readSidecars();
+      const now = Date.now();
+      const files = [];
+      for (const s of sidecars) {
+        const stat = await this.app.vault.adapter.stat(s.__dataPath);
+        files.push({ data: s.__dataPath, json: `${s.__dataPath}.json`, size: (_a = stat == null ? void 0 : stat.size) != null ? _a : 0, at: new Date(s.timestamp).getTime() });
+      }
+      for (const f of files) {
+        if (now - f.at > RETAIN_MS) {
+          await this.app.vault.adapter.remove(f.data).catch(() => void 0);
+          await this.app.vault.adapter.remove(f.json).catch(() => void 0);
+        }
+      }
+      const remaining = files.filter((f) => now - f.at <= RETAIN_MS).sort((a, b) => a.at - b.at);
+      let total = remaining.reduce((s, f) => s + f.size, 0);
+      for (const f of remaining) {
+        if (total <= MAX_TOTAL_BYTES)
+          break;
+        await this.app.vault.adapter.remove(f.data).catch(() => void 0);
+        await this.app.vault.adapter.remove(f.json).catch(() => void 0);
+        total -= f.size;
+      }
+    } catch (e) {
+      console.error(`${LOG5} Recycle GC failed:`, e);
+    }
+  }
+  async ensureDir(dir) {
+    if (!dir)
+      return;
+    const segments = dir.split("/").filter(Boolean);
+    let current = "";
+    for (const seg of segments) {
+      current = current ? `${current}/${seg}` : seg;
+      if (!await this.app.vault.adapter.exists(current)) {
+        await this.app.vault.adapter.mkdir(current);
+      }
+    }
+  }
+};
+function newSyncRunId() {
+  return `${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto3.randomBytes(3).toString("hex")}`;
+}
+
+// sync/DiskSpaceCheck.ts
+var LOG6 = "[DriveSync/DiskSpace]";
+async function checkDiskSpace(expectedBytes) {
+  var _a;
+  const requiredBytes = Math.max(0, expectedBytes) * 2;
+  let freeBytes = null;
+  try {
+    if (typeof navigator !== "undefined" && ((_a = navigator.storage) == null ? void 0 : _a.estimate)) {
+      const est = await navigator.storage.estimate();
+      if (typeof est.quota === "number" && typeof est.usage === "number") {
+        freeBytes = est.quota - est.usage;
+      }
+    }
+  } catch (e) {
+    console.warn(`${LOG6} storage.estimate() failed:`, e);
+  }
+  if (freeBytes === null) {
+    return { ok: true, freeBytes: null, requiredBytes };
+  }
+  if (requiredBytes > freeBytes) {
+    return {
+      ok: false,
+      freeBytes,
+      requiredBytes,
+      reason: `Need ~${fmt(requiredBytes)} free (2\xD7 expected), but only ${fmt(freeBytes)} available.`
+    };
+  }
+  return { ok: true, freeBytes, requiredBytes };
+}
+function fmt(bytes) {
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(0)} MB`;
+}
+
+// sync/DriveSync.ts
 var FILES_API = "https://www.googleapis.com/drive/v3/files";
-var LOG4 = "[DriveSync/Sync]";
+var LOG7 = "[DriveSync/Sync]";
 var DriveSync = class {
-  constructor(auth, downloader, settings, app, manifest, companion, automationEngine) {
+  constructor(auth, downloader, settings, app, manifest, companion, automationEngine, transcriptionStore, bus, heavyWorker, recycle) {
     this.auth = auth;
     this.downloader = downloader;
     this.settings = settings;
@@ -354,11 +672,82 @@ var DriveSync = class {
     this.manifest = manifest;
     this.companion = companion;
     this.automationEngine = automationEngine;
+    this.transcriptionStore = transcriptionStore;
+    this.bus = bus;
+    this.heavyWorker = heavyWorker;
+    this.recycle = recycle;
     this.transcriptionClient = null;
+    /** Set when DriveSync mutates a pair (e.g. changes-API token); the plugin persists after sync. */
+    this.settingsDirty = false;
+    /** Groups recycle-bin entries written during one sync run (Phase 13.5). */
+    this.currentSyncRunId = newSyncRunId();
+    /** Phase 13.3 — per-pair token bucket: timestamps of recent runs for rate-limiting. */
+    this.pairRunTimestamps = /* @__PURE__ */ new Map();
+  }
+  /** Phase 13.3 — returns false (and logs) when a pair exceeds 30 runs/hour. */
+  withinRateLimit(pairId) {
+    var _a;
+    const now = Date.now();
+    const hourAgo = now - 60 * 60 * 1e3;
+    const recent = ((_a = this.pairRunTimestamps.get(pairId)) != null ? _a : []).filter((t) => t >= hourAgo);
+    if (recent.length >= 30) {
+      console.warn(`${LOG7} Rate cap: pair ${pairId} exceeded 30 runs/hour \u2014 skipping this run.`);
+      this.pairRunTimestamps.set(pairId, recent);
+      return false;
+    }
+    recent.push(now);
+    this.pairRunTimestamps.set(pairId, recent);
+    return true;
+  }
+  /** Phase 11.4 — analyze PDF bytes off-thread when enabled, else synchronously. */
+  async analyzeBytes(bytes) {
+    if (this.heavyWorker && this.settings.offThreadHashing) {
+      return this.heavyWorker.analyze(bytes);
+    }
+    return analyzePdf(bytes);
   }
   updateSettings(settings) {
     this.settings = settings;
     this.transcriptionClient = null;
+  }
+  /** Phase 11.1 — the plugin calls this after a sync to persist any pair-token mutations. */
+  consumeSettingsDirty() {
+    const wasDirty = this.settingsDirty;
+    this.settingsDirty = false;
+    return wasDirty;
+  }
+  getChangesClient() {
+    if (!this.changesClient)
+      this.changesClient = new DriveChangesClient(this.auth);
+    return this.changesClient;
+  }
+  /**
+   * Phase 11.1 — cheap pre-walk probe. Returns true when the changes feed proves the
+   * account is idle since this pair's stored token, so the full folder walk can be skipped.
+   * Bootstraps the token on first use and advances it on every call. Conservative: any
+   * change at all (or a structural folder change) returns false and we fall back to a
+   * full scan, which is always correct.
+   */
+  async pairIsIdleViaChanges(pair) {
+    var _a;
+    const useChanges = (_a = pair.useChangesApi) != null ? _a : this.settings.useChangesApi;
+    if (!useChanges)
+      return false;
+    try {
+      const client = this.getChangesClient();
+      if (!pair.driveStartPageToken) {
+        pair.driveStartPageToken = await client.getStartPageToken();
+        this.settingsDirty = true;
+        return false;
+      }
+      const res = await client.listChanges(pair.driveStartPageToken);
+      pair.driveStartPageToken = res.newStartPageToken;
+      this.settingsDirty = true;
+      return res.changedFileIds.size === 0;
+    } catch (e) {
+      console.warn(`${LOG7} changes-API probe failed for "${pair.label}" \u2014 falling back to full scan:`, e);
+      return false;
+    }
   }
   getTranscriptionClient() {
     var _a;
@@ -386,9 +775,11 @@ var DriveSync = class {
     return this.transcriptionClient;
   }
   async sync(dryRun = false) {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m;
     await this.manifest.load();
-    console.log(`${LOG4} Fetching access token`);
+    (_a = this.changesClient) == null ? void 0 : _a.resetRunCache();
+    this.currentSyncRunId = newSyncRunId();
+    console.log(`${LOG7} Fetching access token`);
     const token = await this.auth.getValidAccessToken();
     const result = {
       downloaded: 0,
@@ -404,93 +795,144 @@ var DriveSync = class {
     const activePairs = this.settings.syncPairs.filter(
       (p) => p.enabled && p.driveFolderId.trim()
     );
-    console.log(`${LOG4} Active sync pairs: ${activePairs.length}${dryRun ? " (dry run)" : ""}`);
+    console.log(`${LOG7} Active sync pairs: ${activePairs.length}${dryRun ? " (dry run)" : ""}`);
     const archivedIds = this.settings.driveArchiveFolderId ? await this.collectArchiveIds(token) : /* @__PURE__ */ new Set();
     if (archivedIds.size > 0) {
-      console.log(`${LOG4} Drive archive folder contains ${archivedIds.size} tracked file(s)`);
+      console.log(`${LOG7} Drive archive folder contains ${archivedIds.size} tracked file(s)`);
     }
     const pairSeenIds = /* @__PURE__ */ new Map();
+    const pairTrashedIds = /* @__PURE__ */ new Map();
     const globalSeenIds = /* @__PURE__ */ new Set();
     for (const pair of activePairs) {
-      console.log(`${LOG4} [Phase 1] Processing pair "${pair.label}" \u2192 "${pair.vaultDestFolder}"`);
+      console.log(`${LOG7} [Phase 1] Processing pair "${pair.label}" \u2192 "${pair.vaultDestFolder}"`);
       try {
-        const { pairResult, seenIds } = await this.syncPairFiles(pair, token, dryRun);
+        const { pairResult, seenIds, trashedIds } = await this.syncPairFiles(pair, token, dryRun);
         pairSeenIds.set(pair.id, seenIds);
+        pairTrashedIds.set(pair.id, trashedIds);
         seenIds.forEach((id) => globalSeenIds.add(id));
         result.downloaded += pairResult.downloaded;
         result.skipped += pairResult.skipped;
-        result.moved += (_a = pairResult.moved) != null ? _a : 0;
+        result.moved += (_b = pairResult.moved) != null ? _b : 0;
         result.errors += pairResult.errors;
+        if ((_c = pairResult.conflicts) == null ? void 0 : _c.length) {
+          result.conflicts = [...(_d = result.conflicts) != null ? _d : [], ...pairResult.conflicts];
+        }
         result.pairs[pair.id] = pairResult;
         if (dryRun) {
-          result.wouldDownload.push(...(_b = pairResult.wouldDownload) != null ? _b : []);
+          result.wouldDownload.push(...(_e = pairResult.wouldDownload) != null ? _e : []);
         }
       } catch (e) {
-        console.error(`${LOG4} Pair "${pair.label}" file processing failed:`, e);
+        console.error(`${LOG7} Pair "${pair.label}" file processing failed:`, e);
         result.errors++;
         result.pairs[pair.id] = { downloaded: 0, skipped: 0, errors: 1, removed: 0, moved: 0, archived: 0 };
       }
     }
     if (!dryRun) {
       for (const pair of activePairs) {
-        const seenIds = (_c = pairSeenIds.get(pair.id)) != null ? _c : /* @__PURE__ */ new Set();
+        const seenIds = (_f = pairSeenIds.get(pair.id)) != null ? _f : /* @__PURE__ */ new Set();
+        const trashedIds = (_g = pairTrashedIds.get(pair.id)) != null ? _g : /* @__PURE__ */ new Set();
         try {
-          const delResult = await this.runDeletionPass(pair, seenIds, globalSeenIds, archivedIds);
+          const delResult = await this.runDeletionPass(pair, seenIds, globalSeenIds, archivedIds, trashedIds);
           result.removed += delResult.removed;
-          result.archived += (_d = delResult.archived) != null ? _d : 0;
+          result.archived += (_h = delResult.archived) != null ? _h : 0;
           result.errors += delResult.errors;
           const pr = result.pairs[pair.id];
           pr.removed = delResult.removed;
-          pr.archived = (_e = delResult.archived) != null ? _e : 0;
+          pr.archived = (_i = delResult.archived) != null ? _i : 0;
           pr.errors += delResult.errors;
         } catch (e) {
-          console.error(`${LOG4} Pair "${pair.label}" deletion pass failed:`, e);
+          console.error(`${LOG7} Pair "${pair.label}" deletion pass failed:`, e);
           result.errors++;
         }
       }
     } else {
       for (const pair of activePairs) {
-        const seenIds = (_f = pairSeenIds.get(pair.id)) != null ? _f : /* @__PURE__ */ new Set();
-        const effectiveDeletionBehavior = (_g = pair.deletionBehavior) != null ? _g : this.settings.deletionBehavior;
+        const seenIds = (_j = pairSeenIds.get(pair.id)) != null ? _j : /* @__PURE__ */ new Set();
+        const effectiveDeletionBehavior = (_k = pair.deletionBehavior) != null ? _k : this.settings.deletionBehavior;
         if (effectiveDeletionBehavior !== "keep") {
+          const trashedIds = (_l = pairTrashedIds.get(pair.id)) != null ? _l : /* @__PURE__ */ new Set();
           const pairEntries = this.manifest.allForPair(pair.id);
           for (const [driveId, entry] of pairEntries) {
-            if (!globalSeenIds.has(driveId) && !seenIds.has(driveId)) {
+            if (!globalSeenIds.has(driveId) && !seenIds.has(driveId) && !trashedIds.has(driveId)) {
               result.wouldRemove.push(entry.vaultPath);
             }
           }
         }
       }
     }
-    if (!dryRun)
+    if (!dryRun) {
       await this.manifest.save();
+      await ((_m = this.transcriptionStore) == null ? void 0 : _m.save());
+    }
     return result;
   }
   async syncSinglePair(pairId) {
-    var _a;
+    var _a, _b, _c;
     await this.manifest.load();
-    console.log(`${LOG4} Fetching access token for single-pair sync`);
+    (_a = this.changesClient) == null ? void 0 : _a.resetRunCache();
+    this.currentSyncRunId = newSyncRunId();
+    console.log(`${LOG7} Fetching access token for single-pair sync`);
     const token = await this.auth.getValidAccessToken();
     const pair = this.settings.syncPairs.find((p) => p.id === pairId);
     if (!pair)
       throw new Error(`Sync pair not found: ${pairId}`);
     const archivedIds = this.settings.driveArchiveFolderId ? await this.collectArchiveIds(token) : /* @__PURE__ */ new Set();
-    console.log(`${LOG4} Single-pair sync: "${pair.label}"`);
-    const { pairResult, seenIds } = await this.syncPairFiles(pair, token);
-    const delResult = await this.runDeletionPass(pair, seenIds, seenIds, archivedIds);
+    console.log(`${LOG7} Single-pair sync: "${pair.label}"`);
+    const { pairResult, seenIds, trashedIds } = await this.syncPairFiles(pair, token);
+    const delResult = await this.runDeletionPass(pair, seenIds, seenIds, archivedIds, trashedIds);
     const result = {
       ...pairResult,
       removed: delResult.removed,
-      archived: (_a = delResult.archived) != null ? _a : 0,
+      archived: (_b = delResult.archived) != null ? _b : 0,
       errors: pairResult.errors + delResult.errors,
       timestamp: Date.now()
     };
     await this.manifest.save();
+    await ((_c = this.transcriptionStore) == null ? void 0 : _c.save());
+    return result;
+  }
+  /**
+   * Phase 12.5 — sandbox "test sync". Runs one sync round limited to a single subfolder
+   * of the pair, with no deletion pass, so a config can be proven on a small slice first.
+   */
+  async testSync(pairId, subfolderPath) {
+    var _a, _b, _c, _d, _e, _f;
+    await this.manifest.load();
+    const token = await this.auth.getValidAccessToken();
+    const pair = this.settings.syncPairs.find((p) => p.id === pairId);
+    if (!pair)
+      throw new Error(`Sync pair not found: ${pairId}`);
+    const norm = subfolderPath.replace(/^\/+|\/+$/g, "");
+    const all = await this.collectFiles(
+      pair.driveFolderId,
+      "",
+      token,
+      (_a = pair.excludedSubfolders) != null ? _a : [],
+      false,
+      false
+    );
+    const scoped = all.filter(
+      (e) => !e.file.trashed && (e.relPath === norm || e.relPath.startsWith(`${norm}/`))
+    );
+    console.log(`${LOG7} Test sync: ${scoped.length} file(s) under "${norm}" in pair "${pair.label}"`);
+    const companionEnabled = (_b = pair.companionNotesEnabled) != null ? _b : this.settings.companionNotesEnabled;
+    const result = { downloaded: 0, skipped: 0, errors: 0, removed: 0, moved: 0, archived: 0, timestamp: Date.now() };
+    for (const entry of scoped) {
+      const r = await this.processEntry(entry, pair, token, companionEnabled);
+      result.downloaded += r.downloaded;
+      result.skipped += r.skipped;
+      result.moved += (_c = r.moved) != null ? _c : 0;
+      result.errors += r.errors;
+      if ((_d = r.conflicts) == null ? void 0 : _d.length)
+        result.conflicts = [...(_e = result.conflicts) != null ? _e : [], ...r.conflicts];
+    }
+    await this.manifest.save();
+    await ((_f = this.transcriptionStore) == null ? void 0 : _f.save());
     return result;
   }
   // ── Phase 1: collect + process files ──────────────────────────────────────
   async syncPairFiles(pair, token, dryRun = false) {
-    var _a, _b, _c, _d, _e, _f;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j;
     const pairResult = {
       downloaded: 0,
       skipped: 0,
@@ -501,8 +943,20 @@ var DriveSync = class {
       ...dryRun ? { wouldDownload: [] } : {}
     };
     const effectiveCompanionEnabled = (_a = pair.companionNotesEnabled) != null ? _a : this.settings.companionNotesEnabled;
-    console.log(`${LOG4} Collecting files from Drive folder: ${pair.driveFolderId}`);
-    const driveEntries = await this.collectFiles(
+    if (!dryRun && !this.withinRateLimit(pair.id)) {
+      const tracked = this.manifest.allForPair(pair.id);
+      pairResult.skipped = tracked.length;
+      return { pairResult, seenIds: new Set(tracked.map(([id]) => id)), trashedIds: /* @__PURE__ */ new Set() };
+    }
+    if (!dryRun && await this.pairIsIdleViaChanges(pair)) {
+      const tracked = this.manifest.allForPair(pair.id);
+      console.log(`${LOG7} Changes-API: pair "${pair.label}" idle \u2014 skipping full walk (${tracked.length} tracked)`);
+      pairResult.skipped = tracked.length;
+      const seenIds2 = new Set(tracked.map(([id]) => id));
+      return { pairResult, seenIds: seenIds2, trashedIds: /* @__PURE__ */ new Set() };
+    }
+    console.log(`${LOG7} Collecting files from Drive folder: ${pair.driveFolderId}`);
+    const allDriveEntries = await this.collectFiles(
       pair.driveFolderId,
       "",
       token,
@@ -510,7 +964,11 @@ var DriveSync = class {
       (_c = pair.excludeRootFiles) != null ? _c : false,
       (_d = pair.rootFilesOnly) != null ? _d : false
     );
-    console.log(`${LOG4} Found ${driveEntries.length} PDF(s) in Drive for pair "${pair.label}"`);
+    const driveEntries = allDriveEntries.filter((e) => !e.file.trashed);
+    const trashedIds = new Set(allDriveEntries.filter((e) => e.file.trashed).map((e) => e.file.id));
+    console.log(
+      `${LOG7} Found ${driveEntries.length} active PDF(s)` + (trashedIds.size > 0 ? `, ${trashedIds.size} trashed` : "") + ` in Drive for pair "${pair.label}"`
+    );
     const seenIds = /* @__PURE__ */ new Set();
     for (const entry of driveEntries)
       seenIds.add(entry.file.id);
@@ -522,10 +980,23 @@ var DriveSync = class {
           pairResult.wouldDownload.push(`${pair.label}: ${displayPath}`);
         }
       }
-      return { pairResult, seenIds };
+      return { pairResult, seenIds, trashedIds };
     }
-    const concurrency = Math.max(1, Math.min((_e = this.settings.downloadConcurrency) != null ? _e : 5, 10));
-    console.log(`${LOG4} Processing ${driveEntries.length} file(s) with concurrency=${concurrency}`);
+    let expectedBytes = 0;
+    for (const e of driveEntries) {
+      const existing = this.manifest.get(e.file.id);
+      const willDownload = !existing || (e.file.md5Checksum && existing.driveMd5 ? e.file.md5Checksum !== existing.driveMd5 : e.file.modifiedTime !== existing.driveModifiedTime);
+      if (willDownload)
+        expectedBytes += parseInt((_e = e.file.size) != null ? _e : "0", 10) || 0;
+    }
+    const space = await checkDiskSpace(expectedBytes);
+    if (!space.ok) {
+      (_f = this.bus) == null ? void 0 : _f.emit("error", { message: `Disk-space pre-flight aborted pair "${pair.label}": ${space.reason}`, context: "disk-space" });
+      console.error(`${LOG7} ${space.reason} \u2014 aborting pair "${pair.label}"`);
+      throw new Error(`Insufficient disk space for "${pair.label}": ${space.reason}`);
+    }
+    const concurrency = Math.max(1, Math.min((_g = this.settings.downloadConcurrency) != null ? _g : 5, 10));
+    console.log(`${LOG7} Processing ${driveEntries.length} file(s) with concurrency=${concurrency}`);
     const entryResults = await this.runConcurrent(
       driveEntries,
       concurrency,
@@ -534,14 +1005,17 @@ var DriveSync = class {
     for (const r of entryResults) {
       pairResult.downloaded += r.downloaded;
       pairResult.skipped += r.skipped;
-      pairResult.moved += (_f = r.moved) != null ? _f : 0;
+      pairResult.moved += (_h = r.moved) != null ? _h : 0;
       pairResult.errors += r.errors;
+      if ((_i = r.conflicts) == null ? void 0 : _i.length) {
+        pairResult.conflicts = [...(_j = pairResult.conflicts) != null ? _j : [], ...r.conflicts];
+      }
     }
-    return { pairResult, seenIds };
+    return { pairResult, seenIds, trashedIds };
   }
   // ── Phase 2: deletion pass ────────────────────────────────────────────────
-  async runDeletionPass(pair, seenIds, globalSeenIds, archivedIds) {
-    var _a, _b, _c;
+  async runDeletionPass(pair, seenIds, globalSeenIds, archivedIds, trashedIds = /* @__PURE__ */ new Set()) {
+    var _a, _b, _c, _d, _e;
     const result = { downloaded: 0, skipped: 0, errors: 0, removed: 0, archived: 0 };
     const effectiveDeletionBehavior = (_a = pair.deletionBehavior) != null ? _a : this.settings.deletionBehavior;
     const effectiveArchiveFolder = (_b = pair.archiveFolder) != null ? _b : this.settings.archiveFolder;
@@ -549,44 +1023,53 @@ var DriveSync = class {
       return result;
     }
     console.log(
-      `${LOG4} Running deletion pass for pair "${pair.label}" (behavior: ${effectiveDeletionBehavior})`
+      `${LOG7} Running deletion pass for pair "${pair.label}" (behavior: ${effectiveDeletionBehavior})`
     );
     const pairEntries = this.manifest.allForPair(pair.id);
     for (const [driveId, entry] of pairEntries) {
       if (seenIds.has(driveId))
         continue;
       if (globalSeenIds.has(driveId)) {
-        console.log(`${LOG4} File moved to another pair \u2014 skipping deletion: ${entry.vaultPath}`);
+        console.log(`${LOG7} File moved to another pair \u2014 skipping deletion: ${entry.vaultPath}`);
         continue;
       }
       if (archivedIds.has(driveId)) {
         const archiveBehavior = (_c = pair.driveArchiveBehavior) != null ? _c : effectiveDeletionBehavior;
         if (archiveBehavior === "keep") {
-          console.log(`${LOG4} Drive-archived (behavior=keep): ${entry.vaultPath}`);
+          console.log(`${LOG7} Drive-archived (behavior=keep): ${entry.vaultPath}`);
           continue;
         }
         console.log(
-          `${LOG4} Drive-archived (behavior=${archiveBehavior}): ${entry.vaultPath}`
+          `${LOG7} Drive-archived (behavior=${archiveBehavior}): ${entry.vaultPath}`
         );
         try {
           await this.removeEntry(entry, pair, archiveBehavior, effectiveArchiveFolder);
           this.manifest.delete(driveId);
+          (_d = this.bus) == null ? void 0 : _d.emit("removed", { vaultPath: entry.vaultPath, pairId: pair.id, behavior: `drive-archived:${archiveBehavior}` });
           result.archived++;
         } catch (e) {
-          console.error(`${LOG4} Failed to remove archived "${entry.vaultPath}":`, e);
+          console.error(`${LOG7} Failed to remove archived "${entry.vaultPath}":`, e);
           result.errors++;
         }
         continue;
       }
+      if (trashedIds.has(driveId)) {
+        if (!entry.driveTrashed) {
+          this.manifest.set(driveId, { ...entry, driveTrashed: true });
+        }
+        console.log(`${LOG7} In Drive trash \u2014 preserving vault copy: ${entry.vaultPath}`);
+        continue;
+      }
       if (effectiveDeletionBehavior === "keep")
         continue;
-      console.log(`${LOG4} No longer in Drive \u2014 removing: ${entry.vaultPath}`);
+      console.log(`${LOG7} No longer in Drive \u2014 removing: ${entry.vaultPath}`);
       try {
         await this.removeEntry(entry, pair, effectiveDeletionBehavior, effectiveArchiveFolder);
         this.manifest.delete(driveId);
+        (_e = this.bus) == null ? void 0 : _e.emit("removed", { vaultPath: entry.vaultPath, pairId: pair.id, behavior: effectiveDeletionBehavior });
         result.removed++;
       } catch (e) {
-        console.error(`${LOG4} Failed to remove "${entry.vaultPath}":`, e);
+        console.error(`${LOG7} Failed to remove "${entry.vaultPath}":`, e);
         result.errors++;
       }
     }
@@ -598,17 +1081,17 @@ var DriveSync = class {
     if (!folderId)
       return /* @__PURE__ */ new Set();
     try {
-      console.log(`${LOG4} Listing Drive archive folder: ${folderId}`);
+      console.log(`${LOG7} Listing Drive archive folder: ${folderId}`);
       const files = await this.listItems(
         token,
         `'${folderId}' in parents and mimeType='application/pdf' and trashed=false`,
         "files(id)"
       );
       const ids = new Set(files.map((f) => f.id));
-      console.log(`${LOG4} Drive archive folder: ${ids.size} PDF(s) found`);
+      console.log(`${LOG7} Drive archive folder: ${ids.size} PDF(s) found`);
       return ids;
     } catch (e) {
-      console.error(`${LOG4} Failed to list Drive archive folder \u2014 skipping archive detection:`, e);
+      console.error(`${LOG7} Failed to list Drive archive folder \u2014 skipping archive detection:`, e);
       return /* @__PURE__ */ new Set();
     }
   }
@@ -627,7 +1110,7 @@ var DriveSync = class {
     return results;
   }
   async processEntry(entry, pair, token, companionEnabled) {
-    var _a, _b, _c, _d, _e;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o;
     const r = { downloaded: 0, skipped: 0, errors: 0, removed: 0, moved: 0 };
     const displayPath = entry.relPath ? `${entry.relPath}/${entry.file.name}` : entry.file.name;
     try {
@@ -639,48 +1122,79 @@ var DriveSync = class {
       );
       const existing = this.manifest.get(entry.file.id);
       if (existing && existing.vaultPath !== expectedVaultPath) {
-        console.log(`${LOG4} Move detected: "${existing.vaultPath}" \u2192 "${expectedVaultPath}"`);
+        console.log(`${LOG7} Move detected: "${existing.vaultPath}" \u2192 "${expectedVaultPath}"`);
         await this.handleRename(existing, entry, pair, expectedVaultPath, companionEnabled);
       }
-      const needsDownload = !existing || entry.file.modifiedTime !== existing.driveModifiedTime;
+      if (existing == null ? void 0 : existing.userDeletedAt) {
+        const driveChanged = entry.file.modifiedTime !== existing.driveModifiedTime;
+        if (!driveChanged || !this.settings.redownloadUserDeleted) {
+          if (driveChanged) {
+            this.manifest.set(entry.file.id, { ...existing, driveModifiedTime: entry.file.modifiedTime });
+          }
+          console.log(`${LOG7} User-deleted \u2014 skipping: ${displayPath}`);
+          r.skipped++;
+          return r;
+        }
+        console.log(`${LOG7} Drive version advanced past user deletion \u2014 re-downloading: ${displayPath}`);
+        this.manifest.clearUserDeleted(entry.file.id);
+      }
+      const contentChanged = entry.file.md5Checksum && (existing == null ? void 0 : existing.driveMd5) ? entry.file.md5Checksum !== existing.driveMd5 : entry.file.modifiedTime !== (existing == null ? void 0 : existing.driveModifiedTime);
+      const needsDownload = !existing || contentChanged;
       if (needsDownload) {
-        console.log(`${LOG4} Downloading: ${displayPath}`);
-        const vaultPath = await this.downloader.download(
+        console.log(`${LOG7} Downloading: ${displayPath}`);
+        const { path: vaultPath, cacheHit } = await this.downloader.download(
           entry.file,
           token,
           pair.vaultDestFolder,
           effectiveRelPath
         );
         let transcription;
+        let pdfBytes = null;
+        const resolvedCompanionPath = (_b = (_a = existing == null ? void 0 : existing.companionPath) != null ? _a : this.companion.findCompanionByProperty(vaultPath)) != null ? _b : null;
         const gemini = this.getTranscriptionClient();
-        if (gemini) {
+        const isAutoTxDisabled = (_c = existing == null ? void 0 : existing.transcriptionDisabled) != null ? _c : false;
+        if (gemini && !isAutoTxDisabled) {
           let alreadyTranscribed = false;
-          const existingCompanionPath = (_a = existing == null ? void 0 : existing.companionPath) != null ? _a : null;
-          if (existingCompanionPath) {
-            const companionFile = this.app.vault.getAbstractFileByPath(existingCompanionPath);
+          if (resolvedCompanionPath) {
+            const companionFile = this.app.vault.getAbstractFileByPath(resolvedCompanionPath);
             if (companionFile instanceof import_obsidian3.TFile) {
-              const fm = (_b = this.app.metadataCache.getFileCache(companionFile)) == null ? void 0 : _b.frontmatter;
-              if ((fm == null ? void 0 : fm.transcribed) === true && ((_c = fm == null ? void 0 : fm.sourceDriveModifiedTime) != null ? _c : fm == null ? void 0 : fm.lastUpdate) === entry.file.modifiedTime) {
+              const fm = (_d = this.app.metadataCache.getFileCache(companionFile)) == null ? void 0 : _d.frontmatter;
+              if ((fm == null ? void 0 : fm.transcribed) === true && ((_e = fm == null ? void 0 : fm.sourceDriveModifiedTime) != null ? _e : fm == null ? void 0 : fm.lastUpdate) === entry.file.modifiedTime) {
                 alreadyTranscribed = true;
-                console.log(`${LOG4} Transcription skipped \u2014 already transcribed for this Drive version: ${vaultPath}`);
+                console.log(`${LOG7} Transcription skipped \u2014 already transcribed for this Drive version: ${vaultPath}`);
               }
             }
           }
           if (!alreadyTranscribed) {
             try {
-              const pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
+              pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
               transcription = await gemini.transcribePdf(pdfBytes);
             } catch (e) {
-              console.error(`${LOG4} Gemini transcription failed for "${vaultPath}":`, e);
+              console.error(`${LOG7} Gemini transcription failed for "${vaultPath}":`, e);
             }
+          }
+        } else if ((_f = this.transcriptionStore) == null ? void 0 : _f.get(entry.file.id)) {
+          try {
+            pdfBytes = await this.app.vault.adapter.readBinary(vaultPath);
+          } catch (e) {
+            console.error(`${LOG7} Failed to read PDF for page-count update:`, e);
           }
         }
         let companionPath = null;
+        let companionMtime;
         if (companionEnabled) {
-          const currentCompanionPath = (_d = existing == null ? void 0 : existing.companionPath) != null ? _d : null;
-          if (currentCompanionPath) {
-            await this.companion.update(currentCompanionPath, entry.file, pair, vaultPath, transcription);
-            companionPath = currentCompanionPath;
+          if (resolvedCompanionPath) {
+            const { conflictPath } = await this.companion.update(
+              resolvedCompanionPath,
+              entry.file,
+              pair,
+              vaultPath,
+              transcription,
+              existing == null ? void 0 : existing.companionMtime
+            );
+            if (conflictPath)
+              r.conflicts = [...(_g = r.conflicts) != null ? _g : [], conflictPath];
+            companionPath = resolvedCompanionPath;
           } else {
             companionPath = await this.companion.create(
               entry.file,
@@ -690,35 +1204,77 @@ var DriveSync = class {
               transcription
             );
           }
+          if (companionPath) {
+            const stat = await this.app.vault.adapter.stat(companionPath);
+            if (stat)
+              companionMtime = stat.mtime;
+          }
         }
+        const info = pdfBytes ? await this.analyzeBytes(pdfBytes) : null;
+        const contentHash = (_h = info == null ? void 0 : info.hash) != null ? _h : existing == null ? void 0 : existing.contentHash;
         this.manifest.set(entry.file.id, {
           vaultPath,
           companionPath,
           driveModifiedTime: entry.file.modifiedTime,
           driveCreatedTime: entry.file.createdTime,
-          pairId: pair.id
+          pairId: pair.id,
+          companionMtime,
+          transcriptionDisabled: existing == null ? void 0 : existing.transcriptionDisabled,
+          driveMd5: entry.file.md5Checksum,
+          contentHash
         });
-        if (this.automationEngine) {
-          const automationCompanionPath = (_e = companionPath != null ? companionPath : existing == null ? void 0 : existing.companionPath) != null ? _e : null;
-          await this.automationEngine.runForFile(
-            vaultPath,
-            automationCompanionPath,
-            entry.file.createdTime,
-            transcription,
-            entry.file.id,
-            entry.file.modifiedTime
-          );
+        if (this.transcriptionStore && info) {
+          if (transcription !== void 0) {
+            const finalCompanionPath = companionPath != null ? companionPath : resolvedCompanionPath;
+            const dest = finalCompanionPath ? { type: "companion", path: finalCompanionPath, transcribedAt: new Date().toISOString() } : { type: "note", path: vaultPath, transcribedAt: new Date().toISOString() };
+            this.transcriptionStore.recordTranscription(
+              entry.file.id,
+              vaultPath,
+              info.hash,
+              info.pageCount,
+              entry.file.modifiedTime,
+              dest
+            );
+          } else {
+            this.transcriptionStore.updateCurrentState(
+              entry.file.id,
+              info.pageCount,
+              entry.file.modifiedTime
+            );
+          }
         }
-        console.log(`${LOG4} Downloaded: ${displayPath}`);
+        if (this.automationEngine) {
+          const automationCompanionPath = (_i = companionPath != null ? companionPath : resolvedCompanionPath) != null ? _i : null;
+          await this.automationEngine.runForFile({
+            vaultPath,
+            companionPath: automationCompanionPath,
+            driveCreatedTime: entry.file.createdTime,
+            transcription,
+            driveFileId: entry.file.id,
+            driveModifiedTime: entry.file.modifiedTime
+          });
+        }
+        console.log(`${LOG7} Downloaded: ${displayPath}${cacheHit ? " (cache hit)" : ""}`);
+        (_j = this.bus) == null ? void 0 : _j.emit("downloaded", { vaultPath, pairId: pair.id, driveFileId: entry.file.id, cacheHit });
+        if ((_k = r.conflicts) == null ? void 0 : _k.length) {
+          for (const cp of r.conflicts) {
+            (_l = this.bus) == null ? void 0 : _l.emit("conflict", { vaultPath, backupPath: cp });
+          }
+        }
         r.downloaded++;
       } else if (existing && existing.vaultPath !== expectedVaultPath) {
+        (_m = this.bus) == null ? void 0 : _m.emit("moved", { fromPath: existing.vaultPath, toPath: expectedVaultPath, pairId: pair.id });
         r.moved++;
       } else {
-        console.log(`${LOG4} Up to date, skipping: ${displayPath}`);
+        if (existing == null ? void 0 : existing.driveTrashed) {
+          this.manifest.set(entry.file.id, { ...existing, driveTrashed: void 0 });
+        }
+        console.log(`${LOG7} Up to date, skipping: ${displayPath}`);
+        (_o = this.bus) == null ? void 0 : _o.emit("skipped", { vaultPath: (_n = existing == null ? void 0 : existing.vaultPath) != null ? _n : expectedVaultPath, pairId: pair.id, reason: "up to date" });
         r.skipped++;
       }
     } catch (e) {
-      console.error(`${LOG4} Failed to sync "${displayPath}":`, e);
+      console.error(`${LOG7} Failed to sync "${displayPath}":`, e);
       r.errors++;
     }
     return r;
@@ -727,9 +1283,9 @@ var DriveSync = class {
     const oldTFile = this.app.vault.getAbstractFileByPath(existing.vaultPath);
     if (oldTFile instanceof import_obsidian3.TFile) {
       await this.app.fileManager.renameFile(oldTFile, newVaultPath);
-      console.log(`${LOG4} PDF renamed in vault: ${existing.vaultPath} \u2192 ${newVaultPath}`);
+      console.log(`${LOG7} PDF renamed in vault: ${existing.vaultPath} \u2192 ${newVaultPath}`);
     } else {
-      console.warn(`${LOG4} PDF not found in vault for rename: ${existing.vaultPath}`);
+      console.warn(`${LOG7} PDF not found in vault for rename: ${existing.vaultPath}`);
     }
     if (existing.companionPath && companionEnabled) {
       const newCompanionPath = this.companion.companionPath(
@@ -763,7 +1319,7 @@ var DriveSync = class {
       if (pdfFile instanceof import_obsidian3.TFile) {
         await this.removeFile(pdfFile, entry.vaultPath, pair, effectivePdfBehavior, archiveFolder);
       } else {
-        console.warn(`${LOG4} File not found in vault \u2014 skipping remove: ${entry.vaultPath}`);
+        console.warn(`${LOG7} File not found in vault \u2014 skipping remove: ${entry.vaultPath}`);
       }
     }
     if (entry.companionPath && !keepCompanion) {
@@ -773,20 +1329,33 @@ var DriveSync = class {
         await this.removeFile(compFile, entry.companionPath, pair, companionBehavior, archiveFolder);
       } else {
         console.warn(
-          `${LOG4} Companion note not found \u2014 skipping remove: ${entry.companionPath}`
+          `${LOG7} Companion note not found \u2014 skipping remove: ${entry.companionPath}`
         );
       }
     }
   }
   async removeFile(file, filePath, pair, deletionBehavior, archiveFolder) {
     if (deletionBehavior === "delete") {
-      console.log(`${LOG4} Trashing: ${filePath}`);
+      if (this.recycle) {
+        try {
+          const bytes = await this.app.vault.adapter.readBinary(filePath);
+          await this.recycle.backup(filePath, bytes, {
+            driveFileId: null,
+            pairId: pair.id,
+            action: "delete",
+            syncRunId: this.currentSyncRunId
+          });
+        } catch (e) {
+          console.error(`${LOG7} Recycle backup before trash failed for "${filePath}":`, e);
+        }
+      }
+      console.log(`${LOG7} Trashing: ${filePath}`);
       await this.app.vault.trash(file, true);
     } else if (deletionBehavior === "archive") {
       const relToRoot = filePath.slice(pair.vaultDestFolder.length);
       const archivePath = `${archiveFolder}${relToRoot}`;
       const archiveDir = archivePath.substring(0, archivePath.lastIndexOf("/"));
-      console.log(`${LOG4} Archiving ${filePath} \u2192 ${archivePath}`);
+      console.log(`${LOG7} Archiving ${filePath} \u2192 ${archivePath}`);
       await this.ensureFolder(archiveDir);
       await this.app.fileManager.renameFile(file, archivePath);
     }
@@ -807,13 +1376,13 @@ var DriveSync = class {
     return `${folder}/${safeName}`;
   }
   async collectFiles(folderId, relPath, token, excludedSubfolders = [], excludeRootFiles = false, rootFilesOnly = false) {
-    console.log(`${LOG4} Listing folder id=${folderId} relPath="${relPath}"`);
+    console.log(`${LOG7} Listing folder id=${folderId} relPath="${relPath}"`);
     const isRoot = relPath === "";
     const [files, subfolders] = await Promise.all([
       this.listItems(
         token,
-        `'${folderId}' in parents and mimeType='application/pdf' and trashed=false`,
-        "files(id,name,modifiedTime,createdTime,size)"
+        `'${folderId}' in parents and mimeType='application/pdf'`,
+        "files(id,name,modifiedTime,createdTime,size,trashed,md5Checksum)"
       ),
       rootFilesOnly && !isRoot ? Promise.resolve([]) : this.listItems(
         token,
@@ -822,17 +1391,17 @@ var DriveSync = class {
       )
     ]);
     console.log(
-      `${LOG4} Folder "${relPath || "root"}": ${files.length} PDF(s), ${subfolders.length} subfolder(s)`
+      `${LOG7} Folder "${relPath || "root"}": ${files.length} PDF(s), ${subfolders.length} subfolder(s)`
     );
-    const entries = excludeRootFiles && isRoot ? (console.log(`${LOG4} Skipping ${files.length} root-level file(s) (excludeRootFiles=true)`), []) : files.map((f) => ({ file: f, relPath }));
+    const entries = excludeRootFiles && isRoot ? (console.log(`${LOG7} Skipping ${files.length} root-level file(s) (excludeRootFiles=true)`), []) : files.map((f) => ({ file: f, relPath }));
     if (!rootFilesOnly) {
       for (const folder of subfolders) {
         const childRelPath = relPath ? `${relPath}/${folder.name}` : folder.name;
         if (excludedSubfolders.includes(folder.name) || excludedSubfolders.includes(childRelPath)) {
-          console.log(`${LOG4} Skipping excluded subfolder: ${childRelPath}`);
+          console.log(`${LOG7} Skipping excluded subfolder: ${childRelPath}`);
           continue;
         }
-        console.log(`${LOG4} Descending into subfolder: ${childRelPath}`);
+        console.log(`${LOG7} Descending into subfolder: ${childRelPath}`);
         const childEntries = await this.collectFiles(
           folder.id,
           childRelPath,
@@ -845,6 +1414,29 @@ var DriveSync = class {
       }
     }
     return entries;
+  }
+  /** Fetch with exponential backoff — retries on 429 and 5xx responses. */
+  async fetchWithRetry(url, options, maxRetries = 3) {
+    let lastError;
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      if (attempt > 0) {
+        const delay = 1e3 * Math.pow(2, attempt - 1);
+        console.log(`${LOG7} Drive API retry ${attempt}/${maxRetries} after ${delay}ms`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+      try {
+        const resp = await fetch(url, options);
+        if (resp.ok || resp.status >= 400 && resp.status < 500 && resp.status !== 429) {
+          return resp;
+        }
+        lastError = new Error(`HTTP ${resp.status}`);
+        console.warn(`${LOG7} Drive API returned ${resp.status} \u2014 will retry`);
+      } catch (e) {
+        lastError = e;
+        console.warn(`${LOG7} Drive API fetch failed \u2014 will retry:`, e);
+      }
+    }
+    throw lastError;
   }
   async listItems(token, query, fields) {
     var _a;
@@ -860,18 +1452,18 @@ var DriveSync = class {
       });
       if (pageToken)
         params.set("pageToken", pageToken);
-      console.log(`${LOG4} GET ${FILES_API} page=${page} query="${query}"`);
-      const resp = await fetch(`${FILES_API}?${params}`, {
+      console.log(`${LOG7} GET ${FILES_API} page=${page} query="${query}"`);
+      const resp = await this.fetchWithRetry(`${FILES_API}?${params}`, {
         headers: { Authorization: `Bearer ${token}` }
       });
       if (!resp.ok) {
         const body = await resp.text();
-        console.error(`${LOG4} files.list failed \u2014 status ${resp.status}:`, body);
+        console.error(`${LOG7} files.list failed \u2014 status ${resp.status}:`, body);
         throw new Error(`Drive files.list failed: ${resp.status} ${body}`);
       }
       const data = await resp.json();
       const batch = (_a = data.files) != null ? _a : [];
-      console.log(`${LOG4} Page ${page} returned ${batch.length} item(s)`);
+      console.log(`${LOG7} Page ${page} returned ${batch.length} item(s)`);
       items.push(...batch);
       pageToken = data.nextPageToken;
     } while (pageToken);
@@ -884,7 +1476,7 @@ var DriveSync = class {
       current = current ? `${current}/${seg}` : seg;
       const exists = await this.app.vault.adapter.exists(current);
       if (!exists) {
-        console.log(`${LOG4} Creating folder: ${current}`);
+        console.log(`${LOG7} Creating folder: ${current}`);
         await this.app.vault.createFolder(current);
       }
     }
@@ -892,14 +1484,18 @@ var DriveSync = class {
 };
 
 // sync/DownloadManager.ts
-var LOG5 = "[DriveSync/Download]";
+var LOG8 = "[DriveSync/Download]";
 var DownloadManager = class {
-  constructor(app) {
+  constructor(app, cache) {
     this.app = app;
+    this.cache = cache;
+  }
+  setCache(cache) {
+    this.cache = cache;
   }
   /**
    * Downloads a Drive file to the vault.
-   * Returns the vault-relative path where the file was written.
+   * Returns the vault-relative path and whether the bytes came from the cache.
    */
   async download(file, token, destFolder, relPath) {
     var _a;
@@ -907,8 +1503,15 @@ var DownloadManager = class {
     await this.ensureFolder(folderPath);
     const safeName = this.sanitizeFilename(file.name);
     const localPath = `${folderPath}/${safeName}`;
+    if (this.cache && file.md5Checksum && await this.cache.has(file.md5Checksum)) {
+      const restored = await this.cache.restore(file.md5Checksum, localPath);
+      if (restored) {
+        console.log(`${LOG8} Restored "${file.name}" from cache \u2192 ${localPath}`);
+        return { path: localPath, cacheHit: true };
+      }
+    }
     console.log(
-      `${LOG5} Fetching "${file.name}" (id=${file.id}, size=${(_a = file.size) != null ? _a : "unknown"}) \u2192 ${localPath}`
+      `${LOG8} Fetching "${file.name}" (id=${file.id}, size=${(_a = file.size) != null ? _a : "unknown"}) \u2192 ${localPath}`
     );
     const resp = await fetch(
       `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`,
@@ -917,23 +1520,26 @@ var DownloadManager = class {
     if (!resp.ok) {
       const body = await resp.text();
       console.error(
-        `${LOG5} Download failed for "${file.name}" \u2014 status ${resp.status}:`,
+        `${LOG8} Download failed for "${file.name}" \u2014 status ${resp.status}:`,
         body
       );
       throw new Error(`Download failed for "${file.name}": HTTP ${resp.status}`);
     }
     const buffer = await resp.arrayBuffer();
-    console.log(`${LOG5} Received ${buffer.byteLength} bytes for "${file.name}"`);
+    console.log(`${LOG8} Received ${buffer.byteLength} bytes for "${file.name}"`);
     const exists = await this.app.vault.adapter.exists(localPath);
     if (exists) {
-      console.log(`${LOG5} Overwriting existing file: ${localPath}`);
+      console.log(`${LOG8} Overwriting existing file: ${localPath}`);
       await this.app.vault.adapter.writeBinary(localPath, buffer);
     } else {
-      console.log(`${LOG5} Creating new file: ${localPath}`);
+      console.log(`${LOG8} Creating new file: ${localPath}`);
       await this.app.vault.createBinary(localPath, buffer);
     }
-    console.log(`${LOG5} Write complete: ${localPath}`);
-    return localPath;
+    if (this.cache && file.md5Checksum) {
+      await this.cache.store(file.md5Checksum, buffer);
+    }
+    console.log(`${LOG8} Write complete: ${localPath}`);
+    return { path: localPath, cacheHit: false };
   }
   async ensureFolder(folderPath) {
     const segments = folderPath.split("/").filter(Boolean);
@@ -942,7 +1548,7 @@ var DownloadManager = class {
       current = current ? `${current}/${seg}` : seg;
       const exists = await this.app.vault.adapter.exists(current);
       if (!exists) {
-        console.log(`${LOG5} Creating folder: ${current}`);
+        console.log(`${LOG8} Creating folder: ${current}`);
         await this.app.vault.createFolder(current);
       }
     }
@@ -961,7 +1567,12 @@ var Scheduler = class {
     this.stop();
     if (intervalMinutes <= 0)
       return;
-    const ms = intervalMinutes * 60 * 1e3;
+    const MIN_MS = 60 * 1e3;
+    let ms = intervalMinutes * 60 * 1e3;
+    if (ms < MIN_MS) {
+      console.warn(`[DriveSync] Sync interval below 60s \u2014 clamping to 60s.`);
+      ms = MIN_MS;
+    }
     this.intervalId = window.setInterval(async () => {
       try {
         await callback();
@@ -984,38 +1595,59 @@ var Scheduler = class {
 
 // sync/SyncManifest.ts
 var MANIFEST_PATH = ".obsidian/drive-sync-manifest.json";
-var LOG6 = "[DriveSync/Manifest]";
-var SyncManifestStore = class {
-  constructor(app) {
+var BACKUP_DIR = ".obsidian/drive-sync-manifest.backups";
+var LOG9 = "[DriveSync/Manifest]";
+var MANIFEST_SCHEMA_VERSION = 1;
+var MAX_BACKUPS = 20;
+var JsonManifestStore = class {
+  constructor(app, bus) {
     this.app = app;
+    this.bus = bus;
     this.data = {};
+  }
+  setBus(bus) {
+    this.bus = bus;
   }
   async load() {
     try {
       const exists = await this.app.vault.adapter.exists(MANIFEST_PATH);
       if (!exists) {
-        console.log(`${LOG6} No manifest found \u2014 starting fresh`);
+        console.log(`${LOG9} No manifest found \u2014 starting fresh`);
         this.data = {};
         return;
       }
       const raw = await this.app.vault.adapter.read(MANIFEST_PATH);
-      this.data = JSON.parse(raw);
-      console.log(`${LOG6} Loaded ${Object.keys(this.data).length} manifest entries`);
+      const parsed = JSON.parse(raw);
+      this.data = parsed && parsed.__schemaVersion && parsed.entries ? parsed.entries : parsed;
+      console.log(`${LOG9} Loaded ${Object.keys(this.data).length} manifest entries`);
     } catch (e) {
-      console.error(`${LOG6} Failed to load manifest \u2014 starting fresh:`, e);
+      console.error(`${LOG9} Failed to load manifest \u2014 starting fresh:`, e);
       this.data = {};
     }
   }
   async save() {
+    var _a;
+    const tmpPath = MANIFEST_PATH + ".tmp";
+    const content = JSON.stringify(this.data, null, 2);
     try {
-      await this.app.vault.adapter.write(
-        MANIFEST_PATH,
-        JSON.stringify(this.data, null, 2)
-      );
-      console.log(`${LOG6} Saved ${Object.keys(this.data).length} manifest entries`);
+      await this.app.vault.adapter.write(tmpPath, content);
+      await this.app.vault.adapter.rename(tmpPath, MANIFEST_PATH);
+      console.log(`${LOG9} Saved ${Object.keys(this.data).length} manifest entries`);
     } catch (e) {
-      console.error(`${LOG6} Failed to save manifest:`, e);
+      console.error(`${LOG9} Atomic save failed \u2014 falling back to direct write:`, e);
+      try {
+        await this.app.vault.adapter.remove(tmpPath);
+      } catch (e2) {
+      }
+      try {
+        await this.app.vault.adapter.write(MANIFEST_PATH, content);
+        console.log(`${LOG9} Saved ${Object.keys(this.data).length} manifest entries (direct write)`);
+      } catch (e2) {
+        console.error(`${LOG9} Failed to save manifest:`, e2);
+      }
     }
+    await this.writeBackup(content).catch((e) => console.error(`${LOG9} Backup write failed:`, e));
+    (_a = this.bus) == null ? void 0 : _a.emit("manifest-write", { entryCount: Object.keys(this.data).length });
   }
   get(driveFileId) {
     return this.data[driveFileId];
@@ -1050,34 +1682,93 @@ var SyncManifestStore = class {
     var _a, _b;
     return (_b = (_a = this.data[driveFileId]) == null ? void 0 : _a.automationRuns) == null ? void 0 : _b[automationId];
   }
-  /**
-   * Update vaultPath or companionPath in-memory when the user renames a file in the vault.
-   * Returns true if an entry was updated.
-   */
+  markUserDeleted(vaultPath) {
+    const byVault = this.findByVaultPath(vaultPath);
+    if (!byVault)
+      return false;
+    const [id, entry] = byVault;
+    this.data[id] = { ...entry, userDeletedAt: new Date().toISOString() };
+    console.log(`${LOG9} Marked as user-deleted: "${vaultPath}"`);
+    return true;
+  }
+  clearUserDeleted(driveFileId) {
+    const entry = this.data[driveFileId];
+    if (entry)
+      delete entry.userDeletedAt;
+  }
   healRename(oldPath, newPath) {
     const byVault = this.findByVaultPath(oldPath);
     if (byVault) {
       const [id, entry] = byVault;
       this.data[id] = { ...entry, vaultPath: newPath };
-      console.log(`${LOG6} Healed vault rename: "${oldPath}" \u2192 "${newPath}"`);
+      console.log(`${LOG9} Healed vault rename: "${oldPath}" \u2192 "${newPath}"`);
       return true;
     }
     const byCompanion = this.findByCompanionPath(oldPath);
     if (byCompanion) {
       const [id, entry] = byCompanion;
       this.data[id] = { ...entry, companionPath: newPath };
-      console.log(`${LOG6} Healed companion rename: "${oldPath}" \u2192 "${newPath}"`);
+      console.log(`${LOG9} Healed companion rename: "${oldPath}" \u2192 "${newPath}"`);
       return true;
     }
     return false;
   }
+  // ── Phase 13.2: schema-versioned backups ────────────────────────────────
+  async writeBackup(content) {
+    if (!await this.app.vault.adapter.exists(BACKUP_DIR)) {
+      await this.app.vault.adapter.mkdir(BACKUP_DIR);
+    }
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const wrapped = JSON.stringify(
+      { __schemaVersion: MANIFEST_SCHEMA_VERSION, savedAt: new Date().toISOString(), entries: JSON.parse(content) },
+      null,
+      2
+    );
+    await this.app.vault.adapter.write(`${BACKUP_DIR}/${ts}.json`, wrapped);
+    await this.gcBackups();
+  }
+  async gcBackups() {
+    const names = await this.listBackups();
+    if (names.length <= MAX_BACKUPS)
+      return;
+    const toRemove = names.slice(0, names.length - MAX_BACKUPS);
+    for (const name of toRemove) {
+      await this.app.vault.adapter.remove(`${BACKUP_DIR}/${name}`).catch(() => void 0);
+    }
+  }
+  async listBackups() {
+    if (!await this.app.vault.adapter.exists(BACKUP_DIR))
+      return [];
+    const listing = await this.app.vault.adapter.list(BACKUP_DIR);
+    return listing.files.map((f) => {
+      var _a;
+      return (_a = f.split("/").pop()) != null ? _a : f;
+    }).filter((n) => n.endsWith(".json")).sort();
+  }
+  async restoreBackup(name) {
+    var _a;
+    const path = `${BACKUP_DIR}/${name}`;
+    const raw = await this.app.vault.adapter.read(path);
+    const parsed = JSON.parse(raw);
+    const entries = (_a = parsed.entries) != null ? _a : parsed;
+    this.data = entries;
+    await this.save();
+    console.log(`${LOG9} Restored manifest from backup: ${name}`);
+  }
 };
+function createManifestStore(app, settings, bus) {
+  if (settings.useSqliteManifest) {
+    console.warn(`${LOG9} useSqliteManifest is on, but the SQLite backend is not bundled yet \u2014 using JSON store.`);
+  }
+  return new JsonManifestStore(app, bus);
+}
 
 // sync/CompanionNoteManager.ts
 var import_obsidian4 = require("obsidian");
-var LOG7 = "[DriveSync/Companion]";
+var LOG10 = "[DriveSync/Companion]";
 var DEFAULT_TEMPLATE = `---
 processed: false
+companion: "[[{{fileName}}]]"
 companion-of: "[[{{sourceVaultStem}}]]"
 sourceVaultPath: "{{sourceVaultPath}}"
 sourceDriveModifiedTime: "{{sourceDriveModifiedTime}}"
@@ -1153,7 +1844,7 @@ var CompanionNoteManager = class {
    */
   async create(file, pair, relPath, pdfVaultPath, transcription) {
     const notePath = this.companionPath(pair, relPath, file.name);
-    console.log(`${LOG7} Creating companion note: ${notePath}`);
+    console.log(`${LOG10} Creating companion note: ${notePath}`);
     const template = await this.loadTemplate(pair);
     const templateHasTranscription = template.includes("{{transcription}}");
     let content = this.renderTemplate(template, file, pair, relPath, pdfVaultPath, transcription);
@@ -1163,7 +1854,7 @@ var CompanionNoteManager = class {
     await this.ensureFolder(notePath);
     const exists = await this.app.vault.adapter.exists(notePath);
     if (exists) {
-      console.log(`${LOG7} Companion note already exists \u2014 adopting: ${notePath}`);
+      console.log(`${LOG10} Companion note already exists \u2014 adopting: ${notePath}`);
       await this.update(notePath, file, pair, pdfVaultPath, transcription);
     } else {
       await this.app.vault.create(notePath, content);
@@ -1171,6 +1862,7 @@ var CompanionNoteManager = class {
       if (createdFile instanceof import_obsidian4.TFile) {
         await this.app.fileManager.processFrontMatter(createdFile, (fm) => {
           const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
+          fm["companion"] = `[[${file.name}]]`;
           fm["companion-of"] = `[[${stem}]]`;
           fm["sourceVaultPath"] = pdfVaultPath;
           fm["sourceDriveModifiedTime"] = file.modifiedTime;
@@ -1179,7 +1871,7 @@ var CompanionNoteManager = class {
         });
       }
     }
-    console.log(`${LOG7} Companion note created: ${notePath}`);
+    console.log(`${LOG10} Companion note created: ${notePath}`);
     return notePath;
   }
   /**
@@ -1187,15 +1879,38 @@ var CompanionNoteManager = class {
    * Preserves user-added frontmatter; refreshes sync-tracking fields.
    * Migrates legacy `lastUpdate` → `sourceDriveModifiedTime` on first write.
    * If `transcription` is provided, updates or appends the ## Transcription section and sets transcribed: true.
+   * If `knownMtime` is provided, detects concurrent edits: creates a `.conflict-<ts>.md` backup
+   * when the file's current mtime exceeds the last-known mtime.
    */
-  async update(companionNotePath, file, pair, pdfVaultPath, transcription) {
-    console.log(`${LOG7} Updating companion note frontmatter: ${companionNotePath}`);
+  async update(companionNotePath, file, pair, pdfVaultPath, transcription, knownMtime) {
+    var _a;
+    console.log(`${LOG10} Updating companion note frontmatter: ${companionNotePath}`);
     const tFile = this.app.vault.getAbstractFileByPath(companionNotePath);
     if (!(tFile instanceof import_obsidian4.TFile)) {
-      console.warn(`${LOG7} Companion note not found in vault \u2014 skipping update: ${companionNotePath}`);
-      return;
+      console.warn(`${LOG10} Companion note not found in vault \u2014 skipping update: ${companionNotePath}`);
+      return { conflictPath: null };
+    }
+    let conflictPath = null;
+    if (knownMtime !== void 0) {
+      const stat = await this.app.vault.adapter.stat(companionNotePath);
+      if (stat && stat.mtime > knownMtime) {
+        const policy = (_a = this.settings.conflictPolicy) != null ? _a : "save-both";
+        if (policy === "keep-vault") {
+          console.log(`${LOG10} Conflict detected \u2014 keeping vault version (policy: keep-vault): ${companionNotePath}`);
+          return { conflictPath: null, skipped: true };
+        } else if (policy === "take-drive") {
+          console.log(`${LOG10} Conflict detected \u2014 taking Drive version (policy: take-drive): ${companionNotePath}`);
+        } else {
+          conflictPath = companionNotePath.replace(/\.md$/i, `.conflict-${Date.now()}.md`);
+          console.log(`${LOG10} Companion edited since last sync \u2014 creating conflict backup: ${conflictPath}`);
+          const currentContent = await this.app.vault.read(tFile);
+          await this.ensureFolder(conflictPath);
+          await this.app.vault.create(conflictPath, currentContent);
+        }
+      }
     }
     await this.app.fileManager.processFrontMatter(tFile, (fm) => {
+      var _a2;
       if ("lastUpdate" in fm && !("sourceDriveModifiedTime" in fm)) {
         fm["sourceDriveModifiedTime"] = fm["lastUpdate"];
         delete fm["lastUpdate"];
@@ -1205,7 +1920,9 @@ var CompanionNoteManager = class {
       fm["syncDate"] = new Date().toISOString();
       fm["pairLabel"] = pair.label;
       if (pdfVaultPath) {
+        const pdfName = (_a2 = pdfVaultPath.split("/").pop()) != null ? _a2 : pdfVaultPath;
         const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
+        fm["companion"] = `[[${pdfName}]]`;
         fm["companion-of"] = `[[${stem}]]`;
         fm["sourceVaultPath"] = pdfVaultPath;
       }
@@ -1215,21 +1932,22 @@ var CompanionNoteManager = class {
     if (transcription) {
       await this.updateTranscriptionSection(tFile, transcription);
     }
-    console.log(`${LOG7} Companion note frontmatter updated: ${companionNotePath}`);
+    console.log(`${LOG10} Companion note frontmatter updated: ${companionNotePath}`);
+    return { conflictPath };
   }
   /**
    * Rename a companion note (called when its associated PDF is renamed in Drive).
    */
   async rename(oldPath, newPath) {
-    console.log(`${LOG7} Renaming companion note: ${oldPath} \u2192 ${newPath}`);
+    console.log(`${LOG10} Renaming companion note: ${oldPath} \u2192 ${newPath}`);
     const tFile = this.app.vault.getAbstractFileByPath(oldPath);
     if (!(tFile instanceof import_obsidian4.TFile)) {
-      console.warn(`${LOG7} Companion note not found for rename: ${oldPath}`);
+      console.warn(`${LOG10} Companion note not found for rename: ${oldPath}`);
       return;
     }
     await this.ensureFolder(newPath);
     await this.app.fileManager.renameFile(tFile, newPath);
-    console.log(`${LOG7} Companion note renamed to: ${newPath}`);
+    console.log(`${LOG10} Companion note renamed to: ${newPath}`);
   }
   // ── Private helpers ───────────────────────────────────────────────────────
   /**
@@ -1268,14 +1986,14 @@ var CompanionNoteManager = class {
     try {
       const exists = await this.app.vault.adapter.exists(templatePath);
       if (!exists) {
-        console.warn(`${LOG7} Template file not found at "${templatePath}" \u2014 using default`);
+        console.warn(`${LOG10} Template file not found at "${templatePath}" \u2014 using default`);
         return DEFAULT_TEMPLATE;
       }
       const content = await this.app.vault.adapter.read(templatePath);
-      console.log(`${LOG7} Loaded template from: ${templatePath}`);
+      console.log(`${LOG10} Loaded template from: ${templatePath}`);
       return content;
     } catch (e) {
-      console.error(`${LOG7} Failed to read template \u2014 using default:`, e);
+      console.error(`${LOG10} Failed to read template \u2014 using default:`, e);
       return DEFAULT_TEMPLATE;
     }
   }
@@ -1308,7 +2026,87 @@ var CompanionNoteManager = class {
       newContent = content.trimEnd() + "\n\n" + header + "\n\n" + transcription + "\n";
     }
     await this.app.vault.modify(tFile, newContent);
-    console.log(`${LOG7} Transcription section updated in: ${tFile.path}`);
+    console.log(`${LOG10} Transcription section updated in: ${tFile.path}`);
+  }
+  /**
+   * Create a companion note for any vault file — not just Drive-tracked PDFs.
+   * The note gets frontmatter: companion, companion-of, sourceVaultPath, created.
+   *
+   * @param file      The vault file to create a companion for.
+   * @param placement "alongside" = same folder as file; "root" = vault root.
+   * @returns         The vault path of the created (or adopted) companion note.
+   */
+  async createForArbitraryFile(file, placement) {
+    var _a, _b;
+    const stem = file.basename;
+    let notePath;
+    if (placement === "root") {
+      notePath = `${stem}.md`;
+    } else {
+      const dir = (_b = (_a = file.parent) == null ? void 0 : _a.path) != null ? _b : "";
+      notePath = dir ? `${dir}/${stem}.md` : `${stem}.md`;
+    }
+    await this.ensureFolder(notePath);
+    const exists = await this.app.vault.adapter.exists(notePath);
+    if (exists) {
+      const tFile = this.app.vault.getAbstractFileByPath(notePath);
+      if (tFile instanceof import_obsidian4.TFile) {
+        await this.app.fileManager.processFrontMatter(tFile, (fm) => {
+          fm["companion"] = `[[${file.name}]]`;
+          fm["companion-of"] = `[[${stem}]]`;
+          fm["sourceVaultPath"] = file.path;
+        });
+      }
+    } else {
+      const content = `---
+companion: "[[${file.name}]]"
+companion-of: "[[${stem}]]"
+sourceVaultPath: "${file.path}"
+created: "${new Date().toISOString()}"
+---
+
+# ${stem}
+
+## Notes
+
+`;
+      await this.app.vault.create(notePath, content);
+    }
+    console.log(`${LOG10} Companion note created for arbitrary file: ${notePath}`);
+    return notePath;
+  }
+  /**
+   * Scan vault notes for one that declares itself a companion of the given PDF
+   * via the `companion` frontmatter property, e.g. companion: "[[Link File.pdf]]".
+   * Matches by filename (with or without extension) or full vault path.
+   * Returns the note's vault path if found, null otherwise.
+   */
+  findCompanionByProperty(pdfVaultPath) {
+    var _a, _b;
+    const pdfName = (_a = pdfVaultPath.split("/").pop()) != null ? _a : "";
+    const pdfStem = pdfName.replace(/\.[^.]+$/, "");
+    const pdfPathStem = pdfVaultPath.replace(/\.[^.]+$/, "");
+    for (const file of this.app.vault.getMarkdownFiles()) {
+      const fm = (_b = this.app.metadataCache.getFileCache(file)) == null ? void 0 : _b.frontmatter;
+      const raw = fm == null ? void 0 : fm.companion;
+      if (raw == null)
+        continue;
+      let linkTarget = null;
+      if (typeof raw === "string") {
+        const m = raw.match(/^\[\[(.+?)\]\]$/);
+        linkTarget = m ? m[1] : null;
+      } else if (typeof raw === "object" && typeof raw.link === "string") {
+        linkTarget = raw.link;
+      }
+      if (!linkTarget)
+        continue;
+      const t = linkTarget.split("|")[0].trim();
+      if (t === pdfName || t === pdfStem || t === pdfVaultPath || t === pdfPathStem) {
+        console.log(`${LOG10} Found companion via property: ${file.path} \u2192 ${pdfVaultPath}`);
+        return file.path;
+      }
+    }
+    return null;
   }
   async ensureFolder(filePath) {
     const dir = filePath.substring(0, filePath.lastIndexOf("/"));
@@ -1320,7 +2118,7 @@ var CompanionNoteManager = class {
       current = current ? `${current}/${seg}` : seg;
       const exists = await this.app.vault.adapter.exists(current);
       if (!exists) {
-        console.log(`${LOG7} Creating folder: ${current}`);
+        console.log(`${LOG10} Creating folder: ${current}`);
         await this.app.vault.createFolder(current);
       }
     }
@@ -1374,9 +2172,128 @@ var SyncLogger = class {
   }
 };
 
+// sync/SyncLog.ts
+var LOG_PATH = ".obsidian/drive-sync.log";
+var MAX_SIZE_BYTES = 10 * 1024 * 1024;
+var MAX_ROTATIONS = 3;
+var SyncActivityLog = class {
+  constructor(app, settings) {
+    this.app = app;
+    this.settings = settings;
+  }
+  updateSettings(settings) {
+    this.settings = settings;
+  }
+  async log(entry) {
+    var _a;
+    if (!this.settings.syncActivityLogEnabled)
+      return;
+    const minLevel = (_a = this.settings.syncActivityLogLevel) != null ? _a : "info";
+    if (!this.levelPasses(entry.level, minLevel))
+      return;
+    const full = { ts: new Date().toISOString(), ...entry };
+    const line = JSON.stringify(full) + "\n";
+    await this.rotate();
+    await this.app.vault.adapter.append(LOG_PATH, line);
+  }
+  async readAll() {
+    const exists = await this.app.vault.adapter.exists(LOG_PATH);
+    if (!exists)
+      return [];
+    const content = await this.app.vault.adapter.read(LOG_PATH);
+    return content.split("\n").filter(Boolean).map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch (e) {
+        return null;
+      }
+    }).filter(Boolean);
+  }
+  async rotate() {
+    const exists = await this.app.vault.adapter.exists(LOG_PATH);
+    if (!exists)
+      return;
+    const stat = await this.app.vault.adapter.stat(LOG_PATH);
+    if (!stat || stat.size < MAX_SIZE_BYTES)
+      return;
+    for (let i = MAX_ROTATIONS; i >= 1; i--) {
+      const oldPath = `${LOG_PATH}.${i}`;
+      const newPath = `${LOG_PATH}.${i + 1}`;
+      if (await this.app.vault.adapter.exists(oldPath)) {
+        if (i === MAX_ROTATIONS) {
+          await this.app.vault.adapter.remove(oldPath);
+        } else {
+          await this.app.vault.adapter.rename(oldPath, newPath);
+        }
+      }
+    }
+    await this.app.vault.adapter.rename(LOG_PATH, `${LOG_PATH}.1`);
+  }
+  levelPasses(level, minLevel) {
+    const order = ["info", "warn", "error"];
+    return order.indexOf(level) >= order.indexOf(minLevel);
+  }
+};
+
 // settings/SettingsTab.ts
+var import_obsidian7 = require("obsidian");
+
+// ui/AutomationDryRunModal.ts
 var import_obsidian6 = require("obsidian");
-var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
+var AutomationDryRunModal = class extends import_obsidian6.Modal {
+  constructor(app, automationName, entries) {
+    super(app);
+    this.automationName = automationName;
+    this.entries = entries;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `Dry Run \u2014 "${this.automationName}"` });
+    const wouldRun = this.entries.filter((e) => e.willRun);
+    const wouldSkip = this.entries.filter((e) => !e.willRun);
+    if (this.entries.length === 0) {
+      contentEl.createEl("p", { text: "No matching files found for this automation." });
+      this.addClose();
+      return;
+    }
+    const summary = contentEl.createEl("p");
+    summary.style.cssText = "color:var(--text-muted);margin-bottom:12px;";
+    summary.textContent = `${this.entries.length} matching file${this.entries.length !== 1 ? "s" : ""} \u2014 ${wouldRun.length} would run, ${wouldSkip.length} would skip.`;
+    if (wouldRun.length > 0) {
+      contentEl.createEl("h3", { text: `Would run (${wouldRun.length})` });
+      const ul = contentEl.createEl("ul");
+      ul.style.cssText = "max-height:220px;overflow-y:auto;margin:4px 0 16px;font-size:13px;";
+      for (const e of wouldRun)
+        ul.createEl("li", { text: e.vaultPath });
+    }
+    if (wouldSkip.length > 0) {
+      contentEl.createEl("h3", { text: `Would skip (${wouldSkip.length})` });
+      const ul = contentEl.createEl("ul");
+      ul.style.cssText = "max-height:180px;overflow-y:auto;margin:4px 0 16px;font-size:13px;";
+      for (const e of wouldSkip) {
+        const li = ul.createEl("li");
+        li.createSpan({ text: e.vaultPath });
+        if (e.skipReason) {
+          li.createSpan({ text: ` \u2014 ${e.skipReason}` }).style.cssText = "color:var(--text-muted);";
+        }
+      }
+    }
+    this.addClose();
+  }
+  addClose() {
+    const row = this.contentEl.createDiv();
+    row.style.cssText = "display:flex;justify-content:flex-end;margin-top:8px;";
+    const btn = row.createEl("button", { text: "Close" });
+    btn.addEventListener("click", () => this.close());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// settings/SettingsTab.ts
+var DriveSyncSettingTab = class extends import_obsidian7.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
@@ -1393,7 +2310,9 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       { id: "account", label: "Account" },
       { id: "sync", label: "Sync" },
       { id: "notes", label: "Notes" },
-      { id: "automations", label: "Automations" }
+      { id: "automations", label: "Automations" },
+      { id: "transcription", label: "Transcription" },
+      { id: "advanced", label: "Advanced" }
     ];
     const panes = {};
     const btnEls = {};
@@ -1423,6 +2342,10 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         this.renderNotesTab(pane);
       else if (tab.id === "automations")
         this.renderAutomationsTab(pane);
+      else if (tab.id === "transcription")
+        this.renderTranscriptionTab(pane);
+      else if (tab.id === "advanced")
+        this.renderAdvancedTab(pane);
     }
     switchTab(this.activeTab);
   }
@@ -1540,7 +2463,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
   addCardToggle(controlsEl, value, onChange) {
     const wrapper = controlsEl.createDiv();
     wrapper.addEventListener("click", (e) => e.stopPropagation());
-    const s = new import_obsidian6.Setting(wrapper);
+    const s = new import_obsidian7.Setting(wrapper);
     s.settingEl.addClass("drive-sync-header-setting");
     s.nameEl.style.display = "none";
     s.infoEl.style.display = "none";
@@ -1559,9 +2482,8 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
   }
   // ── Tab renderers ────────────────────────────────────────────────────────
   renderAccountTab(el) {
-    var _a;
     el.createEl("h3", { text: "Google Cloud credentials" });
-    new import_obsidian6.Setting(el).setName("Client ID").setDesc(
+    new import_obsidian7.Setting(el).setName("Client ID").setDesc(
       "OAuth2 Client ID from your Google Cloud Console project (Desktop app type)"
     ).addText(
       (text) => text.setPlaceholder("paste client_id here").setValue(this.plugin.settings.clientId).onChange(async (val) => {
@@ -1569,7 +2491,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian6.Setting(el).setName("Client Secret").setDesc("OAuth2 Client Secret from the same project").addText((text) => {
+    new import_obsidian7.Setting(el).setName("Client Secret").setDesc("OAuth2 Client Secret from the same project").addText((text) => {
       text.inputEl.type = "password";
       text.setPlaceholder("paste client_secret here").setValue(this.plugin.settings.clientSecret).onChange(async (val) => {
         this.plugin.settings.clientSecret = val;
@@ -1577,20 +2499,20 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       });
     });
     el.createEl("h3", { text: "Google account" });
-    new import_obsidian6.Setting(el).setName("Connect Google Drive").setDesc(
+    new import_obsidian7.Setting(el).setName("Connect Google Drive").setDesc(
       "Authorize access to Google Drive. You only need to do this once. Your browser will open for Google's consent screen."
     ).addButton(
       (btn) => btn.setButtonText("Connect").onClick(async () => {
         if (!this.plugin.settings.clientId || !this.plugin.settings.clientSecret) {
-          new import_obsidian6.Notice("Please enter your Client ID and Client Secret first.");
+          new import_obsidian7.Notice("Please enter your Client ID and Client Secret first.");
           return;
         }
         try {
           btn.setButtonText("Connecting\u2026").setDisabled(true);
           await this.plugin.auth.authorize();
-          new import_obsidian6.Notice("Google Drive connected successfully!");
+          new import_obsidian7.Notice("Google Drive connected successfully!");
         } catch (e) {
-          new import_obsidian6.Notice(`Authorization failed: ${e.message}`);
+          new import_obsidian7.Notice(`Authorization failed: ${e.message}`);
         } finally {
           btn.setButtonText("Connect").setDisabled(false);
         }
@@ -1598,77 +2520,9 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
     ).addButton(
       (btn) => btn.setButtonText("Disconnect").setWarning().onClick(async () => {
         await this.plugin.auth.disconnect();
-        new import_obsidian6.Notice("Google Drive disconnected.");
+        new import_obsidian7.Notice("Google Drive disconnected.");
       })
     );
-    el.createEl("h3", { text: "AI Transcription (optional)" });
-    el.createEl("p", {
-      text: "Transcribe handwritten or printed text from synced PDFs using an AI API. Output is stored in companion notes and available as {{transcription}} in templates.",
-      cls: "setting-item-description"
-    });
-    const provider = (_a = this.plugin.settings.transcriptionProvider) != null ? _a : "gemini";
-    new import_obsidian6.Setting(el).setName("Enable AI transcription").setDesc("Automatically transcribe PDFs when they are downloaded during sync.").addToggle(
-      (toggle) => toggle.setValue(this.plugin.settings.geminiEnabled).onChange(async (val) => {
-        this.plugin.settings.geminiEnabled = val;
-        await this.plugin.saveSettings();
-        providerSetting.settingEl.toggle(val);
-        geminiApiKeySetting.settingEl.toggle(val && currentProvider() === "gemini");
-        geminiModelSetting.settingEl.toggle(val && currentProvider() === "gemini");
-        geminiPromptSetting.settingEl.toggle(val && currentProvider() === "gemini");
-        mistralApiKeySetting.settingEl.toggle(val && currentProvider() === "mistral");
-      })
-    );
-    const currentProvider = () => {
-      var _a2;
-      return (_a2 = this.plugin.settings.transcriptionProvider) != null ? _a2 : "gemini";
-    };
-    const providerSetting = new import_obsidian6.Setting(el).setName("Provider").setDesc("Which AI service to use for transcription.").addDropdown(
-      (drop) => drop.addOption("gemini", "Google Gemini").addOption("mistral", "Mistral OCR").setValue(provider).onChange(async (val) => {
-        this.plugin.settings.transcriptionProvider = val;
-        await this.plugin.saveSettings();
-        const isGemini2 = val === "gemini";
-        geminiApiKeySetting.settingEl.toggle(isGemini2);
-        geminiModelSetting.settingEl.toggle(isGemini2);
-        geminiPromptSetting.settingEl.toggle(isGemini2);
-        mistralApiKeySetting.settingEl.toggle(!isGemini2);
-      })
-    );
-    const geminiApiKeySetting = new import_obsidian6.Setting(el).setName("Gemini API key").setDesc("From Google AI Studio (aistudio.google.com). Free tier available.").addText((text) => {
-      text.inputEl.type = "password";
-      text.setPlaceholder("AIza\u2026").setValue(this.plugin.settings.geminiApiKey).onChange(async (val) => {
-        this.plugin.settings.geminiApiKey = val.trim();
-        await this.plugin.saveSettings();
-      });
-    });
-    const geminiModelSetting = new import_obsidian6.Setting(el).setName("Model").setDesc("Gemini model to use for transcription.").addDropdown(
-      (drop) => drop.addOption("gemini-2.0-flash", "Gemini 2.0 Flash (recommended)").addOption("gemini-1.5-flash", "Gemini 1.5 Flash").addOption("gemini-1.5-pro", "Gemini 1.5 Pro").setValue(this.plugin.settings.geminiModel || "gemini-2.0-flash").onChange(async (val) => {
-        this.plugin.settings.geminiModel = val;
-        await this.plugin.saveSettings();
-      })
-    );
-    const geminiPromptSetting = new import_obsidian6.Setting(el).setName("Transcription prompt").setDesc("Instructions sent to Gemini for each PDF. Customize for your note-taking style.").addTextArea((text) => {
-      text.setPlaceholder("Transcribe all text visible in this PDF exactly as written\u2026").setValue(this.plugin.settings.geminiPrompt).onChange(async (val) => {
-        this.plugin.settings.geminiPrompt = val;
-        await this.plugin.saveSettings();
-      });
-      text.inputEl.rows = 4;
-      text.inputEl.style.width = "100%";
-      text.inputEl.style.resize = "vertical";
-    });
-    const mistralApiKeySetting = new import_obsidian6.Setting(el).setName("Mistral API key").setDesc("From console.mistral.ai. Uses the mistral-ocr-latest model.").addText((text) => {
-      text.inputEl.type = "password";
-      text.setPlaceholder("\u2026").setValue(this.plugin.settings.mistralApiKey).onChange(async (val) => {
-        this.plugin.settings.mistralApiKey = val.trim();
-        await this.plugin.saveSettings();
-      });
-    });
-    const enabled = this.plugin.settings.geminiEnabled;
-    const isGemini = currentProvider() === "gemini";
-    providerSetting.settingEl.toggle(enabled);
-    geminiApiKeySetting.settingEl.toggle(enabled && isGemini);
-    geminiModelSetting.settingEl.toggle(enabled && isGemini);
-    geminiPromptSetting.settingEl.toggle(enabled && isGemini);
-    mistralApiKeySetting.settingEl.toggle(enabled && !isGemini);
   }
   renderSyncTab(el) {
     el.createEl("h3", { text: "Sync folders" });
@@ -1678,7 +2532,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
     });
     const pairsContainer = el.createDiv({ cls: "drive-sync-pairs" });
     this.renderPairs(pairsContainer);
-    new import_obsidian6.Setting(el).addButton(
+    new import_obsidian7.Setting(el).addButton(
       (btn) => btn.setButtonText("+ Add folder pair").setCta().onClick(async () => {
         const id = this.generateId();
         this.plugin.settings.syncPairs.push({
@@ -1694,7 +2548,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       })
     );
     el.createEl("h3", { text: "Sync schedule" });
-    new import_obsidian6.Setting(el).setName("Sync interval (minutes)").setDesc("How often to automatically sync. Set to 0 to disable.").addText(
+    new import_obsidian7.Setting(el).setName("Sync interval (minutes)").setDesc("How often to automatically sync. Set to 0 to disable.").addText(
       (text) => text.setPlaceholder("30").setValue(String(this.plugin.settings.syncIntervalMinutes)).onChange(async (val) => {
         const num = parseInt(val, 10);
         if (!isNaN(num) && num >= 0) {
@@ -1707,13 +2561,13 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         }
       })
     );
-    new import_obsidian6.Setting(el).setName("Sync on startup").setDesc("Run a sync immediately when the vault opens (requires Google Drive to be connected).").addToggle(
+    new import_obsidian7.Setting(el).setName("Sync on startup").setDesc("Run a sync immediately when the vault opens (requires Google Drive to be connected).").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async (val) => {
         this.plugin.settings.syncOnStartup = val;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian6.Setting(el).setName("Download concurrency").setDesc("Number of files to download in parallel (1\u201310). Higher = faster for large syncs.").addSlider(
+    new import_obsidian7.Setting(el).setName("Download concurrency").setDesc("Number of files to download in parallel (1\u201310). Higher = faster for large syncs.").addSlider(
       (slider) => {
         var _a;
         return slider.setLimits(1, 10, 1).setValue((_a = this.plugin.settings.downloadConcurrency) != null ? _a : 5).setDynamicTooltip().onChange(async (val) => {
@@ -1724,14 +2578,14 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
     );
     el.createEl("h3", { text: "Deletion behavior" });
     let archiveSetting;
-    new import_obsidian6.Setting(el).setName("When a file is removed from Drive").setDesc("What to do with vault files that no longer exist in the Drive folder.").addDropdown((drop) => {
+    new import_obsidian7.Setting(el).setName("When a file is removed from Drive").setDesc("What to do with vault files that no longer exist in the Drive folder.").addDropdown((drop) => {
       drop.addOption("keep", "Keep in vault").addOption("delete", "Move to system trash").addOption("delete_keep_companion", "Move to system trash (keep companion note)").addOption("delete_only_companion", "Keep PDF, delete companion note only").addOption("archive", "Move to archive folder").addOption("archive_keep_companion", "Move to archive folder (keep companion note)").setValue(this.plugin.settings.deletionBehavior).onChange(async (val) => {
         this.plugin.settings.deletionBehavior = val;
         await this.plugin.saveSettings();
         archiveSetting.settingEl.toggle(val === "archive" || val === "archive_keep_companion");
       });
     });
-    archiveSetting = new import_obsidian6.Setting(el).setName("Archive folder").setDesc("Vault folder to move removed files into. Subfolder structure is preserved.").addText(
+    archiveSetting = new import_obsidian7.Setting(el).setName("Archive folder").setDesc("Vault folder to move removed files into. Subfolder structure is preserved.").addText(
       (text) => text.setPlaceholder("Drive Sync Archive").setValue(this.plugin.settings.archiveFolder).onChange(async (val) => {
         this.plugin.settings.archiveFolder = val.trim() || "Drive Sync Archive";
         await this.plugin.saveSettings();
@@ -1740,12 +2594,23 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
     archiveSetting.settingEl.toggle(
       this.plugin.settings.deletionBehavior === "archive" || this.plugin.settings.deletionBehavior === "archive_keep_companion"
     );
+    new import_obsidian7.Setting(el).setName("Re-download vault-deleted files when Drive updates them").setDesc(
+      "When you manually delete a file from your vault, Drive Sync won't re-download it. Enable this to re-download if the file's Drive version advances after your deletion."
+    ).addToggle(
+      (toggle) => {
+        var _a;
+        return toggle.setValue((_a = this.plugin.settings.redownloadUserDeleted) != null ? _a : true).onChange(async (val) => {
+          this.plugin.settings.redownloadUserDeleted = val;
+          await this.plugin.saveSettings();
+        });
+      }
+    );
     el.createEl("h3", { text: "Drive Archive folder" });
     el.createEl("p", {
       text: "Designate a Drive folder as an archive destination. Files moved there are not downloaded but are detected during sync \u2014 use the per-pair setting below to control what happens to the local vault copy when a file is archived in Drive.",
       cls: "setting-item-description"
     });
-    new import_obsidian6.Setting(el).setName("Drive Archive folder ID").setDesc(
+    new import_obsidian7.Setting(el).setName("Drive Archive folder ID").setDesc(
       "Folder ID or URL of your Drive archive folder. Leave empty to disable. You can paste the full Drive URL here."
     ).addText(
       (text) => text.setPlaceholder("Folder ID or paste full URL").setValue(this.plugin.settings.driveArchiveFolderId).onChange(async (val) => {
@@ -1758,32 +2623,54 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       })
     );
     el.createEl("h3", { text: "Sync log" });
-    new import_obsidian6.Setting(el).setName("Enable sync log").setDesc("Append a row to a Markdown table after each sync run.").addToggle(
+    new import_obsidian7.Setting(el).setName("Enable sync log").setDesc("Append a row to a Markdown table after each sync run.").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.syncLogEnabled).onChange(async (val) => {
         this.plugin.settings.syncLogEnabled = val;
         await this.plugin.saveSettings();
         syncLogPathSetting.settingEl.toggle(val);
       })
     );
-    const syncLogPathSetting = new import_obsidian6.Setting(el).setName("Log file path").setDesc("Vault path to the log file. Created automatically if missing.").addText(
+    const syncLogPathSetting = new import_obsidian7.Setting(el).setName("Log file path").setDesc("Vault path to the log file. Created automatically if missing.").addText(
       (text) => text.setPlaceholder("Drive Sync/.sync-log.md").setValue(this.plugin.settings.syncLogPath).onChange(async (val) => {
         this.plugin.settings.syncLogPath = val.trim() || "Drive Sync/.sync-log.md";
         await this.plugin.saveSettings();
       })
     );
     syncLogPathSetting.settingEl.toggle(this.plugin.settings.syncLogEnabled);
+    el.createEl("h3", { text: "Sync activity log" });
+    el.createEl("p", {
+      text: 'A rolling JSON-lines log at .obsidian/drive-sync.log. Rotates at 10MB, keeps 3 backups. Use the "View sync activity log" command to browse entries.',
+      cls: "setting-item-description"
+    });
+    new import_obsidian7.Setting(el).setName("Enable sync activity log").setDesc("Record detailed per-file events to the activity log.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.syncActivityLogEnabled).onChange(async (val) => {
+        this.plugin.settings.syncActivityLogEnabled = val;
+        await this.plugin.saveSettings();
+        activityLogLevelSetting.settingEl.toggle(val);
+      })
+    );
+    const activityLogLevelSetting = new import_obsidian7.Setting(el).setName("Log level").setDesc("Minimum severity level to record.").addDropdown(
+      (drop) => {
+        var _a;
+        return drop.addOption("info", "Info \u2014 all events").addOption("warn", "Warn \u2014 warnings and errors only").addOption("error", "Error \u2014 errors only").setValue((_a = this.plugin.settings.syncActivityLogLevel) != null ? _a : "info").onChange(async (val) => {
+          this.plugin.settings.syncActivityLogLevel = val;
+          await this.plugin.saveSettings();
+        });
+      }
+    );
+    activityLogLevelSetting.settingEl.toggle(this.plugin.settings.syncActivityLogEnabled);
     el.createEl("h3", { text: "Manual sync" });
-    new import_obsidian6.Setting(el).setName("Sync now").setDesc("Trigger a one-off sync immediately.").addButton(
+    new import_obsidian7.Setting(el).setName("Sync now").setDesc("Trigger a one-off sync immediately.").addButton(
       (btn) => btn.setButtonText("Sync now").onClick(async () => {
         var _a, _b;
         try {
           btn.setButtonText("Syncing\u2026").setDisabled(true);
           const result = await this.plugin.runSync();
-          new import_obsidian6.Notice(
+          new import_obsidian7.Notice(
             `Sync complete \u2014 ${result.downloaded} downloaded, ${result.skipped} up to date` + (((_a = result.moved) != null ? _a : 0) > 0 ? `, ${result.moved} moved` : "") + (result.removed > 0 ? `, ${result.removed} removed` : "") + (((_b = result.archived) != null ? _b : 0) > 0 ? `, ${result.archived} archived` : "") + (result.errors > 0 ? `, ${result.errors} errors` : "")
           );
         } catch (e) {
-          new import_obsidian6.Notice(`Sync failed: ${e.message}`);
+          new import_obsidian7.Notice(`Sync failed: ${e.message}`);
         } finally {
           btn.setButtonText("Sync now").setDisabled(false);
         }
@@ -1794,7 +2681,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           btn.setButtonText("Running\u2026").setDisabled(true);
           await this.plugin.runSync(true);
         } catch (e) {
-          new import_obsidian6.Notice(`Dry run failed: ${e.message}`);
+          new import_obsidian7.Notice(`Dry run failed: ${e.message}`);
         } finally {
           btn.setButtonText("Dry run").setDisabled(false);
         }
@@ -1807,7 +2694,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       text: "For each PDF, automatically create a Markdown note with frontmatter (processed, lastUpdate, syncDate, driveFileId). The processed property resets to false whenever the PDF is updated.",
       cls: "setting-item-description"
     });
-    new import_obsidian6.Setting(el).setName("Enable companion notes").addToggle(
+    new import_obsidian7.Setting(el).setName("Enable companion notes").addToggle(
       (toggle) => toggle.setValue(this.plugin.settings.companionNotesEnabled).onChange(async (val) => {
         this.plugin.settings.companionNotesEnabled = val;
         await this.plugin.saveSettings();
@@ -1816,7 +2703,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         companionTemplateSetting.settingEl.toggle(val);
       })
     );
-    const companionFolderSetting = new import_obsidian6.Setting(el).setName("Companion notes folder").setDesc(
+    const companionFolderSetting = new import_obsidian7.Setting(el).setName("Companion notes folder").setDesc(
       'Root vault folder for companion notes. Leave empty to place notes alongside their PDF. Use "/" to place notes in the vault root. With multiple sync pairs, notes are grouped under <folder>/<pair label>/. Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}.'
     ).addText(
       (text) => text.setPlaceholder("(empty = alongside PDF, / = vault root)").setValue(this.plugin.settings.companionNotesFolder).onChange(async (val) => {
@@ -1824,7 +2711,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    const companionTitleSetting = new import_obsidian6.Setting(el).setName("Companion note title").setDesc(
+    const companionTitleSetting = new import_obsidian7.Setting(el).setName("Companion note title").setDesc(
       'Template for the note title (H1 heading and {{title}} in templates). Leave empty to use the PDF filename without extension. Supports: {{title}} (PDF stem), {{fileName}}, {{pairLabel}}, {{relativePath}}. Example: "Reading: {{title}}"'
     ).addText(
       (text) => text.setPlaceholder("(empty = PDF filename)").setValue(this.plugin.settings.companionNoteTitle).onChange(async (val) => {
@@ -1832,7 +2719,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    const companionTemplateSetting = new import_obsidian6.Setting(el).setName("Template file path").setDesc(
+    const companionTemplateSetting = new import_obsidian7.Setting(el).setName("Template file path").setDesc(
       "Vault path to a .md file to use as the companion note template. Leave empty to use the built-in default. Available placeholders: {{title}}, {{fileName}}, {{fileLink}}, {{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}, {{pairLabel}}, {{transcription}} (Gemini transcription text, if enabled)."
     ).addText(
       (text) => text.setPlaceholder("Templates/drive-sync-note.md").setValue(this.plugin.settings.companionNoteTemplatePath).onChange(async (val) => {
@@ -1843,6 +2730,20 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
     companionFolderSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
     companionTitleSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
     companionTemplateSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
+    el.createEl("h3", { text: "Conflict resolution" });
+    el.createEl("p", {
+      text: "When Drive Sync detects that you've edited a companion note since the last sync, this policy controls what happens.",
+      cls: "setting-item-description"
+    });
+    new import_obsidian7.Setting(el).setName("Conflict policy").setDesc("What to do when a companion note has been edited locally since the last sync.").addDropdown(
+      (drop) => {
+        var _a;
+        return drop.addOption("save-both", "Save both \u2014 backup local edits, apply Drive update (default)").addOption("keep-vault", "Keep vault \u2014 skip Drive update, preserve local edits").addOption("take-drive", "Take Drive \u2014 overwrite local edits without backup").addOption("ask", "Ask \u2014 show a dialog for each conflict during sync").setValue((_a = this.plugin.settings.conflictPolicy) != null ? _a : "save-both").onChange(async (val) => {
+          this.plugin.settings.conflictPolicy = val;
+          await this.plugin.saveSettings();
+        });
+      }
+    );
     el.createEl("h3", { text: "Periodic Notes" });
     el.createEl("p", {
       text: 'Configure vault path templates for each periodic note type. Used by the "Embed to weekly/monthly/\u2026" automation actions to locate the target note. Supports moment.js tokens wrapped in {{}}: {{YYYY}}, {{MM}}, {{DD}}, {{[W]WW}}, {{Q}}.',
@@ -1856,7 +2757,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       { key: "yearly", label: "Yearly note path", placeholder: "Journal/Yearly/{{YYYY}}" }
     ];
     for (const { key, label, placeholder } of periodicFields) {
-      new import_obsidian6.Setting(el).setName(label).setDesc("Path template \u2014 do not include .md extension.").addText(
+      new import_obsidian7.Setting(el).setName(label).setDesc("Path template \u2014 do not include .md extension.").addText(
         (text) => text.setPlaceholder(placeholder).setValue(this.plugin.settings.periodicNotesPaths[key]).onChange(async (val) => {
           this.plugin.settings.periodicNotesPaths[key] = val.trim();
           await this.plugin.saveSettings();
@@ -1864,15 +2765,443 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       );
     }
   }
+  renderTranscriptionTab(el) {
+    var _a, _b, _c, _d;
+    el.createEl("h3", { text: "Provider & credentials" });
+    const currentProvider = () => {
+      var _a2;
+      return (_a2 = this.plugin.settings.transcriptionProvider) != null ? _a2 : "gemini";
+    };
+    new import_obsidian7.Setting(el).setName("Enable AI transcription").setDesc("Automatically transcribe PDFs when they are downloaded during sync.").addToggle(
+      (toggle) => toggle.setValue(this.plugin.settings.geminiEnabled).onChange(async (val) => {
+        this.plugin.settings.geminiEnabled = val;
+        await this.plugin.saveSettings();
+        updateProviderVisibility(currentProvider(), val);
+      })
+    );
+    const providerSetting = new import_obsidian7.Setting(el).setName("Provider").setDesc("Which AI service to use for transcription.").addDropdown(
+      (drop) => drop.addOption("gemini", "Google Gemini").addOption("mistral", "Mistral OCR").setValue(currentProvider()).onChange(async (val) => {
+        this.plugin.settings.transcriptionProvider = val;
+        await this.plugin.saveSettings();
+        updateProviderVisibility(val, this.plugin.settings.geminiEnabled);
+      })
+    );
+    const geminiApiKeySetting = new import_obsidian7.Setting(el).setName("Gemini API key").setDesc("From Google AI Studio (aistudio.google.com). Free tier available.").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("AIza\u2026").setValue(this.plugin.settings.geminiApiKey).onChange(async (val) => {
+        this.plugin.settings.geminiApiKey = val.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+    const geminiModelSetting = new import_obsidian7.Setting(el).setName("Gemini model").setDesc("Gemini model to use for transcription.").addDropdown(
+      (drop) => drop.addOption("gemini-2.0-flash", "Gemini 2.0 Flash (recommended)").addOption("gemini-1.5-flash", "Gemini 1.5 Flash").addOption("gemini-1.5-pro", "Gemini 1.5 Pro").setValue(this.plugin.settings.geminiModel || "gemini-2.0-flash").onChange(async (val) => {
+        this.plugin.settings.geminiModel = val;
+        await this.plugin.saveSettings();
+      })
+    );
+    const geminiPromptSetting = new import_obsidian7.Setting(el).setName("Transcription prompt").setDesc("Instructions sent to Gemini for each PDF. Customize for your note-taking style.").addTextArea((text) => {
+      text.setPlaceholder("Transcribe all text visible in this PDF exactly as written\u2026").setValue(this.plugin.settings.geminiPrompt).onChange(async (val) => {
+        this.plugin.settings.geminiPrompt = val;
+        await this.plugin.saveSettings();
+      });
+      text.inputEl.rows = 4;
+      text.inputEl.style.width = "100%";
+      text.inputEl.style.resize = "vertical";
+    });
+    const geminiTestSetting = new import_obsidian7.Setting(el).setName("Test Gemini connection").setDesc("Send a minimal request to verify your API key is valid.").addButton(
+      (btn) => btn.setButtonText("Test connection").onClick(async () => {
+        var _a2, _b2, _c2;
+        const key = this.plugin.settings.geminiApiKey;
+        const model = this.plugin.settings.geminiModel || "gemini-2.0-flash";
+        if (!key) {
+          new import_obsidian7.Notice("Enter a Gemini API key first.");
+          return;
+        }
+        btn.setButtonText("Testing\u2026").setDisabled(true);
+        try {
+          const res = await (0, import_obsidian7.requestUrl)({
+            url: `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`,
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            throw: false,
+            body: JSON.stringify({ contents: [{ parts: [{ text: "Reply with the single word: ok" }] }] })
+          });
+          if (res.status === 200) {
+            new import_obsidian7.Notice("Gemini connection successful!");
+          } else {
+            const msg = (_c2 = (_b2 = (_a2 = res.json) == null ? void 0 : _a2.error) == null ? void 0 : _b2.message) != null ? _c2 : res.text.slice(0, 200);
+            new import_obsidian7.Notice(`Gemini error ${res.status}: ${msg}`);
+          }
+        } catch (e) {
+          new import_obsidian7.Notice(`Gemini test failed: ${e.message}`);
+        } finally {
+          btn.setButtonText("Test connection").setDisabled(false);
+        }
+      })
+    );
+    const mistralApiKeySetting = new import_obsidian7.Setting(el).setName("Mistral API key").setDesc("From console.mistral.ai. Uses the mistral-ocr-latest model.").addText((text) => {
+      text.inputEl.type = "password";
+      text.setPlaceholder("\u2026").setValue(this.plugin.settings.mistralApiKey).onChange(async (val) => {
+        this.plugin.settings.mistralApiKey = val.trim();
+        await this.plugin.saveSettings();
+      });
+    });
+    const mistralTestSetting = new import_obsidian7.Setting(el).setName("Test Mistral connection").setDesc("Verify your Mistral API key is valid.").addButton(
+      (btn) => btn.setButtonText("Test connection").onClick(async () => {
+        var _a2, _b2;
+        const key = this.plugin.settings.mistralApiKey;
+        if (!key) {
+          new import_obsidian7.Notice("Enter a Mistral API key first.");
+          return;
+        }
+        btn.setButtonText("Testing\u2026").setDisabled(true);
+        try {
+          const res = await (0, import_obsidian7.requestUrl)({
+            url: "https://api.mistral.ai/v1/models",
+            method: "GET",
+            headers: { "Authorization": `Bearer ${key}` },
+            throw: false
+          });
+          if (res.status === 200) {
+            new import_obsidian7.Notice("Mistral connection successful!");
+          } else {
+            const msg = (_b2 = (_a2 = res.json) == null ? void 0 : _a2.message) != null ? _b2 : res.text.slice(0, 200);
+            new import_obsidian7.Notice(`Mistral error ${res.status}: ${msg}`);
+          }
+        } catch (e) {
+          new import_obsidian7.Notice(`Mistral test failed: ${e.message}`);
+        } finally {
+          btn.setButtonText("Test connection").setDisabled(false);
+        }
+      })
+    );
+    const updateProviderVisibility = (prov, enabled) => {
+      const isGemini = prov === "gemini";
+      providerSetting.settingEl.toggle(enabled);
+      geminiApiKeySetting.settingEl.toggle(enabled && isGemini);
+      geminiModelSetting.settingEl.toggle(enabled && isGemini);
+      geminiPromptSetting.settingEl.toggle(enabled && isGemini);
+      geminiTestSetting.settingEl.toggle(enabled && isGemini);
+      mistralApiKeySetting.settingEl.toggle(enabled && !isGemini);
+      mistralTestSetting.settingEl.toggle(enabled && !isGemini);
+    };
+    updateProviderVisibility(currentProvider(), this.plugin.settings.geminiEnabled);
+    el.createEl("h3", { text: "Default behavior" });
+    let defaultNotePathSetting;
+    new import_obsidian7.Setting(el).setName("Default destination").setDesc(
+      'When running "Transcribe current file", skip the picker and go straight to the selected destination. "Ask" always shows the destination picker.'
+    ).addDropdown(
+      (drop) => {
+        var _a2;
+        return drop.addOption("ask", "Ask \u2014 always show the picker").addOption("companion", "Companion note").addOption("daily", "Today's daily note").addOption("note", "Specific file").setValue((_a2 = this.plugin.settings.transcribeDefaultDest) != null ? _a2 : "ask").onChange(async (val) => {
+          this.plugin.settings.transcribeDefaultDest = val;
+          await this.plugin.saveSettings();
+          defaultNotePathSetting.settingEl.toggle(val === "note");
+        });
+      }
+    );
+    defaultNotePathSetting = new import_obsidian7.Setting(el).setName("Default note path").setDesc(
+      `Vault path to the note used as the transcription destination when "Specific file" is selected. If not set or the file doesn't exist, the note picker opens instead.`
+    ).addText(
+      (text) => {
+        var _a2;
+        return text.setPlaceholder("Notes/Transcriptions.md").setValue((_a2 = this.plugin.settings.transcribeDefaultNotePath) != null ? _a2 : "").onChange(async (val) => {
+          this.plugin.settings.transcribeDefaultNotePath = val.trim();
+          await this.plugin.saveSettings();
+        });
+      }
+    ).addButton(
+      (btn) => btn.setButtonText("Browse\u2026").onClick(() => {
+        new NoteFilePicker(this.app, (file) => {
+          this.plugin.settings.transcribeDefaultNotePath = file.path;
+          void this.plugin.saveSettings();
+          this.display();
+        }).open();
+      })
+    );
+    defaultNotePathSetting.settingEl.toggle(
+      ((_a = this.plugin.settings.transcribeDefaultDest) != null ? _a : "ask") === "note"
+    );
+    const fallbackVal = ((_b = this.plugin.settings.transcribeCompanionFallbackFolder) != null ? _b : "").trim();
+    const fallbackSetting = new import_obsidian7.Setting(el).setName("Companion fallback folder").setDesc(
+      'Where to create the companion note when you run "Transcribe \u2192 Companion note" and none exists. Empty = alongside the PDF. "/" = vault root. Supports {{RootFolder}}, {{folderL1}}, {{folderL2}} tokens.'
+    ).addText(
+      (text) => text.setPlaceholder("(empty = alongside PDF)").setValue(fallbackVal).onChange(async (val) => {
+        this.plugin.settings.transcribeCompanionFallbackFolder = val.trim();
+        await this.plugin.saveSettings();
+        fallbackPreviewEl.textContent = this.buildFallbackPreview(val.trim());
+      })
+    );
+    const fallbackPreviewEl = fallbackSetting.settingEl.createEl("div", {
+      text: this.buildFallbackPreview(fallbackVal),
+      cls: "setting-item-description"
+    });
+    fallbackPreviewEl.style.marginTop = "4px";
+    fallbackPreviewEl.style.fontStyle = "italic";
+    el.createEl("h3", { text: "Templates" });
+    el.createEl("p", {
+      text: "Leave any template empty to use the built-in default (a simple ## Transcription block).",
+      cls: "setting-item-description"
+    });
+    const TOKEN_DOCS = "Tokens: {{transcription}}, {{title}}, {{fileName}}, {{date}}, {{link}}, {{embed}}, {{sourcePath}}, {{pairLabel}}";
+    el.createEl("h4", { text: "Companion note" });
+    const companionPathVal = ((_c = this.plugin.settings.transcribeCompanionTemplatePath) != null ? _c : "").trim();
+    let companionInlineSetting;
+    const companionPathSetting = new import_obsidian7.Setting(el).setName("Template file").setDesc(
+      "Vault path to a .md file used as the companion note template. When set and the file exists, it overrides the inline template."
+    ).addText(
+      (text) => {
+        var _a2;
+        return text.setPlaceholder("Templates/transcribe-companion.md").setValue((_a2 = this.plugin.settings.transcribeCompanionTemplatePath) != null ? _a2 : "").onChange(async (val) => {
+          var _a3;
+          this.plugin.settings.transcribeCompanionTemplatePath = val.trim();
+          await this.plugin.saveSettings();
+          companionInlineSetting.settingEl.toggle(!val.trim());
+          const hasInline = !!((_a3 = this.plugin.settings.transcribeCompanionTemplate) != null ? _a3 : "").trim();
+          overrideHint.style.display = !!val.trim() && hasInline ? "" : "none";
+        });
+      }
+    ).addButton(
+      (btn) => btn.setButtonText("Browse\u2026").onClick(() => {
+        new NoteFilePicker(this.app, (file) => {
+          this.plugin.settings.transcribeCompanionTemplatePath = file.path;
+          void this.plugin.saveSettings();
+          this.display();
+        }).open();
+      })
+    ).addButton(
+      (btn) => btn.setButtonText("Preview").onClick(async () => {
+        var _a2, _b2;
+        const filePath = ((_a2 = this.plugin.settings.transcribeCompanionTemplatePath) != null ? _a2 : "").trim();
+        let template;
+        if (filePath) {
+          try {
+            const exists = await this.app.vault.adapter.exists(filePath);
+            if (exists)
+              template = await this.app.vault.adapter.read(filePath);
+          } catch (e) {
+          }
+        }
+        if (!template) {
+          template = ((_b2 = this.plugin.settings.transcribeCompanionTemplate) != null ? _b2 : "").trim() || void 0;
+        }
+        new TemplatePreviewModal(this.app, template).open();
+      })
+    );
+    const overrideHint = companionPathSetting.settingEl.createEl("small", {
+      text: "(file overrides inline)"
+    });
+    overrideHint.style.display = companionPathVal && !!((_d = this.plugin.settings.transcribeCompanionTemplate) != null ? _d : "").trim() ? "" : "none";
+    overrideHint.style.color = "var(--text-accent)";
+    overrideHint.style.marginLeft = "8px";
+    companionInlineSetting = new import_obsidian7.Setting(el).setName("Inline template").setDesc("Used when no template file is set.").addTextArea((text) => {
+      var _a2;
+      text.setPlaceholder("## Transcription\n\n*Source: {{fileName}}*\n\n{{transcription}}").setValue((_a2 = this.plugin.settings.transcribeCompanionTemplate) != null ? _a2 : "").onChange(async (val) => {
+        var _a3;
+        this.plugin.settings.transcribeCompanionTemplate = val;
+        await this.plugin.saveSettings();
+        const filePath = ((_a3 = this.plugin.settings.transcribeCompanionTemplatePath) != null ? _a3 : "").trim();
+        overrideHint.style.display = filePath && !!val.trim() ? "" : "none";
+      });
+      text.inputEl.rows = 5;
+      text.inputEl.style.width = "100%";
+      text.inputEl.style.fontFamily = "monospace";
+      text.inputEl.style.resize = "vertical";
+    });
+    companionInlineSetting.settingEl.toggle(!companionPathVal);
+    el.createEl("p", { text: TOKEN_DOCS, cls: "setting-item-description" });
+    el.createEl("h4", { text: "Daily note" });
+    new import_obsidian7.Setting(el).setName("Template").addTextArea((text) => {
+      var _a2;
+      text.setPlaceholder("## Transcription from {{link}}\n\n{{transcription}}").setValue((_a2 = this.plugin.settings.transcribeDailyTemplate) != null ? _a2 : "").onChange(async (val) => {
+        this.plugin.settings.transcribeDailyTemplate = val;
+        await this.plugin.saveSettings();
+      });
+      text.inputEl.rows = 5;
+      text.inputEl.style.width = "100%";
+      text.inputEl.style.fontFamily = "monospace";
+      text.inputEl.style.resize = "vertical";
+    });
+    el.createEl("p", { text: TOKEN_DOCS, cls: "setting-item-description" });
+    el.createEl("h4", { text: "Specific note" });
+    new import_obsidian7.Setting(el).setName("Template").addTextArea((text) => {
+      var _a2;
+      text.setPlaceholder("## Transcription from {{link}}\n\n{{transcription}}").setValue((_a2 = this.plugin.settings.transcribeNoteTemplate) != null ? _a2 : "").onChange(async (val) => {
+        this.plugin.settings.transcribeNoteTemplate = val;
+        await this.plugin.saveSettings();
+      });
+      text.inputEl.rows = 5;
+      text.inputEl.style.width = "100%";
+      text.inputEl.style.fontFamily = "monospace";
+      text.inputEl.style.resize = "vertical";
+    });
+    el.createEl("p", { text: TOKEN_DOCS, cls: "setting-item-description" });
+    el.createEl("h3", { text: "Page-hash retranscription" });
+    const store = this.plugin.transcriptionStore;
+    const entryCount = store ? store.entries().length : 0;
+    el.createEl("p", {
+      text: `${entryCount} file${entryCount !== 1 ? "s" : ""} have transcription records. Clearing a hash forces re-transcription even when the PDF content hasn't changed.`,
+      cls: "setting-item-description"
+    });
+    new import_obsidian7.Setting(el).setName("Force re-transcribe active file").setDesc("Clear the page hash for the currently open file so it's re-transcribed on the next sync.").addButton(
+      (btn) => btn.setButtonText("Clear hash").onClick(async () => {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+          new import_obsidian7.Notice("No file is currently open.");
+          return;
+        }
+        if (!store) {
+          new import_obsidian7.Notice("Transcription store not available.");
+          return;
+        }
+        const entry = store.findByVaultPath(activeFile.path);
+        if (!entry) {
+          new import_obsidian7.Notice(`No transcription record found for "${activeFile.name}".`);
+          return;
+        }
+        const [driveFileId, rec] = entry;
+        rec.pdfHash = "";
+        store.set(driveFileId, rec);
+        await store.save();
+        new import_obsidian7.Notice(`Hash cleared for "${activeFile.name}". It will be re-transcribed on the next sync.`);
+      })
+    );
+    new import_obsidian7.Setting(el).setName("Clear all transcription records").setDesc("Remove all stored page hashes and transcription history. All PDFs will be re-transcribed on the next sync.").addButton(
+      (btn) => btn.setButtonText("Clear all").setWarning().onClick(async () => {
+        if (!store) {
+          new import_obsidian7.Notice("Transcription store not available.");
+          return;
+        }
+        const count = store.entries().length;
+        if (count === 0) {
+          new import_obsidian7.Notice("No transcription records to clear.");
+          return;
+        }
+        new ConfirmClearTranscriptionsModal(this.app, count, async () => {
+          for (const [id] of store.entries()) {
+            store.delete(id);
+          }
+          await store.save();
+          new import_obsidian7.Notice(`Cleared ${count} transcription record${count !== 1 ? "s" : ""}.`);
+          this.display();
+        }).open();
+      })
+    );
+  }
+  renderAdvancedTab(el) {
+    el.createEl("h3", { text: "Performance" });
+    new import_obsidian7.Setting(el).setName("Use Drive changes API").setDesc("Skip the full folder walk when nothing changed in Drive since the last sync. Falls back to a full scan whenever any change is detected.").addToggle(
+      (t) => t.setValue(this.plugin.settings.useChangesApi).onChange(async (v) => {
+        this.plugin.settings.useChangesApi = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian7.Setting(el).setName("Off-thread hashing").setDesc("Run PDF hashing and page-count scanning on a background worker so the UI stays responsive. Falls back to the main thread if a worker can't be created.").addToggle(
+      (t) => t.setValue(this.plugin.settings.offThreadHashing).onChange(async (v) => {
+        this.plugin.settings.offThreadHashing = v;
+        await this.plugin.saveSettings();
+        new import_obsidian7.Notice("Reload Obsidian for this to take full effect.");
+      })
+    );
+    new import_obsidian7.Setting(el).setName("Content-addressed download cache").setDesc("Reuse already-downloaded bytes when files move/rename/duplicate in Drive, keyed by Drive's md5. Zero bytes re-downloaded on a cache hit.").addToggle(
+      (t) => t.setValue(this.plugin.settings.downloadCacheEnabled).onChange(async (v) => {
+        this.plugin.settings.downloadCacheEnabled = v;
+        await this.plugin.saveSettings();
+        new import_obsidian7.Notice("Reload Obsidian for this to take full effect.");
+      })
+    );
+    new import_obsidian7.Setting(el).setName("Download cache cap (MB)").setDesc("LRU eviction keeps the cache under this size. Unreferenced entries are evicted first.").addText(
+      (txt) => txt.setValue(String(this.plugin.settings.downloadCacheMaxMb)).onChange(async (v) => {
+        var _a;
+        const n = parseInt(v, 10);
+        if (!Number.isNaN(n) && n > 0) {
+          this.plugin.settings.downloadCacheMaxMb = n;
+          (_a = this.plugin.cacheManager) == null ? void 0 : _a.setMaxBytes(n * 1024 * 1024);
+          await this.plugin.saveSettings();
+        }
+      })
+    );
+    new import_obsidian7.Setting(el).setName("SQLite-backed manifest (experimental)").setDesc("Adapter is in place but the SQLite backend is not yet bundled \u2014 leaving this on still uses the JSON store. See IMPROVEMENTS.md Phase 11.2.").addToggle(
+      (t) => t.setValue(this.plugin.settings.useSqliteManifest).onChange(async (v) => {
+        this.plugin.settings.useSqliteManifest = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    el.createEl("h3", { text: "Data & safety" });
+    new import_obsidian7.Setting(el).setName("Verify manifest integrity").setDesc("Walk the manifest, hash each vault file and report drift (missing / hash-mismatch / manifest-only).").addButton(
+      (b) => b.setButtonText("Run verify").onClick(() => this.plugin.runVerifyIntegrity())
+    );
+    new import_obsidian7.Setting(el).setName("Restore manifest from backup").setDesc("Pick a timestamped backup snapshot and restore it (2-step confirm).").addButton(
+      (b) => b.setButtonText("Restore\u2026").onClick(() => this.plugin.openRestoreManifest())
+    );
+    new import_obsidian7.Setting(el).setName("Open recycle bin").setDesc("Open the folder holding pre-overwrite/pre-delete backups created by the sync engine.").addButton(
+      (b) => b.setButtonText("Open").onClick(() => this.plugin.openRecycleFolder())
+    );
+    new import_obsidian7.Setting(el).setName("Undo last sync").setDesc("Restore the files recycled during the most recent sync run (confirm modal).").addButton(
+      (b) => b.setButtonText("Undo\u2026").onClick(() => this.plugin.undoLastSync())
+    );
+    el.createEl("h3", { text: "Error reporting" });
+    new import_obsidian7.Setting(el).setName("Anonymous error reporting").setDesc("Send stripped error reports (class + message template + stack frames only \u2014 no paths or file names) to the endpoint below. Off by default.").addToggle(
+      (t) => t.setValue(this.plugin.settings.errorReportingEnabled).onChange(async (v) => {
+        this.plugin.settings.errorReportingEnabled = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian7.Setting(el).setName("Reporting endpoint").setDesc("HTTPS URL that receives the JSON reports. Leave empty to disable sending.").addText(
+      (txt) => txt.setPlaceholder("https://\u2026").setValue(this.plugin.settings.errorReportingEndpoint).onChange(async (v) => {
+        this.plugin.settings.errorReportingEndpoint = v.trim();
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian7.Setting(el).setName("Preview a test report").setDesc("Show the exact JSON that would be sent, and optionally send it.").addButton(
+      (b) => b.setButtonText("Preview / send test").onClick(() => this.plugin.previewErrorReport())
+    );
+  }
+  buildFallbackPreview(folder) {
+    var _a, _b;
+    const activeFile = this.app.workspace.getActiveFile();
+    const sourcePath = (_a = activeFile == null ? void 0 : activeFile.path) != null ? _a : "Drive Sync/Example/Example Document.pdf";
+    const stem = (_b = sourcePath.replace(/\.pdf$/i, "").split("/").pop()) != null ? _b : "Example";
+    let companionPath;
+    if (folder === "/") {
+      companionPath = `${stem}.md`;
+    } else if (folder) {
+      const resolved = this.resolveCompanionPathTokens(folder, sourcePath);
+      companionPath = `${resolved}/${stem}.md`;
+    } else {
+      const dir = sourcePath.substring(0, sourcePath.lastIndexOf("/"));
+      companionPath = dir ? `${dir}/${stem}.md` : `${stem}.md`;
+    }
+    return `Example: ${sourcePath} \u2192 ${companionPath}`;
+  }
+  resolveCompanionPathTokens(template, vaultFilePath) {
+    const parts = vaultFilePath.split("/");
+    parts.pop();
+    const dirs = parts.filter(Boolean);
+    return template.replace(/\{\{([^}]+)\}\}/g, (match, token) => {
+      var _a, _b;
+      if (token === "RootFolder")
+        return (_a = dirs[0]) != null ? _a : "";
+      const lm = token.match(/^folderL(\d+)$/);
+      if (lm) {
+        const level = parseInt(lm[1], 10);
+        return (_b = dirs[dirs.length - level]) != null ? _b : "";
+      }
+      return match;
+    });
+  }
   renderAutomationsTab(el) {
     el.createEl("h3", { text: "Automations" });
     el.createEl("p", {
       text: "Run actions automatically after a PDF is downloaded. Each automation matches a vault folder path and performs an action on the file.",
       cls: "setting-item-description"
     });
+    new import_obsidian7.Setting(el).setName("Per-file opt-out").setDesc(
+      'To skip automations on a specific file, add to its companion note frontmatter: `drive-sync-skip-automations: ["automation-id-1", "automation-id-2"]` or `drive-sync-skip-all: true` to skip all automations for that file.'
+    );
     const automationsContainer = el.createDiv();
     this.renderAutomations(automationsContainer);
-    new import_obsidian6.Setting(el).addButton(
+    new import_obsidian7.Setting(el).addButton(
       (btn) => btn.setButtonText("+ Add automation").setCta().onClick(async () => {
         const id = this.generateId();
         this.plugin.settings.automations.push({
@@ -1918,11 +3247,11 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         syncBtn.setAttr("disabled", "");
         try {
           const result = await this.plugin.runSyncForPair(pair.id);
-          new import_obsidian6.Notice(
+          new import_obsidian7.Notice(
             `"${pair.label}" \u2014 ${result.downloaded} downloaded, ${result.skipped} up to date` + (((_a = result.moved) != null ? _a : 0) > 0 ? `, ${result.moved} moved` : "") + (result.removed > 0 ? `, ${result.removed} removed` : "") + (((_b = result.archived) != null ? _b : 0) > 0 ? `, ${result.archived} archived` : "") + (result.errors > 0 ? `, ${result.errors} errors` : "")
           );
         } catch (e) {
-          new import_obsidian6.Notice(`Sync failed: ${e.message}`);
+          new import_obsidian7.Notice(`Sync failed: ${e.message}`);
         } finally {
           syncBtn.removeAttribute("disabled");
         }
@@ -1932,7 +3261,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         await this.plugin.saveSettings();
         this.display();
       });
-      new import_obsidian6.Setting(bodyEl).setName("Label").setDesc("A friendly name for this sync pair.").addText(
+      new import_obsidian7.Setting(bodyEl).setName("Label").setDesc("A friendly name for this sync pair.").addText(
         (text) => text.setPlaceholder("e.g. Boox Notes").setValue(pair.label).onChange(async (val) => {
           this.plugin.settings.syncPairs[i].label = val;
           const titleEl = cardEl.querySelector(".drive-sync-card-title");
@@ -1941,7 +3270,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian6.Setting(bodyEl).setName("Drive folder ID").setDesc("The ID from the folder URL: drive.google.com/drive/folders/FOLDER_ID \u2014 you can paste the full URL here.").addText(
+      new import_obsidian7.Setting(bodyEl).setName("Drive folder ID").setDesc("The ID from the folder URL: drive.google.com/drive/folders/FOLDER_ID \u2014 you can paste the full URL here.").addText(
         (text) => text.setPlaceholder("1aBcDeFgHiJkLmNo\u2026 or paste full URL").setValue(pair.driveFolderId).onChange(async (val) => {
           const match = val.match(/\/folders\/([a-zA-Z0-9_-]+)/);
           const id = match ? match[1] : val.trim();
@@ -1951,13 +3280,13 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian6.Setting(bodyEl).setName("Vault destination").setDesc("Folder in your vault where PDFs will appear. Created if missing.").addText(
+      new import_obsidian7.Setting(bodyEl).setName("Vault destination").setDesc("Folder in your vault where PDFs will appear. Created if missing.").addText(
         (text) => text.setPlaceholder("Drive Sync").setValue(pair.vaultDestFolder).onChange(async (val) => {
           this.plugin.settings.syncPairs[i].vaultDestFolder = val.trim() || "Drive Sync";
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian6.Setting(bodyEl).setName("Excluded subfolders").setDesc("Comma-separated subfolder names or paths to skip during sync (e.g. Archive, Old/2023).").addText(
+      new import_obsidian7.Setting(bodyEl).setName("Excluded subfolders").setDesc("Comma-separated subfolder names or paths to skip during sync (e.g. Archive, Old/2023).").addText(
         (text) => {
           var _a;
           return text.setPlaceholder("Archive, Old/2023").setValue(((_a = pair.excludedSubfolders) != null ? _a : []).join(", ")).onChange(async (val) => {
@@ -1966,7 +3295,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      new import_obsidian6.Setting(bodyEl).setName("Skip root-level files").setDesc("Ignore files sitting directly inside this Drive folder \u2014 only sync files found inside subfolders.").addToggle(
+      new import_obsidian7.Setting(bodyEl).setName("Skip root-level files").setDesc("Ignore files sitting directly inside this Drive folder \u2014 only sync files found inside subfolders.").addToggle(
         (toggle) => {
           var _a;
           return toggle.setValue((_a = pair.excludeRootFiles) != null ? _a : false).onChange(async (val) => {
@@ -1975,7 +3304,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      new import_obsidian6.Setting(bodyEl).setName("Root files only").setDesc("Only sync files directly inside this Drive folder \u2014 ignore all subfolders.").addToggle(
+      new import_obsidian7.Setting(bodyEl).setName("Root files only").setDesc("Only sync files directly inside this Drive folder \u2014 ignore all subfolders.").addToggle(
         (toggle) => {
           var _a;
           return toggle.setValue((_a = pair.rootFilesOnly) != null ? _a : false).onChange(async (val) => {
@@ -1984,7 +3313,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      new import_obsidian6.Setting(bodyEl).setName("Collapse single-file folders").setDesc("Strip a wrapper folder when it has the same name as the file inside it. e.g. Books/My Book/My Book.pdf \u2192 Books/My Book.pdf").addToggle(
+      new import_obsidian7.Setting(bodyEl).setName("Collapse single-file folders").setDesc("Strip a wrapper folder when it has the same name as the file inside it. e.g. Books/My Book/My Book.pdf \u2192 Books/My Book.pdf").addToggle(
         (toggle) => {
           var _a;
           return toggle.setValue((_a = pair.collapseSingleFileFolder) != null ? _a : false).onChange(async (val) => {
@@ -1995,13 +3324,13 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
       );
       const advancedEl = bodyEl.createDiv();
       advancedEl.style.display = "none";
-      const advancedToggle = new import_obsidian6.Setting(bodyEl).setName("Advanced overrides").setDesc("Override global deletion and companion note settings for this pair only.").addToggle(
+      const advancedToggle = new import_obsidian7.Setting(bodyEl).setName("Advanced overrides").setDesc("Override global deletion and companion note settings for this pair only.").addToggle(
         (toggle) => toggle.setValue(false).onChange((val) => {
           advancedEl.style.display = val ? "block" : "none";
         })
       );
       bodyEl.insertBefore(advancedToggle.settingEl, advancedEl);
-      const pairArchiveSetting = new import_obsidian6.Setting(advancedEl).setName("Deletion behavior (override)").setDesc("Leave unset to use the global setting.").addDropdown((drop) => {
+      const pairArchiveSetting = new import_obsidian7.Setting(advancedEl).setName("Deletion behavior (override)").setDesc("Leave unset to use the global setting.").addDropdown((drop) => {
         var _a;
         drop.addOption("", "\u2014 use global \u2014").addOption("keep", "Keep in vault").addOption("delete", "Move to system trash").addOption("delete_keep_companion", "Move to system trash (keep companion note)").addOption("delete_only_companion", "Keep PDF, delete companion note only").addOption("archive", "Move to archive folder").addOption("archive_keep_companion", "Move to archive folder (keep companion note)").setValue((_a = pair.deletionBehavior) != null ? _a : "").onChange(async (val) => {
           this.plugin.settings.syncPairs[i].deletionBehavior = val ? val : void 0;
@@ -2009,7 +3338,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           pairArchivePathSetting.settingEl.toggle(val === "archive" || val === "archive_keep_companion");
         });
       });
-      const pairArchivePathSetting = new import_obsidian6.Setting(advancedEl).setName("Archive folder (override)").setDesc("Vault folder to archive removed files into for this pair.").addText(
+      const pairArchivePathSetting = new import_obsidian7.Setting(advancedEl).setName("Archive folder (override)").setDesc("Vault folder to archive removed files into for this pair.").addText(
         (text) => {
           var _a;
           return text.setPlaceholder(this.plugin.settings.archiveFolder).setValue((_a = pair.archiveFolder) != null ? _a : "").onChange(async (val) => {
@@ -2019,7 +3348,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         }
       );
       pairArchivePathSetting.settingEl.toggle(pair.deletionBehavior === "archive" || pair.deletionBehavior === "archive_keep_companion");
-      const driveArchiveBehaviorSetting = new import_obsidian6.Setting(advancedEl).setName("Drive archive behavior (override)").setDesc(
+      const driveArchiveBehaviorSetting = new import_obsidian7.Setting(advancedEl).setName("Drive archive behavior (override)").setDesc(
         "What to do with the vault copy when a file moves to the Drive Archive folder. Leave unset to use this pair's deletion behavior. Only applies when a Drive Archive folder ID is configured globally."
       ).addDropdown((drop) => {
         var _a;
@@ -2029,13 +3358,13 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         });
       });
       driveArchiveBehaviorSetting.settingEl.toggle(!!this.plugin.settings.driveArchiveFolderId);
-      new import_obsidian6.Setting(advancedEl).setName("Companion notes (override)").setDesc("Leave unset to use the global setting.").addDropdown(
+      new import_obsidian7.Setting(advancedEl).setName("Companion notes (override)").setDesc("Leave unset to use the global setting.").addDropdown(
         (drop) => drop.addOption("", "\u2014 use global \u2014").addOption("true", "Enabled").addOption("false", "Disabled").setValue(pair.companionNotesEnabled === void 0 ? "" : String(pair.companionNotesEnabled)).onChange(async (val) => {
           this.plugin.settings.syncPairs[i].companionNotesEnabled = val === "" ? void 0 : val === "true";
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian6.Setting(advancedEl).setName("Companion notes folder (override)").setDesc(
+      new import_obsidian7.Setting(advancedEl).setName("Companion notes folder (override)").setDesc(
         'Override the global companion notes folder for this pair. Leave empty to use the global setting. Use "/" to place notes in the vault root. Supports tokens: {{RootFolder}}, {{folderL1}}, {{folderL2}}. Example: Notes/{{RootFolder}}/{{folderL1}}'
       ).addText(
         (text) => {
@@ -2046,7 +3375,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      new import_obsidian6.Setting(advancedEl).setName("Companion note title (override)").setDesc(
+      new import_obsidian7.Setting(advancedEl).setName("Companion note title (override)").setDesc(
         "Override the global title template for companion notes in this pair. Leave empty to use the global setting. Supports: {{title}} (PDF stem), {{fileName}}, {{pairLabel}}, {{relativePath}}."
       ).addText(
         (text) => {
@@ -2057,7 +3386,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      new import_obsidian6.Setting(advancedEl).setName("Companion note template (override)").setDesc(
+      new import_obsidian7.Setting(advancedEl).setName("Companion note template (override)").setDesc(
         "Vault path to a .md template file for companion notes in this pair. Leave empty to use the global template. Available placeholders: {{title}}, {{fileName}}, {{fileLink}}, {{lastUpdate}}, {{syncDate}}, {{driveFileId}}, {{relativePath}}, {{pairLabel}}"
       ).addText(
         (text) => {
@@ -2098,26 +3427,41 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         const count = this.plugin.countMatchingFilesForAutomation(automation.id);
         new RunOnExistingFilesModal(this.app, automation.name, count, (force) => {
           (async () => {
-            const notice = new import_obsidian6.Notice(`Running "${automation.name}"\u2026`, 0);
+            const notice = new import_obsidian7.Notice(`Running "${automation.name}"\u2026`, 0);
             try {
               const r = await this.plugin.runAutomationOnExistingFiles(automation.id, { force });
               notice.hide();
-              new import_obsidian6.Notice(
+              new import_obsidian7.Notice(
                 `"${automation.name}" \u2014 ${r.ran} ran, ${r.skipped} skipped` + (r.errors > 0 ? `, ${r.errors} errors` : "")
               );
             } catch (err) {
               notice.hide();
-              new import_obsidian6.Notice(`Automation failed: ${err.message}`);
+              new import_obsidian7.Notice(`Automation failed: ${err.message}`);
             }
           })();
         }).open();
+      });
+      const DRY_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+      this.addCardButton(controlsEl, DRY_ICON, "Dry run \u2014 preview what would happen", () => {
+        (async () => {
+          var _a2;
+          const notice = new import_obsidian7.Notice(`Dry run for "${automation.name}"\u2026`, 0);
+          try {
+            const r = await this.plugin.dryRunAutomationOnExistingFiles(automation.id);
+            notice.hide();
+            new AutomationDryRunModal(this.app, automation.name, (_a2 = r.preview) != null ? _a2 : []).open();
+          } catch (err) {
+            notice.hide();
+            new import_obsidian7.Notice(`Dry run failed: ${err.message}`);
+          }
+        })();
       });
       this.addCardButton(controlsEl, TRASH_ICON, "Delete this automation", async () => {
         this.plugin.settings.automations.splice(i, 1);
         await this.plugin.saveSettings();
         this.display();
       });
-      new import_obsidian6.Setting(bodyEl).setName("Name").setDesc("A descriptive name for this automation.").addText(
+      new import_obsidian7.Setting(bodyEl).setName("Name").setDesc("A descriptive name for this automation.").addText(
         (text) => text.setPlaceholder("e.g. Embed daily PDFs").setValue(automation.name).onChange(async (val) => {
           this.plugin.settings.automations[i].name = val;
           const titleEl = cardEl.querySelector(".drive-sync-card-title");
@@ -2126,7 +3470,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian6.Setting(bodyEl).setName("Trigger folder").setDesc(
+      new import_obsidian7.Setting(bodyEl).setName("Trigger folder").setDesc(
         "Vault path prefix to watch. Date tokens are resolved from the PDF filename. " + TOKEN_HINT + " Example: Onyx/Notebooks/Daily/{{YYYY}}/Q{{Q}}"
       ).addText(
         (text) => text.setPlaceholder("Onyx/Notebooks/Daily/{{YYYY}}/Q{{Q}}").setValue(automation.triggerFolderPath).onChange(async (val) => {
@@ -2134,7 +3478,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
-      new import_obsidian6.Setting(bodyEl).setName("File scope").setDesc(
+      new import_obsidian7.Setting(bodyEl).setName("File scope").setDesc(
         'Which files inside the trigger folder fire this automation. "All files" includes every depth. "Root files only" skips subfolders. "Subfolders only" skips files sitting directly in the trigger folder.'
       ).addDropdown(
         (drop) => {
@@ -2145,7 +3489,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      new import_obsidian6.Setting(bodyEl).setName("Excluded subfolders").setDesc(
+      new import_obsidian7.Setting(bodyEl).setName("Excluded subfolders").setDesc(
         'Comma-separated subfolder names (relative to the trigger folder) whose files should be ignored. Example: "Archive, Old" skips files inside Archive/ and Old/.'
       ).addText(
         (text) => {
@@ -2157,7 +3501,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      new import_obsidian6.Setting(bodyEl).setName("Action").setDesc(
+      new import_obsidian7.Setting(bodyEl).setName("Action").setDesc(
         "Periodic embeds insert a link into the matching periodic note (path configured in the Notes tab). append_to_note appends to any named note. add_tag_to_companion adds a tag to the companion note's frontmatter. link_to_matching_note finds notes in a folder whose name contains all words of the PDF title and inserts an embed. transcribe_to_periodic_note appends the Gemini transcription to a periodic note (requires Gemini enabled)."
       ).addDropdown(
         (drop) => drop.addOption("embed_to_daily_note", "Embed to daily note").addOption("embed_to_weekly_note", "Embed to weekly note").addOption("embed_to_monthly_note", "Embed to monthly note").addOption("embed_to_quarterly_note", "Embed to quarterly note").addOption("embed_to_yearly_note", "Embed to yearly note").addOption("append_to_note", "Append to note").addOption("add_tag_to_companion", "Add tag to companion note").addOption("link_to_matching_note", "Link to matching note").addOption("transcribe_to_periodic_note", "Transcribe to periodic note").addOption("transcribe_to_companion", "Transcribe to companion note").setValue(automation.action.type).onChange(async (val) => {
@@ -2166,7 +3510,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           updateActionFieldVisibility(val);
         })
       );
-      const dailyPatternSetting = new import_obsidian6.Setting(bodyEl).setName("Daily note path (override)").setDesc(
+      const dailyPatternSetting = new import_obsidian7.Setting(bodyEl).setName("Daily note path (override)").setDesc(
         "Per-automation override for the daily note path. Uses the same format as the global Daily note path in the Notes tab (folder + filename with Moment.js tokens). " + TOKEN_HINT + " Example: Journal/Daily/{{YYYY}}-{{MM}}-{{DD}}. Leave empty to use the global Daily note path from the Notes tab (or fall back to frontmatter search if that is also unset)."
       ).addText(
         (text) => text.setPlaceholder("{{YYYY}}-{{MM}}-{{DD}}").setValue(automation.action.dailyNoteNamePattern).onChange(async (val) => {
@@ -2174,7 +3518,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           await this.plugin.saveSettings();
         })
       );
-      const targetNoteSetting = new import_obsidian6.Setting(bodyEl).setName("Target note path").setDesc("Vault path to the note where the embed will be appended (e.g. MOCs/All PDFs.md).").addText(
+      const targetNoteSetting = new import_obsidian7.Setting(bodyEl).setName("Target note path").setDesc("Vault path to the note where the embed will be appended (e.g. MOCs/All PDFs.md).").addText(
         (text) => {
           var _a2;
           return text.setPlaceholder("MOCs/All PDFs.md").setValue((_a2 = automation.action.targetNotePath) != null ? _a2 : "").onChange(async (val) => {
@@ -2183,7 +3527,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      const tagNameSetting = new import_obsidian6.Setting(bodyEl).setName("Tag name").setDesc("Tag to add to the companion note's frontmatter tags array (without leading #).").addText(
+      const tagNameSetting = new import_obsidian7.Setting(bodyEl).setName("Tag name").setDesc("Tag to add to the companion note's frontmatter tags array (without leading #).").addText(
         (text) => {
           var _a2;
           return text.setPlaceholder("synced").setValue((_a2 = automation.action.tagName) != null ? _a2 : "").onChange(async (val) => {
@@ -2192,7 +3536,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      const searchFolderSetting = new import_obsidian6.Setting(bodyEl).setName("Search folder path").setDesc(
+      const searchFolderSetting = new import_obsidian7.Setting(bodyEl).setName("Search folder path").setDesc(
         'Vault folder to search for notes whose name contains all words of the PDF title (case-insensitive, punctuation ignored). Example: "Books/Notes".'
       ).addText(
         (text) => {
@@ -2203,7 +3547,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      const createNoteIfNotFoundSetting = new import_obsidian6.Setting(bodyEl).setName("Create note if not found").setDesc(
+      const createNoteIfNotFoundSetting = new import_obsidian7.Setting(bodyEl).setName("Create note if not found").setDesc(
         "When enabled, a new note is created if no matching note exists in the search folder. The new note uses the PDF title as its filename and can be pre-filled from a template."
       ).addToggle(
         (toggle) => {
@@ -2217,7 +3561,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         }
       );
       const createNoteEnabled = (_a = automation.action.createNoteIfNotFound) != null ? _a : false;
-      const newNoteFolderSetting = new import_obsidian6.Setting(bodyEl).setName("New note folder").setDesc("Folder where the new note is created. Defaults to the search folder when left empty.").addText(
+      const newNoteFolderSetting = new import_obsidian7.Setting(bodyEl).setName("New note folder").setDesc("Folder where the new note is created. Defaults to the search folder when left empty.").addText(
         (text) => {
           var _a2;
           return text.setPlaceholder("(uses search folder)").setValue((_a2 = automation.action.newNoteFolder) != null ? _a2 : "").onChange(async (val) => {
@@ -2227,7 +3571,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         }
       );
       newNoteFolderSetting.settingEl.toggle(createNoteEnabled);
-      const newNoteTemplateSetting = new import_obsidian6.Setting(bodyEl).setName("New note template").setDesc(
+      const newNoteTemplateSetting = new import_obsidian7.Setting(bodyEl).setName("New note template").setDesc(
         "Vault path to a template note whose content is copied into the new note. Leave empty to create a blank note."
       ).addText(
         (text) => {
@@ -2239,7 +3583,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         }
       );
       newNoteTemplateSetting.settingEl.toggle(createNoteEnabled);
-      const matchThresholdSetting = new import_obsidian6.Setting(bodyEl).setName("Match confidence threshold").setDesc(
+      const matchThresholdSetting = new import_obsidian7.Setting(bodyEl).setName("Match confidence threshold").setDesc(
         "Fraction of PDF title words that must appear in a note name (1.0 = all words). Lower values allow partial matches (e.g. 0.5 = half the words)."
       ).addSlider(
         (slider) => {
@@ -2250,7 +3594,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      const matchAliasesSetting = new import_obsidian6.Setting(bodyEl).setName("Match on aliases").setDesc("Also check note frontmatter aliases fields when searching for a match.").addToggle(
+      const matchAliasesSetting = new import_obsidian7.Setting(bodyEl).setName("Match on aliases").setDesc("Also check note frontmatter aliases fields when searching for a match.").addToggle(
         (toggle) => {
           var _a2;
           return toggle.setValue((_a2 = automation.action.matchOnAliases) != null ? _a2 : false).onChange(async (val) => {
@@ -2259,7 +3603,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      const bidirectionalLinkSetting = new import_obsidian6.Setting(bodyEl).setName("Bidirectional link").setDesc("Also add a backlink to the matched note inside the companion note.").addToggle(
+      const bidirectionalLinkSetting = new import_obsidian7.Setting(bodyEl).setName("Bidirectional link").setDesc("Also add a backlink to the matched note inside the companion note.").addToggle(
         (toggle) => {
           var _a2;
           return toggle.setValue((_a2 = automation.action.bidirectionalLink) != null ? _a2 : false).onChange(async (val) => {
@@ -2268,7 +3612,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      const periodicNoteTypeSetting = new import_obsidian6.Setting(bodyEl).setName("Periodic note type").setDesc("Which periodic note to append the transcription to.").addDropdown(
+      const periodicNoteTypeSetting = new import_obsidian7.Setting(bodyEl).setName("Periodic note type").setDesc("Which periodic note to append the transcription to.").addDropdown(
         (drop) => {
           var _a2;
           return drop.addOption("daily", "Daily").addOption("weekly", "Weekly").addOption("monthly", "Monthly").addOption("quarterly", "Quarterly").addOption("yearly", "Yearly").setValue((_a2 = automation.action.periodicNoteType) != null ? _a2 : "daily").onChange(async (val) => {
@@ -2277,7 +3621,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      const transcriptionTemplateSetting = new import_obsidian6.Setting(bodyEl).setName("Transcription template").setDesc(
+      const transcriptionTemplateSetting = new import_obsidian7.Setting(bodyEl).setName("Transcription template").setDesc(
         "Template for the content inserted into the periodic note. Placeholders: {{transcription}}, {{title}}, {{date}}, {{link}} \u2192 [[file]], {{embed}} \u2192 ![[file]]. Leave empty to use the default."
       ).addTextArea((text) => {
         var _a2;
@@ -2290,13 +3634,13 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
         text.inputEl.style.fontFamily = "monospace";
         text.inputEl.style.resize = "vertical";
       });
-      const insertPositionSetting = new import_obsidian6.Setting(bodyEl).setName("Insert position").setDesc("Where in the note to insert the embed.").addDropdown(
+      const insertPositionSetting = new import_obsidian7.Setting(bodyEl).setName("Insert position").setDesc("Where in the note to insert the embed.").addDropdown(
         (drop) => drop.addOption("bottom", "Bottom of note").addOption("top", "Top (after frontmatter)").setValue(automation.action.insertPosition).onChange(async (val) => {
           this.plugin.settings.automations[i].action.insertPosition = val;
           await this.plugin.saveSettings();
         })
       );
-      const embedCompanionSetting = new import_obsidian6.Setting(bodyEl).setName("Embed companion note instead of file").setDesc(
+      const embedCompanionSetting = new import_obsidian7.Setting(bodyEl).setName("Embed companion note instead of file").setDesc(
         "When enabled, inserts a link to the companion note rather than the PDF. Falls back to the PDF if no companion note exists."
       ).addToggle(
         (toggle) => {
@@ -2307,7 +3651,7 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
           });
         }
       );
-      const embedTemplateSetting = new import_obsidian6.Setting(bodyEl).setName("Embed template").setDesc(
+      const embedTemplateSetting = new import_obsidian7.Setting(bodyEl).setName("Embed template").setDesc(
         "Template for the content inserted into the note. Supports multiple lines. Leave empty for the default (![[file]]). Placeholders: {{embed}} \u2192 ![[target]], {{link}} \u2192 [[target]], {{target}} \u2192 embed target name, {{title}} \u2192 PDF stem (no extension), {{date}} \u2192 YYYY-MM-DD."
       ).addTextArea((text) => {
         var _a2;
@@ -2351,7 +3695,81 @@ var DriveSyncSettingTab = class extends import_obsidian6.PluginSettingTab {
     return Math.random().toString(36).slice(2) + Date.now().toString(36);
   }
 };
-var RunOnExistingFilesModal = class extends import_obsidian6.Modal {
+var NoteFilePicker = class extends import_obsidian7.FuzzySuggestModal {
+  constructor(app, onChoose) {
+    super(app);
+    this.onChoose = onChoose;
+    this.setPlaceholder("Pick a markdown file\u2026");
+  }
+  getItems() {
+    return this.app.vault.getMarkdownFiles();
+  }
+  getItemText(file) {
+    return file.path;
+  }
+  onChooseItem(file) {
+    this.onChoose(file);
+  }
+};
+var TemplatePreviewModal = class extends import_obsidian7.Modal {
+  constructor(app, template) {
+    super(app);
+    this.template = template;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: "Template preview" });
+    const sampleTitle = "Example Document";
+    const sampleFile = "Example Document.pdf";
+    const sampleDate = new Date().toISOString().slice(0, 10);
+    const sampleTranscription = "This is a sample transcription.\n\nSecond paragraph of content.";
+    let rendered;
+    if (this.template) {
+      rendered = this.template.replaceAll("{{transcription}}", sampleTranscription).replaceAll("{{title}}", sampleTitle).replaceAll("{{fileName}}", sampleFile).replaceAll("{{date}}", sampleDate).replaceAll("{{link}}", `[[${sampleTitle}]]`).replaceAll("{{embed}}", `![[${sampleFile}]]`).replaceAll("{{sourcePath}}", "Drive Sync/Example/Example Document.pdf").replaceAll("{{pairLabel}}", "My Pair");
+    } else {
+      rendered = `## Transcription
+
+*Source: ${sampleFile}*
+
+${sampleTranscription}`;
+    }
+    contentEl.createEl("p", {
+      text: "Rendered using synthetic example data:",
+      cls: "setting-item-description"
+    });
+    const pre = contentEl.createEl("pre");
+    pre.style.cssText = "background:var(--background-secondary);padding:12px;border-radius:4px;white-space:pre-wrap;font-family:monospace;font-size:var(--font-ui-smaller);overflow:auto;max-height:400px;";
+    pre.textContent = rendered;
+    new import_obsidian7.Setting(contentEl).addButton((b) => b.setButtonText("Close").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ConfirmClearTranscriptionsModal = class extends import_obsidian7.Modal {
+  constructor(app, count, onConfirm) {
+    super(app);
+    this.count = count;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: "Clear all transcription records?" });
+    contentEl.createEl("p", {
+      text: `This will delete ${this.count} transcription record${this.count !== 1 ? "s" : ""}. All PDFs will be re-transcribed on the next sync. This cannot be undone.`
+    });
+    new import_obsidian7.Setting(contentEl).addButton(
+      (b) => b.setButtonText("Clear all").setWarning().onClick(() => {
+        this.close();
+        this.onConfirm();
+      })
+    ).addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var RunOnExistingFilesModal = class extends import_obsidian7.Modal {
   constructor(app, automationName, matchedCount, onConfirm) {
     super(app);
     this.automationName = automationName;
@@ -2366,10 +3784,10 @@ var RunOnExistingFilesModal = class extends import_obsidian6.Modal {
       text: `This will check ${this.matchedCount} matching file${this.matchedCount !== 1 ? "s" : ""}.`,
       cls: "setting-item-description"
     });
-    new import_obsidian6.Setting(contentEl).setName("Force re-run").setDesc("Re-run even for files already completed at the current Drive version.").addToggle((t) => t.setValue(false).onChange((v) => {
+    new import_obsidian7.Setting(contentEl).setName("Force re-run").setDesc("Re-run even for files already completed at the current Drive version.").addToggle((t) => t.setValue(false).onChange((v) => {
       this.force = v;
     }));
-    new import_obsidian6.Setting(contentEl).addButton(
+    new import_obsidian7.Setting(contentEl).addButton(
       (b) => b.setButtonText("Run").setCta().onClick(() => {
         this.close();
         this.onConfirm(this.force);
@@ -2382,16 +3800,30 @@ var RunOnExistingFilesModal = class extends import_obsidian6.Modal {
 };
 
 // automation/AutomationEngine.ts
-var import_obsidian7 = require("obsidian");
-var LOG8 = "[DriveSync/Automation]";
+var import_obsidian8 = require("obsidian");
+var LOG11 = "[DriveSync/Automation]";
 var AutomationEngine = class {
-  constructor(app, settings, manifest) {
+  constructor(app, settings, manifest, bus) {
     this.app = app;
     this.settings = settings;
     this.manifest = manifest;
+    this.bus = bus;
   }
   updateSettings(settings) {
     this.settings = settings;
+  }
+  setBus(bus) {
+    this.bus = bus;
+  }
+  emitRun(vaultPath, automation, result, error) {
+    var _a;
+    (_a = this.bus) == null ? void 0 : _a.emit("automation-run", {
+      vaultPath,
+      automationId: automation.id,
+      automationName: automation.name,
+      result,
+      ...error ? { error } : {}
+    });
   }
   updateManifest(manifest) {
     this.manifest = manifest;
@@ -2409,6 +3841,7 @@ var AutomationEngine = class {
       return { matched: 0, ran: 0, skipped: 0, errors: 0 };
     const entries = (_b = (_a = this.manifest) == null ? void 0 : _a.entries()) != null ? _b : [];
     let matched = 0, ran = 0, skipped = 0, errors = 0;
+    const preview = [];
     for (const [driveFileId, entry] of entries) {
       if (!this.matchesTrigger(automation, entry.vaultPath))
         continue;
@@ -2420,10 +3853,13 @@ var AutomationEngine = class {
         (_c = opts.force) != null ? _c : false
       );
       if (opts.dryRun) {
-        if (willRun)
+        if (willRun) {
           ran++;
-        else
+          preview.push({ vaultPath: entry.vaultPath, willRun: true });
+        } else {
           skipped++;
+          preview.push({ vaultPath: entry.vaultPath, willRun: false, skipReason: "already ran for this Drive version" });
+        }
         continue;
       }
       if (!willRun) {
@@ -2435,7 +3871,7 @@ var AutomationEngine = class {
         });
         continue;
       }
-      console.log(`${LOG8} runForAllMatchingFiles: running "${automation.name}" for "${entry.vaultPath}"`);
+      console.log(`${LOG11} runForAllMatchingFiles: running "${automation.name}" for "${entry.vaultPath}"`);
       try {
         await this.runAction(
           automation.action,
@@ -2452,7 +3888,7 @@ var AutomationEngine = class {
         ran++;
       } catch (e) {
         console.error(
-          `${LOG8} runForAllMatchingFiles: "${automation.name}" failed for "${entry.vaultPath}":`,
+          `${LOG11} runForAllMatchingFiles: "${automation.name}" failed for "${entry.vaultPath}":`,
           e
         );
         (_i = this.manifest) == null ? void 0 : _i.recordAutomationRun(driveFileId, automation.id, {
@@ -2467,19 +3903,51 @@ var AutomationEngine = class {
     if (!opts.dryRun && (ran > 0 || errors > 0)) {
       await ((_j = this.manifest) == null ? void 0 : _j.save());
     }
-    return { matched, ran, skipped, errors };
+    return { matched, ran, skipped, errors, ...opts.dryRun ? { preview } : {} };
   }
-  async runForFile(vaultPath, companionPath, driveCreatedTime, transcription, driveFileId, driveModifiedTime, force = false) {
+  async runForFile(opts) {
     var _a, _b, _c;
+    const {
+      vaultPath,
+      companionPath,
+      driveCreatedTime,
+      transcription,
+      driveFileId,
+      driveModifiedTime,
+      force = false,
+      ignoreFolderTrigger = false
+    } = opts;
     const matching = this.settings.automations.filter(
-      (a) => a.enabled && this.matchesTrigger(a, vaultPath)
+      (a) => a.enabled && (ignoreFolderTrigger || this.matchesTrigger(a, vaultPath))
     );
     if (matching.length === 0)
       return;
+    let skipAll = false;
+    let skipList = [];
+    if (companionPath) {
+      const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
+      if (companionFile instanceof import_obsidian8.TFile) {
+        const cache = this.app.metadataCache.getFileCache(companionFile);
+        const fm = cache == null ? void 0 : cache.frontmatter;
+        if ((fm == null ? void 0 : fm["drive-sync-skip-all"]) === true)
+          skipAll = true;
+        if (Array.isArray(fm == null ? void 0 : fm["drive-sync-skip-automations"])) {
+          skipList = fm["drive-sync-skip-automations"];
+        }
+      }
+    }
+    if (skipAll) {
+      console.log(`${LOG11} Skipping all automations for "${vaultPath}" \u2014 drive-sync-skip-all: true`);
+      return;
+    }
     for (const automation of matching) {
+      if (skipList.includes(automation.id)) {
+        console.log(`${LOG11} Skipping automation "${automation.name}" for "${vaultPath}" \u2014 in drive-sync-skip-automations`);
+        continue;
+      }
       const shouldRun = this.shouldRunAutomation(automation.id, driveFileId, driveModifiedTime, force);
       if (!shouldRun) {
-        console.log(`${LOG8} Skipping automation "${automation.name}" for "${vaultPath}" \u2014 already ran for this Drive version`);
+        console.log(`${LOG11} Skipping automation "${automation.name}" for "${vaultPath}" \u2014 already ran for this Drive version`);
         if (driveFileId) {
           (_a = this.manifest) == null ? void 0 : _a.recordAutomationRun(driveFileId, automation.id, {
             lastRunAt: new Date().toISOString(),
@@ -2489,9 +3957,10 @@ var AutomationEngine = class {
         }
         continue;
       }
-      console.log(`${LOG8} Running automation "${automation.name}" for: ${vaultPath}`);
+      console.log(`${LOG11} Running automation "${automation.name}" for: ${vaultPath}`);
       try {
         await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, transcription);
+        this.emitRun(vaultPath, automation, "success");
         if (driveFileId) {
           (_b = this.manifest) == null ? void 0 : _b.recordAutomationRun(driveFileId, automation.id, {
             lastRunAt: new Date().toISOString(),
@@ -2500,7 +3969,8 @@ var AutomationEngine = class {
           });
         }
       } catch (e) {
-        console.error(`${LOG8} Automation "${automation.name}" failed for "${vaultPath}":`, e);
+        console.error(`${LOG11} Automation "${automation.name}" failed for "${vaultPath}":`, e);
+        this.emitRun(vaultPath, automation, "error", e instanceof Error ? e.message : String(e));
         if (driveFileId) {
           (_c = this.manifest) == null ? void 0 : _c.recordAutomationRun(driveFileId, automation.id, {
             lastRunAt: new Date().toISOString(),
@@ -2510,6 +3980,98 @@ var AutomationEngine = class {
           });
         }
       }
+    }
+  }
+  /**
+   * Run a single automation against any vault file on demand, bypassing the trigger-folder filter.
+   *
+   * Untracked files (no manifest entry) skip the decision matrix entirely — every invocation runs
+   * the action because there's no driveFileId to record history against. Re-running on the same
+   * untracked file is therefore not idempotent at the matrix level; callers that need idempotency
+   * should rely on the actions themselves (which generally check before inserting).
+   */
+  async runForFileAdHoc(vaultPath, automationId, opts = {}) {
+    var _a, _b, _c, _d, _e, _f, _g;
+    const automation = this.settings.automations.find((a) => a.id === automationId);
+    if (!automation)
+      return { ran: false, skippedReason: "automation not found" };
+    if (!automation.enabled)
+      return { ran: false, skippedReason: "automation disabled" };
+    const file = this.app.vault.getAbstractFileByPath(vaultPath);
+    if (!(file instanceof import_obsidian8.TFile)) {
+      return { ran: false, skippedReason: `file not found in vault: ${vaultPath}` };
+    }
+    const entry = (_a = this.manifest) == null ? void 0 : _a.findByVaultPath(vaultPath);
+    const tracked = !!entry;
+    let companionPath = null;
+    let driveCreatedTime;
+    let driveFileId;
+    let driveModifiedTime;
+    if (entry) {
+      const [id, manifestEntry] = entry;
+      driveFileId = id;
+      companionPath = manifestEntry.companionPath;
+      driveCreatedTime = manifestEntry.driveCreatedTime;
+      driveModifiedTime = manifestEntry.driveModifiedTime;
+      if (companionPath) {
+        const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
+        if (companionFile instanceof import_obsidian8.TFile) {
+          const cache = this.app.metadataCache.getFileCache(companionFile);
+          const fm = cache == null ? void 0 : cache.frontmatter;
+          if ((fm == null ? void 0 : fm["drive-sync-skip-all"]) === true) {
+            return { ran: false, skippedReason: "drive-sync-skip-all: true" };
+          }
+          if (Array.isArray(fm == null ? void 0 : fm["drive-sync-skip-automations"]) && fm["drive-sync-skip-automations"].includes(automationId)) {
+            return { ran: false, skippedReason: "in drive-sync-skip-automations" };
+          }
+        }
+      }
+    } else {
+      driveModifiedTime = new Date(file.stat.mtime).toISOString();
+    }
+    const force = opts.force === true || !tracked;
+    const shouldRun = this.shouldRunAutomation(automationId, driveFileId, driveModifiedTime, force);
+    if (!shouldRun) {
+      if (driveFileId && !opts.dryRun) {
+        (_b = this.manifest) == null ? void 0 : _b.recordAutomationRun(driveFileId, automationId, {
+          lastRunAt: new Date().toISOString(),
+          lastRunDriveModifiedTime: driveModifiedTime != null ? driveModifiedTime : "",
+          result: "skipped"
+        });
+        await ((_c = this.manifest) == null ? void 0 : _c.save());
+      }
+      return { ran: false, skippedReason: "already ran for this Drive version" };
+    }
+    if (opts.dryRun) {
+      return { ran: true };
+    }
+    console.log(`${LOG11} runForFileAdHoc: running "${automation.name}" for "${vaultPath}" (tracked=${tracked})`);
+    try {
+      await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, void 0);
+      this.emitRun(vaultPath, automation, "success");
+      if (driveFileId) {
+        (_d = this.manifest) == null ? void 0 : _d.recordAutomationRun(driveFileId, automationId, {
+          lastRunAt: new Date().toISOString(),
+          lastRunDriveModifiedTime: driveModifiedTime != null ? driveModifiedTime : "",
+          result: "success"
+        });
+        await ((_e = this.manifest) == null ? void 0 : _e.save());
+      }
+      return { ran: true };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`${LOG11} runForFileAdHoc: "${automation.name}" failed for "${vaultPath}":`, e);
+      this.emitRun(vaultPath, automation, "error", msg);
+      if (driveFileId) {
+        (_f = this.manifest) == null ? void 0 : _f.recordAutomationRun(driveFileId, automationId, {
+          lastRunAt: new Date().toISOString(),
+          lastRunDriveModifiedTime: driveModifiedTime != null ? driveModifiedTime : "",
+          result: "error",
+          errorMessage: msg
+        });
+        await ((_g = this.manifest) == null ? void 0 : _g.save());
+      }
+      return { ran: false, error: msg };
     }
   }
   /**
@@ -2589,16 +4151,16 @@ var AutomationEngine = class {
       return;
     const dateStr = this.resolveDate(fileName, driveCreatedTime);
     if (!dateStr) {
-      console.log(`${LOG8} No date found for daily note embed: ${fileName}`);
+      console.log(`${LOG11} No date found for daily note embed: ${fileName}`);
       return;
     }
     const pattern = action.dailyNoteNamePattern || this.settings.periodicNotesPaths.daily;
     const dailyNote = pattern ? this.findNoteByPattern(dateStr, pattern) : this.findDailyNoteByFrontmatter(dateStr);
     if (!dailyNote) {
-      console.log(`${LOG8} No daily note found for date: ${dateStr}`);
+      console.log(`${LOG11} No daily note found for date: ${dateStr}`);
       return;
     }
-    console.log(`${LOG8} Found daily note: ${dailyNote.path}`);
+    console.log(`${LOG11} Found daily note: ${dailyNote.path}`);
     const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
     const pdfStem = fileName.replace(/\.[^/.]+$/, "");
     const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
@@ -2610,21 +4172,21 @@ var AutomationEngine = class {
       return;
     const dateStr = this.resolveDate(fileName, driveCreatedTime);
     if (!dateStr) {
-      console.log(`${LOG8} No date found for ${period} note embed: ${fileName}`);
+      console.log(`${LOG11} No date found for ${period} note embed: ${fileName}`);
       return;
     }
     const pathTemplate = this.settings.periodicNotesPaths[period];
     if (!pathTemplate) {
-      console.log(`${LOG8} No path configured for ${period} notes \u2014 skipping. Set it in Settings \u2192 Periodic Notes.`);
+      console.log(`${LOG11} No path configured for ${period} notes \u2014 skipping. Set it in Settings \u2192 Periodic Notes.`);
       return;
     }
     const resolvedPath = this.resolveDatePattern(pathTemplate, dateStr);
     const note = this.findNoteByPath(resolvedPath);
     if (!note) {
-      console.log(`${LOG8} No ${period} note found for date ${dateStr} (looked for "${resolvedPath}")`);
+      console.log(`${LOG11} No ${period} note found for date ${dateStr} (looked for "${resolvedPath}")`);
       return;
     }
-    console.log(`${LOG8} Found ${period} note: ${note.path}`);
+    console.log(`${LOG11} Found ${period} note: ${note.path}`);
     const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
     const pdfStem = fileName.replace(/\.[^/.]+$/, "");
     const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
@@ -2633,12 +4195,12 @@ var AutomationEngine = class {
   async runAppendToNote(vaultPath, companionPath, action) {
     var _a;
     if (!action.targetNotePath) {
-      console.warn(`${LOG8} append_to_note: no targetNotePath configured`);
+      console.warn(`${LOG11} append_to_note: no targetNotePath configured`);
       return;
     }
     const target = this.app.vault.getAbstractFileByPath(action.targetNotePath);
-    if (!(target instanceof import_obsidian7.TFile)) {
-      console.log(`${LOG8} append_to_note: target note not found: ${action.targetNotePath}`);
+    if (!(target instanceof import_obsidian8.TFile)) {
+      console.log(`${LOG11} append_to_note: target note not found: ${action.targetNotePath}`);
       return;
     }
     const fileName = (_a = vaultPath.split("/").pop()) != null ? _a : vaultPath;
@@ -2650,31 +4212,31 @@ var AutomationEngine = class {
   }
   async runAddTagToCompanion(companionPath, action) {
     if (!action.tagName) {
-      console.warn(`${LOG8} add_tag_to_companion: no tagName configured`);
+      console.warn(`${LOG11} add_tag_to_companion: no tagName configured`);
       return;
     }
     if (!companionPath) {
-      console.log(`${LOG8} add_tag_to_companion: no companion note for this file \u2014 skipping`);
+      console.log(`${LOG11} add_tag_to_companion: no companion note for this file \u2014 skipping`);
       return;
     }
     const file = this.app.vault.getAbstractFileByPath(companionPath);
-    if (!(file instanceof import_obsidian7.TFile)) {
-      console.log(`${LOG8} add_tag_to_companion: companion note not found: ${companionPath}`);
+    if (!(file instanceof import_obsidian8.TFile)) {
+      console.log(`${LOG11} add_tag_to_companion: companion note not found: ${companionPath}`);
       return;
     }
     const content = await this.app.vault.read(file);
     const newContent = this.addTagToFrontmatter(content, action.tagName);
     if (newContent !== content) {
       await this.app.vault.modify(file, newContent);
-      console.log(`${LOG8} Added tag "${action.tagName}" to companion note: ${companionPath}`);
+      console.log(`${LOG11} Added tag "${action.tagName}" to companion note: ${companionPath}`);
     } else {
-      console.log(`${LOG8} Tag "${action.tagName}" already present in: ${companionPath}`);
+      console.log(`${LOG11} Tag "${action.tagName}" already present in: ${companionPath}`);
     }
   }
   async runLinkToMatchingNote(vaultPath, companionPath, action) {
     var _a, _b, _c;
     if (!action.searchFolderPath) {
-      console.warn(`${LOG8} link_to_matching_note: no searchFolderPath configured`);
+      console.warn(`${LOG11} link_to_matching_note: no searchFolderPath configured`);
       return;
     }
     const fileName = (_a = vaultPath.split("/").pop()) != null ? _a : vaultPath;
@@ -2704,7 +4266,7 @@ var AutomationEngine = class {
       return { file, score };
     }).filter((m) => m.score >= threshold).sort((a, b) => b.score - a.score);
     if (scored.length === 0) {
-      console.log(`${LOG8} link_to_matching_note: no notes in "${folderPrefix}" match stem "${stem}" (threshold=${threshold})`);
+      console.log(`${LOG11} link_to_matching_note: no notes in "${folderPrefix}" match stem "${stem}" (threshold=${threshold})`);
       if (action.createNoteIfNotFound) {
         await this.createAndLinkNote(stem, fileName, folderPrefix, action);
       }
@@ -2713,12 +4275,12 @@ var AutomationEngine = class {
     const dateStr = this.extractDate(fileName);
     const matchLine = this.buildEmbedLine(action.embedTemplate, fileName, stem, dateStr);
     for (const { file: note } of scored) {
-      console.log(`${LOG8} link_to_matching_note: inserting embed into ${note.path} (score=${(_c = scored.find((m) => m.file === note)) == null ? void 0 : _c.score.toFixed(2)})`);
+      console.log(`${LOG11} link_to_matching_note: inserting embed into ${note.path} (score=${(_c = scored.find((m) => m.file === note)) == null ? void 0 : _c.score.toFixed(2)})`);
       await this.insertEmbed(note, matchLine, action.insertPosition);
     }
     if (action.bidirectionalLink && companionPath) {
       const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
-      if (companionFile instanceof import_obsidian7.TFile) {
+      if (companionFile instanceof import_obsidian8.TFile) {
         for (const { file: matchedNote } of scored) {
           const backLink = `[[${matchedNote.basename}]]`;
           await this.insertEmbed(companionFile, backLink, action.insertPosition);
@@ -2729,7 +4291,7 @@ var AutomationEngine = class {
   async runTranscribeToPeriodicNote(vaultPath, companionPath, action, driveCreatedTime, transcription) {
     var _a, _b;
     if (!transcription) {
-      console.log(`${LOG8} transcribe_to_periodic_note: no transcription available \u2014 skipping`);
+      console.log(`${LOG11} transcribe_to_periodic_note: no transcription available \u2014 skipping`);
       return;
     }
     const fileName = vaultPath.split("/").pop();
@@ -2737,19 +4299,19 @@ var AutomationEngine = class {
       return;
     const dateStr = this.resolveDate(fileName, driveCreatedTime);
     if (!dateStr) {
-      console.log(`${LOG8} transcribe_to_periodic_note: no date found for "${fileName}" \u2014 skipping`);
+      console.log(`${LOG11} transcribe_to_periodic_note: no date found for "${fileName}" \u2014 skipping`);
       return;
     }
     const period = (_a = action.periodicNoteType) != null ? _a : "daily";
     const pathTemplate = this.settings.periodicNotesPaths[period];
     if (!pathTemplate) {
-      console.log(`${LOG8} transcribe_to_periodic_note: no path configured for ${period} notes \u2014 skipping`);
+      console.log(`${LOG11} transcribe_to_periodic_note: no path configured for ${period} notes \u2014 skipping`);
       return;
     }
     const resolvedPath = this.resolveDatePattern(pathTemplate, dateStr);
     const note = this.findNoteByPath(resolvedPath);
     if (!note) {
-      console.log(`${LOG8} transcribe_to_periodic_note: no ${period} note found for date ${dateStr} ("${resolvedPath}")`);
+      console.log(`${LOG11} transcribe_to_periodic_note: no ${period} note found for date ${dateStr} ("${resolvedPath}")`);
       return;
     }
     const pdfStem = fileName.replace(/\.[^/.]+$/, "");
@@ -2759,7 +4321,7 @@ var AutomationEngine = class {
 
 {{transcription}}`;
     const content = template.replace(/\{\{transcription\}\}/g, transcription).replace(/\{\{title\}\}/g, pdfStem).replace(/\{\{date\}\}/g, dateStr).replace(/\{\{link\}\}/g, `[[${embedTarget}]]`).replace(/\{\{embed\}\}/g, `![[${embedTarget}]]`);
-    console.log(`${LOG8} transcribe_to_periodic_note: appending to ${note.path}`);
+    console.log(`${LOG11} transcribe_to_periodic_note: appending to ${note.path}`);
     await this.insertEmbed(note, content, action.insertPosition);
   }
   async createAndLinkNote(stem, fileName, searchFolderPath, action) {
@@ -2769,18 +4331,18 @@ var AutomationEngine = class {
     const existing = this.app.vault.getAbstractFileByPath(notePath);
     const dateStr = this.extractDate(fileName);
     const embedLine = this.buildEmbedLine(action.embedTemplate, fileName, stem, dateStr);
-    if (existing instanceof import_obsidian7.TFile) {
-      console.log(`${LOG8} link_to_matching_note: note already exists at "${notePath}", inserting embed`);
+    if (existing instanceof import_obsidian8.TFile) {
+      console.log(`${LOG11} link_to_matching_note: note already exists at "${notePath}", inserting embed`);
       await this.insertEmbed(existing, embedLine, action.insertPosition);
       return;
     }
     let content = "";
     if (action.newNoteTemplatePath) {
       const templateFile = this.app.vault.getAbstractFileByPath(action.newNoteTemplatePath);
-      if (templateFile instanceof import_obsidian7.TFile) {
+      if (templateFile instanceof import_obsidian8.TFile) {
         content = await this.app.vault.read(templateFile);
       } else {
-        console.warn(`${LOG8} link_to_matching_note: template not found: ${action.newNoteTemplatePath}`);
+        console.warn(`${LOG11} link_to_matching_note: template not found: ${action.newNoteTemplatePath}`);
       }
     }
     const parts = targetFolder.split("/");
@@ -2791,7 +4353,7 @@ var AutomationEngine = class {
       }
     }
     const newNote = await this.app.vault.create(notePath, content);
-    console.log(`${LOG8} link_to_matching_note: created new note at "${notePath}"`);
+    console.log(`${LOG11} link_to_matching_note: created new note at "${notePath}"`);
     await this.insertEmbed(newNote, embedLine, action.insertPosition);
   }
   // ── Embed target resolution ──────────────────────────────────────────────────
@@ -2873,7 +4435,7 @@ ${newFmBody}
     var _a;
     const withMd = resolvedPath.endsWith(".md") ? resolvedPath : resolvedPath + ".md";
     const candidate = this.app.vault.getAbstractFileByPath(withMd);
-    if (candidate instanceof import_obsidian7.TFile)
+    if (candidate instanceof import_obsidian8.TFile)
       return candidate;
     const expectedBasename = (_a = resolvedPath.split("/").pop()) != null ? _a : resolvedPath;
     for (const file of this.app.vault.getMarkdownFiles()) {
@@ -2886,13 +4448,13 @@ ${newFmBody}
   findNoteByPattern(dateStr, pattern) {
     var _a;
     const expectedName = this.resolveDatePattern(pattern, dateStr);
-    console.log(`${LOG8} Looking for note with name: "${expectedName}"`);
+    console.log(`${LOG11} Looking for note with name: "${expectedName}"`);
     const byPath = this.findNoteByPath(expectedName);
     if (byPath)
       return byPath;
-    const basename = (_a = expectedName.split("/").pop()) != null ? _a : expectedName;
+    const basename2 = (_a = expectedName.split("/").pop()) != null ? _a : expectedName;
     for (const file of this.app.vault.getMarkdownFiles()) {
-      if (file.basename === basename)
+      if (file.basename === basename2)
         return file;
     }
     return null;
@@ -2907,7 +4469,7 @@ ${newFmBody}
       const rawDate = cache.frontmatter.date;
       if (!rawDate || !String(rawDate).startsWith(dateStr))
         continue;
-      const tags = (_a = (0, import_obsidian7.getAllTags)(cache)) != null ? _a : [];
+      const tags = (_a = (0, import_obsidian8.getAllTags)(cache)) != null ? _a : [];
       const normalized = tags.map((t) => t.replace(/^#/, ""));
       if (normalized.includes("periodic/daily"))
         return file;
@@ -2918,7 +4480,7 @@ ${newFmBody}
   async insertEmbed(note, line, position) {
     const content = await this.app.vault.read(note);
     if (content.includes(line)) {
-      console.log(`${LOG8} Embed already present in ${note.path} \u2014 skipping`);
+      console.log(`${LOG11} Embed already present in ${note.path} \u2014 skipping`);
       return;
     }
     let newContent;
@@ -2934,7 +4496,7 @@ ${newFmBody}
       }
     }
     await this.app.vault.modify(note, newContent);
-    console.log(`${LOG8} Inserted line "${line}" into ${note.path} (${position})`);
+    console.log(`${LOG11} Inserted line "${line}" into ${note.path} (${position})`);
   }
   // ── Helpers ──────────────────────────────────────────────────────────────────
   /** Lowercase, strip punctuation, split into words. Used for fuzzy title matching. */
@@ -2957,16 +4519,16 @@ ${newFmBody}
   async runTranscribeToCompanion(companionPath, action, transcription) {
     var _a;
     if (!transcription) {
-      console.log(`${LOG8} transcribe_to_companion: no transcription available \u2014 skipping`);
+      console.log(`${LOG11} transcribe_to_companion: no transcription available \u2014 skipping`);
       return;
     }
     if (!companionPath) {
-      console.log(`${LOG8} transcribe_to_companion: no companion note for this file \u2014 skipping`);
+      console.log(`${LOG11} transcribe_to_companion: no companion note for this file \u2014 skipping`);
       return;
     }
     const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
-    if (!(companionFile instanceof import_obsidian7.TFile)) {
-      console.log(`${LOG8} transcribe_to_companion: companion note not found: ${companionPath}`);
+    if (!(companionFile instanceof import_obsidian8.TFile)) {
+      console.log(`${LOG11} transcribe_to_companion: companion note not found: ${companionPath}`);
       return;
     }
     const content = await this.app.vault.read(companionFile);
@@ -2985,7 +4547,7 @@ ${newFmBody}
       newContent = content.trimEnd() + "\n\n" + header + "\n\n" + sectionBody + "\n";
     }
     await this.app.vault.modify(companionFile, newContent);
-    console.log(`${LOG8} transcribe_to_companion: transcription written to ${companionPath}`);
+    console.log(`${LOG11} transcribe_to_companion: transcription written to ${companionPath}`);
   }
   /**
    * Resolve {{token}} placeholders in a pattern string using the given date.
@@ -2998,20 +4560,39 @@ ${newFmBody}
       const m = moment(dateStr, "YYYY-MM-DD");
       return pattern.replace(/\{\{([^}]+)\}\}/g, (_, token) => m.format(token));
     } catch (e) {
-      console.warn(`${LOG8} Failed to resolve date pattern "${pattern}" for "${dateStr}"`);
+      console.warn(`${LOG11} Failed to resolve date pattern "${pattern}" for "${dateStr}"`);
       return pattern;
     }
   }
 };
 
 // ui/SyncStatusView.ts
-var import_obsidian8 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 var SYNC_STATUS_VIEW_TYPE = "drive-sync-status";
-var SyncStatusView = class extends import_obsidian8.ItemView {
+var EVENT_ICON = {
+  downloaded: "download",
+  uploaded: "upload",
+  skipped: "minus",
+  moved: "move",
+  removed: "trash",
+  conflict: "alert-triangle",
+  "automation-run": "zap",
+  "manifest-write": "save",
+  "auth-failed": "shield-alert",
+  "auth-restored": "shield-check",
+  "recycle-write": "archive",
+  "sync-complete": "check-circle",
+  "quota-pause": "pause",
+  error: "x-circle"
+};
+var SyncStatusView = class extends import_obsidian9.ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
     this.result = null;
+    this.tab = "summary";
+    this.liveListEl = null;
+    this.livePaused = false;
   }
   getViewType() {
     return SYNC_STATUS_VIEW_TYPE;
@@ -3027,15 +4608,46 @@ var SyncStatusView = class extends import_obsidian8.ItemView {
   }
   updateResult(result) {
     this.result = result;
-    this.render();
+    if (this.tab === "summary")
+      this.render();
+  }
+  /** Phase 12.1 — append a single bus event to the live ticker when that tab is open. */
+  onBusEvent(rec) {
+    var _a;
+    if (this.tab !== "live" || !this.liveListEl || this.livePaused)
+      return;
+    this.prependLiveRow(rec);
+    while (this.liveListEl.childElementCount > 50) {
+      (_a = this.liveListEl.lastElementChild) == null ? void 0 : _a.remove();
+    }
   }
   render() {
-    var _a, _b, _c, _d, _e;
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl("h4", { text: "Drive Sync Status" });
+    const tabs = contentEl.createDiv({ cls: "drive-sync-tabs" });
+    tabs.style.cssText = "display:flex; gap:4px; margin-bottom:8px;";
+    const mkTab = (id, label) => {
+      const b = tabs.createEl("button", { text: label });
+      b.style.cssText = `flex:1; padding:4px; cursor:pointer;${this.tab === id ? " font-weight:bold; border-bottom:2px solid var(--interactive-accent);" : ""}`;
+      b.onclick = () => {
+        this.tab = id;
+        this.render();
+      };
+    };
+    mkTab("summary", "Summary");
+    mkTab("live", "Live");
+    const body = contentEl.createDiv();
+    if (this.tab === "summary")
+      this.renderSummary(body);
+    else
+      this.renderLive(body);
+  }
+  renderSummary(root) {
+    var _a, _b, _c, _d, _e, _f;
+    this.renderHealth(root);
     if (!this.result) {
-      contentEl.createEl("p", {
+      root.createEl("p", {
         text: "No sync has run yet in this session.",
         cls: "setting-item-description"
       });
@@ -3043,7 +4655,7 @@ var SyncStatusView = class extends import_obsidian8.ItemView {
     }
     const r = this.result;
     const ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : "unknown";
-    contentEl.createEl("p", { text: `Last sync: ${ts}` });
+    root.createEl("p", { text: `Last sync: ${ts}` });
     const summaryParts = [
       `${r.downloaded} downloaded`,
       `${r.skipped} up to date`,
@@ -3052,10 +4664,9 @@ var SyncStatusView = class extends import_obsidian8.ItemView {
       ...((_b = r.archived) != null ? _b : 0) > 0 ? [`${r.archived} archived`] : [],
       `${r.errors} errors`
     ];
-    const summary = contentEl.createEl("p");
-    summary.textContent = `Total \u2014 ${summaryParts.join(", ")}`;
+    root.createEl("p").textContent = `Total \u2014 ${summaryParts.join(", ")}`;
     if (r.pairs && Object.keys(r.pairs).length > 0) {
-      contentEl.createEl("h5", { text: "Per-pair breakdown" });
+      root.createEl("h5", { text: "Per-pair breakdown" });
       const showMoved = Object.values(r.pairs).some((pr) => {
         var _a2;
         return ((_a2 = pr.moved) != null ? _a2 : 0) > 0;
@@ -3064,10 +4675,9 @@ var SyncStatusView = class extends import_obsidian8.ItemView {
         var _a2;
         return ((_a2 = pr.archived) != null ? _a2 : 0) > 0;
       });
-      const table = contentEl.createEl("table");
+      const table = root.createEl("table");
       table.style.cssText = "width: 100%; border-collapse: collapse;";
-      const thead = table.createEl("thead");
-      const headerRow = thead.createEl("tr");
+      const headerRow = table.createEl("thead").createEl("tr");
       const headers = ["Pair", "Downloaded", "Up to date"];
       if (showMoved)
         headers.push("Moved");
@@ -3084,9 +4694,8 @@ var SyncStatusView = class extends import_obsidian8.ItemView {
         this.plugin.settings.syncPairs.map((p) => [p.id, p.label])
       );
       for (const [pairId, pr] of Object.entries(r.pairs)) {
-        const label = (_c = pairLabelMap[pairId]) != null ? _c : pairId;
         const tr = tbody.createEl("tr");
-        const cells = [label, String(pr.downloaded), String(pr.skipped)];
+        const cells = [(_c = pairLabelMap[pairId]) != null ? _c : pairId, String(pr.downloaded), String(pr.skipped)];
         if (showMoved)
           cells.push(String((_d = pr.moved) != null ? _d : 0));
         cells.push(String(pr.removed));
@@ -3099,12 +4708,131 @@ var SyncStatusView = class extends import_obsidian8.ItemView {
         });
       }
     }
+    if ((_f = r.conflicts) == null ? void 0 : _f.length) {
+      root.createEl("h5", { text: "Companion note conflicts" });
+      root.createEl("p", {
+        text: `${r.conflicts.length} companion note${r.conflicts.length !== 1 ? "s were" : " was"} edited locally since the last sync. Conflict backups were created:`,
+        cls: "setting-item-description"
+      });
+      const list = root.createEl("ul");
+      for (const conflictPath of r.conflicts)
+        list.createEl("li", { text: conflictPath });
+    }
+  }
+  /** Phase 12.2 — colored health dot per pair, computed by the plugin. */
+  renderHealth(root) {
+    const pairs = this.plugin.settings.syncPairs;
+    if (pairs.length === 0)
+      return;
+    root.createEl("h5", { text: "Pair health" });
+    const wrap = root.createDiv();
+    for (const pair of pairs) {
+      const h = this.plugin.getPairHealth(pair.id);
+      const row = wrap.createDiv();
+      row.style.cssText = "display:flex; align-items:center; gap:6px; padding:2px 0;";
+      const dot = row.createSpan();
+      dot.style.cssText = `width:10px; height:10px; border-radius:50%; background:${h.color}; flex:0 0 auto;`;
+      dot.setAttr("aria-label", h.tooltip);
+      dot.setAttr("title", h.tooltip);
+      row.createSpan({ text: pair.label });
+    }
+  }
+  renderLive(root) {
+    const controls = root.createDiv();
+    controls.style.cssText = "display:flex; gap:6px; margin-bottom:6px;";
+    const pauseBtn = controls.createEl("button", { text: this.livePaused ? "Resume" : "Pause" });
+    pauseBtn.onclick = () => {
+      this.livePaused = !this.livePaused;
+      this.render();
+    };
+    const clearBtn = controls.createEl("button", { text: "Clear" });
+    clearBtn.onclick = () => {
+      this.plugin.recentEvents.length = 0;
+      this.render();
+    };
+    this.liveListEl = root.createDiv({ cls: "drive-sync-live" });
+    this.liveListEl.style.cssText = "max-height: 60vh; overflow:auto;";
+    const events = this.plugin.recentEvents;
+    if (events.length === 0) {
+      this.liveListEl.createEl("p", { text: "No events yet.", cls: "setting-item-description" });
+      return;
+    }
+    for (let i = events.length - 1; i >= 0; i--)
+      this.appendLiveRow(events[i]);
+  }
+  prependLiveRow(rec) {
+    if (!this.liveListEl)
+      return;
+    const placeholder = this.liveListEl.querySelector(".setting-item-description");
+    placeholder == null ? void 0 : placeholder.remove();
+    const row = this.makeLiveRow(rec);
+    this.liveListEl.prepend(row);
+  }
+  appendLiveRow(rec) {
+    var _a;
+    (_a = this.liveListEl) == null ? void 0 : _a.appendChild(this.makeLiveRow(rec));
+  }
+  makeLiveRow(rec) {
+    var _a;
+    const row = createDiv();
+    row.style.cssText = "display:flex; gap:6px; align-items:baseline; padding:2px 0; font-size:12px; border-bottom:1px solid var(--background-modifier-border);";
+    const time = row.createSpan({ text: new Date(rec.at).toLocaleTimeString() });
+    time.style.cssText = "color: var(--text-muted); flex:0 0 auto;";
+    const icon = row.createSpan();
+    icon.style.cssText = "flex:0 0 auto;";
+    (0, import_obsidian9.setIcon)(icon, (_a = EVENT_ICON[rec.event]) != null ? _a : "circle");
+    const summary = this.summarize(rec);
+    const text = row.createSpan({ text: summary.text });
+    if (summary.path) {
+      text.style.cssText = "cursor:pointer; text-decoration:underline dotted;";
+      text.onclick = () => {
+        const f = this.app.vault.getAbstractFileByPath(summary.path);
+        if (f instanceof import_obsidian9.TFile)
+          this.app.workspace.getLeaf(false).openFile(f);
+      };
+    }
+    return row;
+  }
+  summarize(rec) {
+    const p = rec.payload;
+    switch (rec.event) {
+      case "downloaded":
+        return { text: `Downloaded ${p.vaultPath}`, path: p.vaultPath };
+      case "uploaded":
+        return { text: `Uploaded ${p.vaultPath}`, path: p.vaultPath };
+      case "skipped":
+        return { text: `Skipped ${p.vaultPath} (${p.reason})`, path: p.vaultPath };
+      case "moved":
+        return { text: `Moved \u2192 ${p.toPath}`, path: p.toPath };
+      case "removed":
+        return { text: `Removed ${p.vaultPath} (${p.behavior})`, path: p.vaultPath };
+      case "conflict":
+        return { text: `Conflict: ${p.vaultPath}`, path: p.vaultPath };
+      case "automation-run":
+        return { text: `${p.automationName}: ${p.result} on ${p.vaultPath}`, path: p.vaultPath };
+      case "manifest-write":
+        return { text: `Manifest saved (${p.entryCount} entries)` };
+      case "auth-failed":
+        return { text: `Auth failed: ${p.reason}` };
+      case "auth-restored":
+        return { text: `Auth restored` };
+      case "recycle-write":
+        return { text: `Recycled ${p.originalPath}`, path: p.recyclePath };
+      case "sync-complete":
+        return { text: `Sync complete` };
+      case "quota-pause":
+        return { text: `Quota guard paused uploads` };
+      case "error":
+        return { text: `Error: ${p.message}` };
+      default:
+        return { text: rec.event };
+    }
   }
 };
 
 // ui/DryRunModal.ts
-var import_obsidian9 = require("obsidian");
-var DryRunModal = class extends import_obsidian9.Modal {
+var import_obsidian10 = require("obsidian");
+var DryRunModal = class extends import_obsidian10.Modal {
   constructor(app, result) {
     super(app);
     this.result = result;
@@ -3150,57 +4878,478 @@ var DryRunModal = class extends import_obsidian9.Modal {
   }
 };
 
+// ui/FileTrackerModal.ts
+var import_obsidian11 = require("obsidian");
+var ONE_DAY_MS = 864e5;
+var MICRO_BTN = "font-size: 11px; padding: 1px 5px; border-radius: 4px; cursor: pointer; border: 1px solid var(--background-modifier-border); background: var(--background-secondary); color: var(--text-muted); line-height: 1.4; white-space: nowrap;";
+var FileTrackerModal = class extends import_obsidian11.Modal {
+  constructor(app, manifest, transcriptionStore, settings, onRetranscribe) {
+    super(app);
+    this.manifest = manifest;
+    this.transcriptionStore = transcriptionStore;
+    this.settings = settings;
+    this.onRetranscribe = onRetranscribe;
+    this.filterText = "";
+    this.sortCol = "updated";
+    this.sortDir = -1;
+    this.modalEl.addClass("drive-sync-file-tracker");
+  }
+  onOpen() {
+    this.modalEl.style.cssText = "width: min(900px, 92vw); max-height: 80vh;";
+    this.contentEl.style.cssText = "display: flex; flex-direction: column; height: 100%;";
+    this.render();
+  }
+  buildRows() {
+    return this.manifest.entries().map(([driveFileId, entry]) => {
+      var _a;
+      return {
+        driveFileId,
+        vaultPath: entry.vaultPath,
+        companionPath: entry.companionPath,
+        pairId: entry.pairId,
+        driveModifiedTime: entry.driveModifiedTime,
+        ts: this.transcriptionStore.get(driveFileId),
+        isPdf: entry.vaultPath.toLowerCase().endsWith(".pdf"),
+        transcriptionDisabled: (_a = entry.transcriptionDisabled) != null ? _a : false
+      };
+    });
+  }
+  render() {
+    const { contentEl } = this;
+    contentEl.empty();
+    const pairLabelMap = Object.fromEntries(
+      this.settings.syncPairs.map((p) => [p.id, p.label])
+    );
+    const allRows = this.buildRows();
+    const transcribed = allRows.filter((r) => r.ts).length;
+    const header = contentEl.createDiv();
+    header.style.cssText = "flex-shrink: 0; padding-bottom: 12px;";
+    header.createEl("h2", { text: "File Tracker" }).style.margin = "0 0 4px";
+    header.createEl("p", {
+      text: `${allRows.length} files synced \xB7 ${transcribed} transcribed`,
+      cls: "setting-item-description"
+    }).style.margin = "0 0 10px";
+    const searchInput = header.createEl("input", {
+      type: "text",
+      placeholder: "Filter by filename\u2026"
+    });
+    searchInput.style.cssText = "width: 100%; padding: 6px 10px; border-radius: 4px; border: 1px solid var(--background-modifier-border); background: var(--background-primary); color: var(--text-normal); font-size: 13px;";
+    searchInput.value = this.filterText;
+    searchInput.addEventListener("input", () => {
+      this.filterText = searchInput.value.toLowerCase();
+      this.renderTable(tableWrap, allRows, pairLabelMap);
+    });
+    const tableWrap = contentEl.createDiv();
+    tableWrap.style.cssText = "flex: 1; overflow-y: auto; overflow-x: auto;";
+    this.renderTable(tableWrap, allRows, pairLabelMap);
+  }
+  renderTable(container, allRows, pairLabelMap) {
+    var _a;
+    container.empty();
+    const rows = allRows.filter((r) => {
+      if (!this.filterText)
+        return true;
+      return r.vaultPath.toLowerCase().includes(this.filterText);
+    });
+    if (rows.length === 0) {
+      const msg = container.createEl("p", {
+        text: this.filterText ? "No files match your filter." : "No files synced yet.",
+        cls: "setting-item-description"
+      });
+      msg.style.cssText = "padding: 16px 0; text-align: center;";
+      return;
+    }
+    rows.sort((a, b) => {
+      var _a2, _b, _c, _d;
+      let cmp = 0;
+      if (this.sortCol === "name") {
+        cmp = basename(a.vaultPath).localeCompare(basename(b.vaultPath));
+      } else if (this.sortCol === "updated") {
+        cmp = a.driveModifiedTime.localeCompare(b.driveModifiedTime);
+      } else {
+        const ta = (_b = (_a2 = a.ts) == null ? void 0 : _a2.lastTranscribedAt) != null ? _b : "";
+        const tb = (_d = (_c = b.ts) == null ? void 0 : _c.lastTranscribedAt) != null ? _d : "";
+        cmp = ta.localeCompare(tb);
+      }
+      return cmp * this.sortDir;
+    });
+    const table = container.createEl("table");
+    table.style.cssText = "width: 100%; border-collapse: collapse; font-size: 13px;";
+    const thead = table.createEl("thead");
+    const headerRow = thead.createEl("tr");
+    const cols = [
+      { label: "File", key: "name" },
+      { label: "Pair", key: null },
+      { label: "Drive Updated", key: "updated" },
+      { label: "Transcription", key: "transcribed" },
+      { label: "Pages", key: null, tip: "Page count at last transcription. Arrow shows growth detected on re-download." },
+      { label: "Destinations", key: null }
+    ];
+    for (const col of cols) {
+      const th = headerRow.createEl("th");
+      const isActive = col.key && this.sortCol === col.key;
+      th.textContent = col.label + (isActive ? this.sortDir === 1 ? " \u2191" : " \u2193" : "");
+      th.title = (_a = col.tip) != null ? _a : "";
+      th.style.cssText = "text-align: left; padding: 6px 10px; border-bottom: 2px solid var(--background-modifier-border); white-space: nowrap; font-weight: 600; " + (col.key ? "cursor: pointer;" : "cursor: default;");
+      if (col.key) {
+        const key = col.key;
+        th.addEventListener("click", () => {
+          if (this.sortCol === key) {
+            this.sortDir = this.sortDir * -1;
+          } else {
+            this.sortCol = key;
+            this.sortDir = -1;
+          }
+          this.renderTable(container, allRows, pairLabelMap);
+        });
+      }
+    }
+    const tbody = table.createEl("tbody");
+    for (const row of rows) {
+      this.renderRow(tbody, row, pairLabelMap);
+    }
+  }
+  renderRow(tbody, row, pairLabelMap) {
+    var _a, _b;
+    const tr = tbody.createEl("tr");
+    tr.style.cssText = "border-bottom: 1px solid var(--background-modifier-border-hover);";
+    tr.addEventListener("mouseenter", () => {
+      tr.style.background = "var(--background-modifier-hover)";
+    });
+    tr.addEventListener("mouseleave", () => {
+      tr.style.background = "";
+    });
+    const tdFile = tr.createEl("td");
+    tdFile.style.cssText = "padding: 7px 10px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;";
+    const name = basename(row.vaultPath);
+    const fileLink = tdFile.createEl("a", { text: name });
+    fileLink.title = row.vaultPath;
+    fileLink.style.cssText = "cursor: pointer; color: var(--link-color); text-decoration: none;";
+    fileLink.addEventListener("click", () => this.openFile(row.vaultPath));
+    const tdPair = tr.createEl("td");
+    tdPair.style.cssText = "padding: 7px 10px; white-space: nowrap;";
+    const pairLabel = (_a = pairLabelMap[row.pairId]) != null ? _a : row.pairId;
+    const badge = tdPair.createEl("span", { text: pairLabel });
+    badge.style.cssText = "font-size: 11px; padding: 2px 7px; border-radius: 10px; background: var(--background-modifier-hover); white-space: nowrap;";
+    const tdDriveUpdated = tr.createEl("td");
+    tdDriveUpdated.style.cssText = "padding: 7px 10px; white-space: nowrap; color: var(--text-muted);";
+    tdDriveUpdated.textContent = relativeTime(row.driveModifiedTime);
+    tdDriveUpdated.title = row.driveModifiedTime;
+    const tdTranscribed = tr.createEl("td");
+    tdTranscribed.style.cssText = "padding: 7px 10px;";
+    const txWrap = tdTranscribed.createDiv();
+    txWrap.style.cssText = "display: flex; align-items: center; gap: 6px; flex-wrap: nowrap;";
+    if (!row.ts) {
+      const badge2 = txWrap.createEl("span", { text: "\u2014" });
+      badge2.style.color = "var(--text-faint)";
+    } else {
+      const driveUpdatedSince = row.driveModifiedTime !== row.ts.lastTranscribedDriveModifiedTime;
+      if (driveUpdatedSince) {
+        const chip = txWrap.createEl("span", { text: "\u26A0 Stale" });
+        chip.style.cssText = "color: var(--color-orange, #e8a100); font-weight: 500; white-space: nowrap;";
+        chip.title = `Transcribed ${row.ts.lastTranscribedAt.slice(0, 10)} for Drive version ${row.ts.lastTranscribedDriveModifiedTime.slice(0, 10)}, but Drive file updated ${row.driveModifiedTime.slice(0, 10)}`;
+      } else {
+        const chip = txWrap.createEl("span", {
+          text: "\u2713 " + relativeTime(row.ts.lastTranscribedAt)
+        });
+        chip.style.cssText = "color: var(--color-green, var(--interactive-success)); white-space: nowrap;";
+        chip.title = `Transcribed: ${row.ts.lastTranscribedAt}`;
+      }
+    }
+    if (row.isPdf) {
+      if (this.onRetranscribe) {
+        const btnRetx = txWrap.createEl("button", { text: "\u21BA" });
+        btnRetx.title = "Re-transcribe this file";
+        btnRetx.style.cssText = MICRO_BTN;
+        btnRetx.addEventListener("click", (e) => {
+          e.stopPropagation();
+          this.close();
+          this.onRetranscribe(row.vaultPath);
+        });
+      }
+      const isOff = row.transcriptionDisabled;
+      const btnToggle = txWrap.createEl("button", {
+        text: isOff ? "Auto: Off" : "Auto: On"
+      });
+      btnToggle.title = isOff ? "Automatic transcription is disabled \u2014 click to re-enable" : "Click to disable automatic transcription for this file";
+      btnToggle.style.cssText = MICRO_BTN + (isOff ? " opacity: 0.5;" : "");
+      btnToggle.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        const entry = this.manifest.get(row.driveFileId);
+        if (!entry)
+          return;
+        this.manifest.set(row.driveFileId, {
+          ...entry,
+          transcriptionDisabled: !isOff
+        });
+        await this.manifest.save();
+        this.render();
+      });
+    }
+    const tdPages = tr.createEl("td");
+    tdPages.style.cssText = "padding: 7px 10px; white-space: nowrap; color: var(--text-muted);";
+    if (!row.ts || row.ts.pageCount === 0) {
+      tdPages.textContent = "\u2014";
+    } else {
+      const atTx = row.ts.pageCount;
+      const current = (_b = row.ts.currentPageCount) != null ? _b : atTx;
+      if (current > atTx) {
+        tdPages.textContent = `${atTx} \u2192 ${current} pp`;
+        tdPages.style.color = "var(--color-orange, #e8a100)";
+        tdPages.title = `${atTx} pages when transcribed; ${current} pages on last download`;
+      } else {
+        tdPages.textContent = `${atTx} pp`;
+        tdPages.title = `${atTx} pages at transcription`;
+      }
+    }
+    const tdDest = tr.createEl("td");
+    tdDest.style.cssText = "padding: 7px 10px;";
+    if (row.companionPath) {
+      this.destLink(tdDest, "\u{1F4DD}", "Companion", row.companionPath);
+    }
+    if (row.ts) {
+      for (const dest of row.ts.destinations) {
+        if (dest.type === "companion" && dest.path === row.companionPath)
+          continue;
+        const icon = dest.type === "daily" ? "\u{1F4C5}" : "\u{1F4C4}";
+        const label = dest.type === "daily" ? "Daily" : "Note";
+        this.destLink(tdDest, icon, label, dest.path, dest.transcribedAt);
+      }
+    }
+  }
+  destLink(parent, icon, label, path, title) {
+    const link = parent.createEl("a", { text: `${icon} ${label}` });
+    link.style.cssText = "cursor: pointer; color: var(--link-color); text-decoration: none; margin-right: 8px; font-size: 12px; white-space: nowrap;";
+    link.title = title ? `${path}
+${relativeTime(title)}` : path;
+    link.addEventListener("click", () => this.openFile(path));
+  }
+  openFile(path) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (file instanceof import_obsidian11.TFile) {
+      this.app.workspace.getLeaf(false).openFile(file);
+      this.close();
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+function basename(path) {
+  var _a;
+  return (_a = path.split("/").pop()) != null ? _a : path;
+}
+function relativeTime(iso) {
+  try {
+    const ms = Date.now() - new Date(iso).getTime();
+    if (ms < 0)
+      return new Date(iso).toLocaleDateString();
+    if (ms < 6e4)
+      return "just now";
+    if (ms < 36e5)
+      return `${Math.floor(ms / 6e4)}m ago`;
+    if (ms < ONE_DAY_MS)
+      return `${Math.floor(ms / 36e5)}h ago`;
+    if (ms < ONE_DAY_MS * 30)
+      return `${Math.floor(ms / ONE_DAY_MS)}d ago`;
+    return new Date(iso).toLocaleDateString();
+  } catch (e) {
+    return iso;
+  }
+}
+
+// ui/SyncLogModal.ts
+var import_obsidian12 = require("obsidian");
+var SyncLogModal = class extends import_obsidian12.Modal {
+  constructor(app, syncLog) {
+    super(app);
+    this.syncLog = syncLog;
+  }
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Sync Activity Log" });
+    const entries = await this.syncLog.readAll();
+    if (entries.length === 0) {
+      contentEl.createEl("p", { text: "No log entries yet. Enable the sync activity log in settings to start recording." });
+      this.addClose();
+      return;
+    }
+    const controls = contentEl.createDiv();
+    controls.style.cssText = "display:flex;gap:8px;margin-bottom:12px;align-items:center;";
+    const levelFilter = controls.createEl("select");
+    levelFilter.style.cssText = "padding:4px 8px;border:1px solid var(--background-modifier-border);border-radius:4px;";
+    for (const [val, label] of [["all", "All levels"], ["info", "Info"], ["warn", "Warn"], ["error", "Error"]]) {
+      levelFilter.createEl("option", { text: label, value: val });
+    }
+    const searchInput = controls.createEl("input");
+    searchInput.type = "text";
+    searchInput.placeholder = "Filter by file or action\u2026";
+    searchInput.style.cssText = "flex:1;padding:4px 8px;border:1px solid var(--background-modifier-border);border-radius:4px;";
+    const countEl = controls.createSpan();
+    countEl.style.cssText = "color:var(--text-muted);font-size:12px;white-space:nowrap;";
+    const wrapper = contentEl.createDiv();
+    wrapper.style.cssText = "overflow-y:auto;max-height:420px;border:1px solid var(--background-modifier-border);border-radius:4px;";
+    const table = wrapper.createEl("table");
+    table.style.cssText = "width:100%;border-collapse:collapse;font-size:12px;";
+    const thead = table.createEl("thead");
+    const hRow = thead.createEl("tr");
+    for (const h of ["Time", "Lvl", "Action", "File", "Result"]) {
+      const th = hRow.createEl("th", { text: h });
+      th.style.cssText = "text-align:left;padding:5px 8px;border-bottom:2px solid var(--background-modifier-border);position:sticky;top:0;background:var(--background-primary);white-space:nowrap;";
+    }
+    const tbody = table.createEl("tbody");
+    const render = () => {
+      var _a;
+      tbody.empty();
+      const level = levelFilter.value;
+      const search = searchInput.value.toLowerCase();
+      const filtered = entries.slice().reverse().filter((e) => {
+        var _a2;
+        if (level !== "all" && e.level !== level)
+          return false;
+        if (search && !((_a2 = e.file) == null ? void 0 : _a2.toLowerCase().includes(search)) && !e.action.toLowerCase().includes(search) && !e.result.toLowerCase().includes(search))
+          return false;
+        return true;
+      });
+      countEl.textContent = `${filtered.length} / ${entries.length} entries`;
+      for (const entry of filtered) {
+        const row = tbody.createEl("tr");
+        row.style.cssText = "border-bottom:1px solid var(--background-modifier-border-hover);";
+        const levelColor = entry.level === "error" ? "var(--text-error)" : entry.level === "warn" ? "var(--color-orange)" : "var(--text-muted)";
+        const td = (text, color, mono = false) => {
+          const el = row.createEl("td");
+          el.style.cssText = `padding:4px 8px;overflow:hidden;max-width:200px;${color ? `color:${color};` : ""}${mono ? "font-family:monospace;" : ""}`;
+          el.title = text;
+          el.textContent = text.length > 40 ? text.slice(0, 37) + "\u2026" : text;
+          return el;
+        };
+        td(new Date(entry.ts).toLocaleString());
+        td(entry.level, levelColor);
+        td(entry.action);
+        td((_a = entry.file) != null ? _a : "\u2014");
+        const resultEl = td(entry.result);
+        if (entry.details)
+          resultEl.title = `${entry.result}
+
+${entry.details}`;
+      }
+      if (filtered.length === 0) {
+        const row = tbody.createEl("tr");
+        const td = row.createEl("td", { text: "No matching entries." });
+        td.setAttribute("colspan", "5");
+        td.style.cssText = "padding:12px;color:var(--text-muted);text-align:center;";
+      }
+    };
+    levelFilter.addEventListener("change", render);
+    searchInput.addEventListener("input", render);
+    render();
+    this.addClose();
+  }
+  addClose() {
+    const row = this.contentEl.createDiv();
+    row.style.cssText = "display:flex;justify-content:flex-end;margin-top:12px;";
+    const btn = row.createEl("button", { text: "Close" });
+    btn.addEventListener("click", () => this.close());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// ui/FileStatusModal.ts
+var import_obsidian14 = require("obsidian");
+
 // commands/TranscribeCurrentFile.ts
-var import_obsidian10 = require("obsidian");
-var LOG9 = "[DriveSync/Transcribe]";
+var import_obsidian13 = require("obsidian");
+var LOG12 = "[DriveSync/Transcribe]";
+function openTranscribePickerForFile(app, plugin, file, fastPath) {
+  new DestinationPickerModal(app, plugin, file, fastPath).open();
+}
 async function transcribeCurrentFile(plugin) {
   var _a;
   const activeFile = plugin.app.workspace.getActiveFile();
   if (!activeFile) {
-    new import_obsidian10.Notice("No file is currently open.");
+    new import_obsidian13.Notice("No file is currently open.");
     return;
   }
   if (!activeFile.path.toLowerCase().endsWith(".pdf")) {
-    new import_obsidian10.Notice("Transcription only supports PDF files.");
+    new import_obsidian13.Notice("Transcription only supports PDF files.");
     return;
   }
   if (!plugin.settings.geminiEnabled) {
-    new import_obsidian10.Notice("AI transcription is not enabled. Enable it in Drive Sync settings.");
+    new import_obsidian13.Notice("AI transcription is not enabled. Enable it in Drive Sync settings.");
     return;
   }
   const provider = (_a = plugin.settings.transcriptionProvider) != null ? _a : "gemini";
   if (provider === "mistral" && !plugin.settings.mistralApiKey) {
-    new import_obsidian10.Notice("Mistral API key is not set. Add it in Drive Sync settings.");
+    new import_obsidian13.Notice("Mistral API key is not set. Add it in Drive Sync settings.");
     return;
   }
   if (provider === "gemini" && !plugin.settings.geminiApiKey) {
-    new import_obsidian10.Notice("Gemini API key is not set. Add it in Drive Sync settings.");
+    new import_obsidian13.Notice("Gemini API key is not set. Add it in Drive Sync settings.");
     return;
   }
   new DestinationPickerModal(plugin.app, plugin, activeFile).open();
 }
-var DestinationPickerModal = class extends import_obsidian10.Modal {
-  constructor(app, plugin, pdfFile) {
+var DestinationPickerModal = class extends import_obsidian13.Modal {
+  constructor(app, plugin, pdfFile, fastPath) {
     super(app);
     this.plugin = plugin;
     this.pdfFile = pdfFile;
+    this.fastPath = fastPath;
   }
   onOpen() {
+    var _a, _b;
+    if (this.fastPath === "companion") {
+      this.close();
+      void this.proceed({ type: "companion" });
+      return;
+    }
+    if (this.fastPath === "daily") {
+      this.close();
+      void this.proceed({ type: "daily" });
+      return;
+    }
+    const defaultDest = (_a = this.plugin.settings.transcribeDefaultDest) != null ? _a : "ask";
+    if (defaultDest === "companion") {
+      this.close();
+      void this.proceed({ type: "companion" });
+      return;
+    }
+    if (defaultDest === "daily") {
+      this.close();
+      void this.proceed({ type: "daily" });
+      return;
+    }
+    if (defaultDest === "note") {
+      this.close();
+      const defaultNotePath = ((_b = this.plugin.settings.transcribeDefaultNotePath) != null ? _b : "").trim();
+      if (defaultNotePath) {
+        const defaultNoteFile = this.app.vault.getAbstractFileByPath(defaultNotePath);
+        if (defaultNoteFile instanceof import_obsidian13.TFile) {
+          void this.proceed({ type: "note", file: defaultNoteFile });
+          return;
+        }
+      }
+      new NotePickerModal(this.app, (file) => void this.proceed({ type: "note", file })).open();
+      return;
+    }
     const { contentEl } = this;
     contentEl.createEl("h3", { text: `Transcribe "${this.pdfFile.basename}" to\u2026` });
-    new import_obsidian10.Setting(contentEl).setName("Companion note").setDesc("Create or update the companion note alongside this PDF").addButton(
+    new import_obsidian13.Setting(contentEl).setName("Companion note").setDesc("Create or update the companion note alongside this PDF").addButton(
       (b) => b.setButtonText("Select").setCta().onClick(() => {
         this.close();
         void this.proceed({ type: "companion" });
       })
     );
-    new import_obsidian10.Setting(contentEl).setName("Today's daily note").setDesc("Append transcription to today's daily note").addButton(
+    new import_obsidian13.Setting(contentEl).setName("Today's daily note").setDesc("Append transcription to today's daily note").addButton(
       (b) => b.setButtonText("Select").onClick(() => {
         this.close();
         void this.proceed({ type: "daily" });
       })
     );
-    new import_obsidian10.Setting(contentEl).setName("Pick a note\u2026").setDesc("Choose any markdown note in your vault").addButton(
+    new import_obsidian13.Setting(contentEl).setName("Pick a note\u2026").setDesc("Choose any markdown note in your vault").addButton(
       (b) => b.setButtonText("Browse").onClick(() => {
         this.close();
         new NotePickerModal(
@@ -3222,10 +5371,10 @@ var DestinationPickerModal = class extends import_obsidian10.Modal {
       new OverwriteModal(this.app, destFile.name, async (action) => {
         if (action === "skip")
           return;
-        await this.runTranscription(destFile, action);
+        await this.runTranscription(destFile, action, dest.type);
       }).open();
     } else {
-      await this.runTranscription(destFile, "replace");
+      await this.runTranscription(destFile, "replace", dest.type);
     }
   }
   async resolveDestination(dest) {
@@ -3239,22 +5388,32 @@ var DestinationPickerModal = class extends import_obsidian10.Modal {
     }
   }
   async resolveCompanion() {
+    var _a, _b;
     const { app, plugin, pdfFile } = this;
     const manifestEntry = plugin.manifestStore.findByVaultPath(pdfFile.path);
     if (manifestEntry) {
       const [, entry] = manifestEntry;
       if (entry.companionPath) {
         const existing2 = app.vault.getAbstractFileByPath(entry.companionPath);
-        if (existing2 instanceof import_obsidian10.TFile)
+        if (existing2 instanceof import_obsidian13.TFile)
           return existing2;
       }
     }
-    const dir = pdfFile.parent ? pdfFile.parent.path : "";
-    const companionPath = (0, import_obsidian10.normalizePath)(
-      dir ? `${dir}/${pdfFile.basename}.md` : `${pdfFile.basename}.md`
-    );
+    const fallbackFolder = (_b = (_a = plugin.settings.transcribeCompanionFallbackFolder) == null ? void 0 : _a.trim()) != null ? _b : "";
+    let companionPath;
+    if (fallbackFolder === "/") {
+      companionPath = (0, import_obsidian13.normalizePath)(`${pdfFile.basename}.md`);
+    } else if (fallbackFolder) {
+      const resolvedFolder = resolvePathTokens(fallbackFolder, pdfFile.path);
+      companionPath = (0, import_obsidian13.normalizePath)(`${resolvedFolder}/${pdfFile.basename}.md`);
+    } else {
+      const dir = pdfFile.parent ? pdfFile.parent.path : "";
+      companionPath = (0, import_obsidian13.normalizePath)(
+        dir ? `${dir}/${pdfFile.basename}.md` : `${pdfFile.basename}.md`
+      );
+    }
     const existing = app.vault.getAbstractFileByPath(companionPath);
-    if (existing instanceof import_obsidian10.TFile)
+    if (existing instanceof import_obsidian13.TFile)
       return existing;
     try {
       await ensureFolder(app, companionPath);
@@ -3262,7 +5421,7 @@ var DestinationPickerModal = class extends import_obsidian10.Modal {
 
 `);
     } catch (e) {
-      new import_obsidian10.Notice(`Failed to create companion note: ${e.message}`);
+      new import_obsidian13.Notice(`Failed to create companion note: ${e.message}`);
       return null;
     }
   }
@@ -3271,7 +5430,7 @@ var DestinationPickerModal = class extends import_obsidian10.Modal {
     const { app, plugin } = this;
     const dailyPath = resolveDailyNotePath(app, plugin);
     const existing = app.vault.getAbstractFileByPath(dailyPath);
-    if (existing instanceof import_obsidian10.TFile)
+    if (existing instanceof import_obsidian13.TFile)
       return existing;
     try {
       await ensureFolder(app, dailyPath);
@@ -3280,13 +5439,13 @@ var DestinationPickerModal = class extends import_obsidian10.Modal {
 
 `);
     } catch (e) {
-      new import_obsidian10.Notice(`Failed to create daily note: ${e.message}`);
+      new import_obsidian13.Notice(`Failed to create daily note: ${e.message}`);
       return null;
     }
   }
-  async runTranscription(destFile, mode) {
-    var _a;
-    const notice = new import_obsidian10.Notice(`Transcribing "${this.pdfFile.basename}"\u2026`, 0);
+  async runTranscription(destFile, mode, destType) {
+    var _a, _b, _c;
+    const notice = new import_obsidian13.Notice(`Transcribing "${this.pdfFile.basename}"\u2026`, 0);
     try {
       const pdfBytes = await this.app.vault.readBinary(this.pdfFile);
       const provider = (_a = this.plugin.settings.transcriptionProvider) != null ? _a : "gemini";
@@ -3297,16 +5456,61 @@ var DestinationPickerModal = class extends import_obsidian10.Modal {
       );
       const transcription = await client.transcribePdf(pdfBytes);
       notice.hide();
-      await writeTranscription(this.app, destFile, transcription, mode, this.pdfFile.name);
-      new import_obsidian10.Notice(`Transcription written to "${destFile.name}"`);
+      const template = await this.resolveTemplate(destType);
+      const manifestEntry = this.plugin.manifestStore.findByVaultPath(this.pdfFile.path);
+      const pairId = manifestEntry ? manifestEntry[1].pairId : null;
+      const pairLabel = pairId ? (_c = (_b = this.plugin.settings.syncPairs.find((p) => p.id === pairId)) == null ? void 0 : _b.label) != null ? _c : "" : "";
+      await writeTranscription(this.app, destFile, transcription, mode, this.pdfFile.name, template, this.pdfFile.path, pairLabel);
+      new import_obsidian13.Notice(`Transcription written to "${destFile.name}"`);
+      await this.recordTranscription(pdfBytes, destFile);
     } catch (e) {
       notice.hide();
-      console.error(LOG9, "Transcription failed:", e);
-      new import_obsidian10.Notice(`Transcription failed: ${e.message}`);
+      console.error(LOG12, "Transcription failed:", e);
+      new import_obsidian13.Notice(`Transcription failed: ${e.message}`);
     }
   }
+  async resolveTemplate(destType) {
+    var _a, _b, _c, _d;
+    if (destType === "companion") {
+      const filePath = ((_a = this.plugin.settings.transcribeCompanionTemplatePath) != null ? _a : "").trim();
+      if (filePath) {
+        try {
+          const exists = await this.app.vault.adapter.exists(filePath);
+          if (exists)
+            return await this.app.vault.adapter.read(filePath);
+        } catch (e) {
+        }
+      }
+      return ((_b = this.plugin.settings.transcribeCompanionTemplate) != null ? _b : "").trim() || void 0;
+    }
+    if (destType === "daily") {
+      return ((_c = this.plugin.settings.transcribeDailyTemplate) != null ? _c : "").trim() || void 0;
+    }
+    return ((_d = this.plugin.settings.transcribeNoteTemplate) != null ? _d : "").trim() || void 0;
+  }
+  async recordTranscription(pdfBytes, destFile) {
+    const store = this.plugin.transcriptionStore;
+    if (!store)
+      return;
+    const { analyzePdf: analyzePdf2 } = await Promise.resolve().then(() => (init_PdfPageHasher(), PdfPageHasher_exports));
+    const info = analyzePdf2(pdfBytes);
+    const manifestEntry = this.plugin.manifestStore.findByVaultPath(this.pdfFile.path);
+    const driveFileId = manifestEntry ? manifestEntry[0] : null;
+    const driveModifiedTime = manifestEntry ? manifestEntry[1].driveModifiedTime : "";
+    if (!driveFileId)
+      return;
+    const isCompanion = manifestEntry && manifestEntry[1].companionPath === destFile.path;
+    const isDaily = destFile.path.includes(moment().format("YYYY-MM-DD"));
+    const destType = isCompanion ? "companion" : isDaily ? "daily" : "note";
+    store.recordTranscription(driveFileId, this.pdfFile.path, info.hash, info.pageCount, driveModifiedTime, {
+      type: destType,
+      path: destFile.path,
+      transcribedAt: new Date().toISOString()
+    });
+    await store.save();
+  }
 };
-var OverwriteModal = class extends import_obsidian10.Modal {
+var OverwriteModal = class extends import_obsidian13.Modal {
   constructor(app, noteName, onConfirm) {
     super(app);
     this.noteName = noteName;
@@ -3318,7 +5522,7 @@ var OverwriteModal = class extends import_obsidian10.Modal {
     contentEl.createEl("p", {
       text: `"${this.noteName}" already has a ## Transcription section. What would you like to do?`
     });
-    new import_obsidian10.Setting(contentEl).addButton(
+    new import_obsidian13.Setting(contentEl).addButton(
       (b) => b.setButtonText("Skip").onClick(() => {
         this.close();
         this.onConfirm("skip");
@@ -3339,7 +5543,7 @@ var OverwriteModal = class extends import_obsidian10.Modal {
     this.contentEl.empty();
   }
 };
-var NotePickerModal = class extends import_obsidian10.FuzzySuggestModal {
+var NotePickerModal = class extends import_obsidian13.FuzzySuggestModal {
   constructor(app, onChoose) {
     super(app);
     this.onChoose = onChoose;
@@ -3364,7 +5568,7 @@ function resolveDailyNotePath(app, plugin) {
       const format = opts.format || "YYYY-MM-DD";
       const folder = ((_e = opts.folder) != null ? _e : "").trim();
       const dateStr = moment().format(format);
-      return (0, import_obsidian10.normalizePath)(folder ? `${folder}/${dateStr}.md` : `${dateStr}.md`);
+      return (0, import_obsidian13.normalizePath)(folder ? `${folder}/${dateStr}.md` : `${dateStr}.md`);
     }
   } catch (e) {
   }
@@ -3372,11 +5576,27 @@ function resolveDailyNotePath(app, plugin) {
   if (tpl) {
     const dateStr = tpl.replace(
       /\{\{([^}]+)\}\}/g,
-      (_, fmt) => moment().format(fmt)
+      (_, fmt2) => moment().format(fmt2)
     );
-    return (0, import_obsidian10.normalizePath)(`${dateStr}.md`);
+    return (0, import_obsidian13.normalizePath)(`${dateStr}.md`);
   }
-  return (0, import_obsidian10.normalizePath)(`${moment().format("YYYY-MM-DD")}.md`);
+  return (0, import_obsidian13.normalizePath)(`${moment().format("YYYY-MM-DD")}.md`);
+}
+function resolvePathTokens(template, vaultFilePath) {
+  const parts = vaultFilePath.split("/");
+  parts.pop();
+  const dirs = parts.filter(Boolean);
+  return template.replace(/\{\{([^}]+)\}\}/g, (match, token) => {
+    var _a, _b;
+    if (token === "RootFolder")
+      return (_a = dirs[0]) != null ? _a : "";
+    const lm = token.match(/^folderL(\d+)$/);
+    if (lm) {
+      const level = parseInt(lm[1], 10);
+      return (_b = dirs[dirs.length - level]) != null ? _b : "";
+    }
+    return match;
+  });
 }
 async function hasTranscriptionSection(app, file) {
   try {
@@ -3386,22 +5606,27 @@ async function hasTranscriptionSection(app, file) {
     return false;
   }
 }
-async function writeTranscription(app, file, transcription, mode, sourceName) {
+async function writeTranscription(app, file, transcription, mode, sourceName, template, sourcePath, pairLabel) {
   await app.vault.process(file, (content) => {
     const HEADER = "## Transcription";
-    const newSection = `
-
-${HEADER}
+    let newBlock;
+    if (template) {
+      const stem = sourceName.replace(/\.pdf$/i, "");
+      const date = moment().format("YYYY-MM-DD");
+      newBlock = template.replaceAll("{{transcription}}", transcription).replaceAll("{{title}}", stem).replaceAll("{{fileName}}", sourceName).replaceAll("{{date}}", date).replaceAll("{{link}}", `[[${stem}]]`).replaceAll("{{embed}}", `![[${sourceName}]]`).replaceAll("{{sourcePath}}", sourcePath != null ? sourcePath : sourceName).replaceAll("{{pairLabel}}", pairLabel != null ? pairLabel : "");
+    } else {
+      newBlock = `${HEADER}
 
 *Source: ${sourceName}*
 
 ${transcription}`;
+    }
     const sectionIdx = content.indexOf("\n" + HEADER);
     if (sectionIdx !== -1) {
       if (mode === "replace") {
         const nextSection = content.indexOf("\n## ", sectionIdx + 1);
         const end = nextSection !== -1 ? nextSection : content.length;
-        return content.slice(0, sectionIdx) + newSection + content.slice(end);
+        return content.slice(0, sectionIdx) + "\n\n" + newBlock + content.slice(end);
       } else {
         const nextSection = content.indexOf("\n## ", sectionIdx + 1);
         const insertAt = nextSection !== -1 ? nextSection : content.length;
@@ -3414,7 +5639,7 @@ ${transcription}`;
         return content.slice(0, insertAt) + block + content.slice(insertAt);
       }
     }
-    return content.trimEnd() + newSection;
+    return content.trimEnd() + "\n\n" + newBlock;
   });
 }
 async function ensureFolder(app, filePath) {
@@ -3431,6 +5656,1077 @@ async function ensureFolder(app, filePath) {
   }
 }
 
+// ui/FileStatusModal.ts
+var FileStatusModal = class extends import_obsidian14.Modal {
+  constructor(app, plugin, file) {
+    super(app);
+    this.plugin = plugin;
+    this.file = file;
+  }
+  onOpen() {
+    this.modalEl.style.cssText = "width: min(700px, 92vw); max-height: 85vh;";
+    this.contentEl.style.cssText = "overflow-y: auto; padding: 0 4px;";
+    this.render();
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+  render() {
+    var _a, _b;
+    const { contentEl, file } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `Drive Sync \u2014 ${file.basename}` }).style.marginTop = "0";
+    const manifest = this.plugin.manifestStore;
+    const transcriptionStore = this.plugin.transcriptionStore;
+    const settings = this.plugin.settings;
+    const entry = manifest.findByVaultPath(file.path);
+    if (!entry) {
+      this.renderUntracked();
+      return;
+    }
+    const [driveFileId, manifestEntry] = entry;
+    const pair = settings.syncPairs.find((p) => p.id === manifestEntry.pairId);
+    this.section("Drive metadata");
+    const meta = this.table();
+    this.row(meta, "Drive file ID", driveFileId);
+    this.row(meta, "Pair", pair ? `${pair.label} (${manifestEntry.pairId})` : manifestEntry.pairId);
+    this.row(meta, "Drive modified", manifestEntry.driveModifiedTime);
+    if (manifestEntry.driveCreatedTime) {
+      this.row(meta, "Drive created", manifestEntry.driveCreatedTime);
+    }
+    if (manifestEntry.driveTrashed) {
+      this.row(meta, "Status", "\u26A0 In Drive trash");
+    }
+    if (manifestEntry.userDeletedAt) {
+      this.row(meta, "User deleted", manifestEntry.userDeletedAt);
+    }
+    if (manifestEntry.transcriptionDisabled) {
+      this.row(meta, "Transcription", "Disabled for this file");
+    }
+    this.section("Companion note");
+    const compTable = this.table();
+    if (manifestEntry.companionPath) {
+      const companionExists = !!this.app.vault.getAbstractFileByPath(manifestEntry.companionPath);
+      const pathRow = compTable.insertRow();
+      pathRow.insertCell().textContent = "Path";
+      const pathCell = pathRow.insertCell();
+      pathRow.cells[0].style.cssText = "padding: 3px 6px; font-size: 13px; color: var(--text-muted); width: 180px;";
+      pathCell.style.cssText = "padding: 3px 6px; font-size: 13px;";
+      if (companionExists) {
+        const link = pathCell.createEl("a", { text: manifestEntry.companionPath });
+        link.style.cursor = "pointer";
+        link.addEventListener("click", () => {
+          const cf = this.app.vault.getAbstractFileByPath(manifestEntry.companionPath);
+          if (cf instanceof import_obsidian14.TFile) {
+            this.app.workspace.getLeaf(false).openFile(cf);
+            this.close();
+          }
+        });
+      } else {
+        pathCell.textContent = manifestEntry.companionPath + " (missing)";
+      }
+      this.row(compTable, "Exists", companionExists ? "Yes" : "No");
+      if (manifestEntry.companionMtime) {
+        this.row(compTable, "Last written", new Date(manifestEntry.companionMtime).toISOString());
+      }
+    } else {
+      this.row(compTable, "Path", "None");
+    }
+    const tsEntry = transcriptionStore.get(driveFileId);
+    if (file.path.toLowerCase().endsWith(".pdf")) {
+      this.section("Transcription");
+      const tsTable = this.table();
+      if (tsEntry) {
+        this.row(tsTable, "Last transcribed", tsEntry.lastTranscribedAt);
+        this.row(tsTable, "Page count", String(tsEntry.pageCount));
+        if (tsEntry.currentPageCount && tsEntry.currentPageCount !== tsEntry.pageCount) {
+          this.row(tsTable, "Current pages (Drive)", String(tsEntry.currentPageCount));
+        }
+        this.row(tsTable, "Hash", tsEntry.pdfHash.slice(0, 16) + "\u2026");
+        if (tsEntry.destinations.length) {
+          const destRow = tsTable.insertRow();
+          destRow.insertCell().textContent = "Destinations";
+          const cell = destRow.insertCell();
+          destRow.cells[0].style.cssText = "padding: 3px 6px; font-size: 13px; color: var(--text-muted); width: 180px;";
+          cell.style.cssText = "padding: 3px 6px; font-size: 13px;";
+          for (const d of tsEntry.destinations) {
+            const line = cell.createDiv();
+            line.style.cssText = "font-size: 12px; color: var(--text-muted);";
+            line.textContent = `${d.type}: ${d.path} (${d.transcribedAt.slice(0, 10)})`;
+          }
+        }
+      } else {
+        this.row(tsTable, "Status", "Not yet transcribed");
+      }
+    }
+    if (manifestEntry.automationRuns && Object.keys(manifestEntry.automationRuns).length > 0) {
+      this.section("Automation runs");
+      const autoTable = this.table();
+      const thead = autoTable.querySelector("thead tr");
+      thead.innerHTML = "";
+      ["Automation", "Last run", "Result", "Outputs"].forEach((h) => {
+        const th = thead.createEl("th", { text: h });
+        th.style.cssText = "text-align: left; font-size: 11px; color: var(--text-faint); padding: 2px 6px; font-weight: 600;";
+      });
+      for (const [autoId, run] of Object.entries(manifestEntry.automationRuns)) {
+        const automation = settings.automations.find((a) => a.id === autoId);
+        const autoRow = autoTable.insertRow();
+        autoRow.insertCell().textContent = (_a = automation == null ? void 0 : automation.name) != null ? _a : autoId;
+        autoRow.insertCell().textContent = run.lastRunAt.slice(0, 16).replace("T", " ");
+        const resultCell = autoRow.insertCell();
+        resultCell.textContent = run.result;
+        resultCell.style.color = run.result === "success" ? "var(--color-green)" : run.result === "error" ? "var(--color-red)" : "var(--text-muted)";
+        const outCell = autoRow.insertCell();
+        if ((_b = run.outputs) == null ? void 0 : _b.length) {
+          outCell.textContent = run.outputs.join(", ");
+          outCell.style.cssText = "font-size: 11px; color: var(--text-muted);";
+        }
+        if (run.errorMessage) {
+          const errRow = autoTable.insertRow();
+          const errCell = errRow.insertCell();
+          errCell.colSpan = 4;
+          errCell.textContent = `\u21B3 ${run.errorMessage}`;
+          errCell.style.cssText = "font-size: 11px; color: var(--color-red); padding-left: 12px;";
+        }
+      }
+    }
+    this.renderActions(driveFileId, manifestEntry.pairId);
+  }
+  renderUntracked() {
+    const { contentEl, file } = this;
+    const notice = contentEl.createDiv();
+    notice.style.cssText = "padding: 12px 16px; background: var(--background-secondary); border-radius: 6px; color: var(--text-muted); margin: 8px 0 16px;";
+    notice.textContent = "Not tracked by Drive Sync.";
+    const isPdf = file.path.toLowerCase().endsWith(".pdf");
+    const providerEnabled = this.plugin.settings.geminiEnabled || !!this.plugin.settings.mistralApiKey;
+    contentEl.createEl("p", {
+      text: "Available actions for untracked files:",
+      cls: "setting-item-description"
+    });
+    const row = contentEl.createDiv();
+    row.style.cssText = "display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;";
+    if (isPdf && providerEnabled) {
+      this.actionBtn(row, "Transcribe\u2026", () => {
+        openTranscribePickerForFile(this.app, this.plugin, file);
+        this.close();
+      });
+    }
+    if (this.plugin.settings.automations.some((a) => a.enabled)) {
+      this.actionBtn(row, "Run automation on this file\u2026", () => {
+        this.plugin.openAdHocAutomationPicker(file);
+        this.close();
+      });
+    }
+    this.actionBtn(row, "Create companion note (alongside)", async () => {
+      try {
+        const path = await this.plugin.companionManager.createForArbitraryFile(file, "alongside");
+        new import_obsidian14.Notice(`Companion note created: ${path}`);
+        const created = this.app.vault.getAbstractFileByPath(path);
+        if (created instanceof import_obsidian14.TFile) {
+          this.app.workspace.getLeaf(false).openFile(created);
+        }
+      } catch (e) {
+        new import_obsidian14.Notice(`Failed: ${e.message}`);
+      }
+      this.close();
+    });
+    this.actionBtn(row, "Create companion note (root)", async () => {
+      try {
+        const path = await this.plugin.companionManager.createForArbitraryFile(file, "root");
+        new import_obsidian14.Notice(`Companion note created: ${path}`);
+        const created = this.app.vault.getAbstractFileByPath(path);
+        if (created instanceof import_obsidian14.TFile) {
+          this.app.workspace.getLeaf(false).openFile(created);
+        }
+      } catch (e) {
+        new import_obsidian14.Notice(`Failed: ${e.message}`);
+      }
+      this.close();
+    });
+  }
+  renderActions(driveFileId, pairId) {
+    const { contentEl, file } = this;
+    const divider = contentEl.createEl("hr");
+    divider.style.cssText = "margin: 16px 0 12px; border-color: var(--background-modifier-border);";
+    const row = contentEl.createDiv();
+    row.style.cssText = "display: flex; gap: 8px; flex-wrap: wrap;";
+    const isPdf = file.path.toLowerCase().endsWith(".pdf");
+    const providerEnabled = this.plugin.settings.geminiEnabled || !!this.plugin.settings.mistralApiKey;
+    if (isPdf && providerEnabled) {
+      this.actionBtn(row, "Transcribe\u2026", () => {
+        openTranscribePickerForFile(this.app, this.plugin, file);
+        this.close();
+      });
+    }
+    if (isPdf) {
+      this.actionBtn(row, "Force re-transcription", () => {
+        this.plugin.transcriptionStore.delete(driveFileId);
+        this.plugin.transcriptionStore.save().catch(console.error);
+        new import_obsidian14.Notice(
+          `Transcription record cleared for "${file.basename}". Re-sync to re-transcribe.`
+        );
+        this.close();
+      });
+    }
+    if (this.plugin.settings.automations.some((a) => a.enabled)) {
+      this.actionBtn(row, "Run automation on this file\u2026", () => {
+        this.plugin.openAdHocAutomationPicker(file);
+        this.close();
+      });
+    }
+    this.actionBtn(row, "Sync pair now", () => {
+      this.plugin.runSyncForPair(pairId).then(() => new import_obsidian14.Notice("Pair sync complete.")).catch((e) => new import_obsidian14.Notice(`Sync failed: ${e.message}`));
+      this.close();
+    });
+  }
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  section(title) {
+    const h = this.contentEl.createEl("h3", { text: title });
+    h.style.cssText = "margin: 16px 0 6px; font-size: 14px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em;";
+  }
+  table() {
+    const t = this.contentEl.createEl("table");
+    t.style.cssText = "width: 100%; border-collapse: collapse; margin-bottom: 4px;";
+    const thead = t.createEl("thead");
+    const tr = thead.createEl("tr");
+    ["Field", "Value"].forEach((h) => {
+      const th = tr.createEl("th", { text: h });
+      th.style.cssText = "text-align: left; font-size: 11px; color: var(--text-faint); padding: 2px 6px; font-weight: 600;";
+    });
+    return t;
+  }
+  row(table, field, value) {
+    const r = table.insertRow();
+    const c0 = r.insertCell();
+    const c1 = r.insertCell();
+    c0.textContent = field;
+    c1.textContent = value;
+    c0.style.cssText = "padding: 3px 6px; font-size: 13px; color: var(--text-muted); width: 180px;";
+    c1.style.cssText = "padding: 3px 6px; font-size: 13px;";
+    return r;
+  }
+  actionBtn(container, label, onClick) {
+    const btn = container.createEl("button", { text: label });
+    btn.style.cssText = "font-size: 13px; cursor: pointer;";
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+};
+
+// ai/TranscriptionStore.ts
+var STORE_PATH = ".obsidian/drive-sync-transcriptions.json";
+var LOG13 = "[DriveSync/TranscriptionStore]";
+var TranscriptionStore = class {
+  constructor(app) {
+    this.app = app;
+    this.data = {};
+  }
+  async load() {
+    try {
+      const exists = await this.app.vault.adapter.exists(STORE_PATH);
+      if (!exists) {
+        this.data = {};
+        return;
+      }
+      const raw = await this.app.vault.adapter.read(STORE_PATH);
+      this.data = JSON.parse(raw);
+      console.log(`${LOG13} Loaded ${Object.keys(this.data).length} entries`);
+    } catch (e) {
+      console.error(`${LOG13} Failed to load \u2014 starting fresh:`, e);
+      this.data = {};
+    }
+  }
+  async save() {
+    try {
+      await this.app.vault.adapter.write(STORE_PATH, JSON.stringify(this.data, null, 2));
+    } catch (e) {
+      console.error(`${LOG13} Failed to save:`, e);
+    }
+  }
+  get(driveFileId) {
+    return this.data[driveFileId];
+  }
+  set(driveFileId, entry) {
+    this.data[driveFileId] = entry;
+  }
+  delete(driveFileId) {
+    delete this.data[driveFileId];
+  }
+  entries() {
+    return Object.entries(this.data);
+  }
+  /**
+   * Record a completed transcription. Creates or updates the entry.
+   * Called after transcription text is written to a destination note.
+   */
+  recordTranscription(driveFileId, vaultPath, pdfHash, pageCount, driveModifiedTime, dest) {
+    const now = new Date().toISOString();
+    const existing = this.data[driveFileId];
+    if (existing) {
+      existing.pdfHash = pdfHash;
+      existing.pageCount = pageCount;
+      existing.lastTranscribedAt = now;
+      existing.lastTranscribedDriveModifiedTime = driveModifiedTime;
+      existing.vaultPath = vaultPath;
+      existing.currentPageCount = pageCount;
+      existing.currentDriveModifiedTime = driveModifiedTime;
+      const idx = existing.destinations.findIndex(
+        (d) => d.type === dest.type && d.path === dest.path
+      );
+      if (idx >= 0) {
+        existing.destinations[idx] = dest;
+      } else {
+        existing.destinations.push(dest);
+      }
+    } else {
+      this.data[driveFileId] = {
+        driveFileId,
+        vaultPath,
+        pdfHash,
+        pageCount,
+        lastTranscribedAt: now,
+        lastTranscribedDriveModifiedTime: driveModifiedTime,
+        destinations: [dest],
+        currentPageCount: pageCount,
+        currentDriveModifiedTime: driveModifiedTime
+      };
+    }
+  }
+  /**
+   * Update the current page count and Drive modified time after a re-download
+   * without re-transcription. Only updates if an entry already exists.
+   */
+  updateCurrentState(driveFileId, pageCount, driveModifiedTime) {
+    const entry = this.data[driveFileId];
+    if (!entry)
+      return;
+    entry.currentPageCount = pageCount;
+    entry.currentDriveModifiedTime = driveModifiedTime;
+  }
+  /**
+   * Find a store entry by vault path.
+   */
+  findByVaultPath(vaultPath) {
+    return this.entries().find(([, e]) => e.vaultPath === vaultPath);
+  }
+};
+
+// events/EventBus.ts
+var EventBus = class {
+  constructor() {
+    // Internally untyped for storage; the public on/emit signatures enforce types.
+    this.handlers = /* @__PURE__ */ new Map();
+    /** Subscribers that receive *every* event (e.g. the live ticker). */
+    this.wildcard = /* @__PURE__ */ new Set();
+  }
+  on(event, handler) {
+    let set = this.handlers.get(event);
+    if (!set) {
+      set = /* @__PURE__ */ new Set();
+      this.handlers.set(event, set);
+    }
+    set.add(handler);
+    return () => set.delete(handler);
+  }
+  /** Subscribe to all events. Returns an unsubscribe function. */
+  onAny(handler) {
+    this.wildcard.add(handler);
+    return () => this.wildcard.delete(handler);
+  }
+  emit(event, payload) {
+    const rec = { event, payload, at: Date.now() };
+    const set = this.handlers.get(event);
+    if (set) {
+      for (const handler of set) {
+        try {
+          handler(payload);
+        } catch (e) {
+          console.error(`[DriveSync/EventBus] handler for "${event}" threw:`, e);
+        }
+      }
+    }
+    for (const handler of this.wildcard) {
+      try {
+        handler(rec);
+      } catch (e) {
+        console.error(`[DriveSync/EventBus] wildcard handler threw:`, e);
+      }
+    }
+  }
+  /** Drop every subscriber. Call on plugin unload. */
+  clear() {
+    this.handlers.clear();
+    this.wildcard.clear();
+  }
+};
+
+// sync/CacheManager.ts
+var CACHE_DIR = ".obsidian/drive-sync-cache";
+var LOG14 = "[DriveSync/Cache]";
+var CacheManager = class {
+  constructor(app, maxBytes) {
+    this.app = app;
+    this.maxBytes = maxBytes;
+  }
+  setMaxBytes(maxBytes) {
+    this.maxBytes = maxBytes;
+  }
+  keyPath(key) {
+    const safe = key.replace(/[^a-zA-Z0-9_-]/g, "");
+    return `${CACHE_DIR}/${safe}`;
+  }
+  async has(key) {
+    if (!key)
+      return false;
+    return this.app.vault.adapter.exists(this.keyPath(key));
+  }
+  /** Restore cached bytes to a vault path. Returns true on a cache hit. */
+  async restore(key, destPath) {
+    if (!await this.has(key))
+      return false;
+    try {
+      const bytes = await this.app.vault.adapter.readBinary(this.keyPath(key));
+      const exists = await this.app.vault.adapter.exists(destPath);
+      if (exists)
+        await this.app.vault.adapter.writeBinary(destPath, bytes);
+      else
+        await this.app.vault.createBinary(destPath, bytes);
+      console.log(`${LOG14} Cache hit \u2014 restored ${destPath} from ${key.slice(0, 8)}\u2026`);
+      return true;
+    } catch (e) {
+      console.error(`${LOG14} Failed to restore from cache (${key}):`, e);
+      return false;
+    }
+  }
+  async store(key, bytes) {
+    if (!key)
+      return;
+    try {
+      if (!await this.app.vault.adapter.exists(CACHE_DIR)) {
+        await this.app.vault.adapter.mkdir(CACHE_DIR);
+      }
+      const path = this.keyPath(key);
+      if (!await this.app.vault.adapter.exists(path)) {
+        await this.app.vault.adapter.writeBinary(path, bytes);
+      }
+    } catch (e) {
+      console.error(`${LOG14} Failed to write cache (${key}):`, e);
+    }
+  }
+  /**
+   * LRU eviction. Evicts entries whose key is not in `referenced` first (oldest first),
+   * then continues by oldest mtime until total size is under the cap.
+   */
+  async gc(referenced) {
+    var _a;
+    try {
+      if (!await this.app.vault.adapter.exists(CACHE_DIR))
+        return;
+      const listing = await this.app.vault.adapter.list(CACHE_DIR);
+      const entries = [];
+      for (const path of listing.files) {
+        const stat = await this.app.vault.adapter.stat(path);
+        if (!stat)
+          continue;
+        entries.push({ path, key: (_a = path.split("/").pop()) != null ? _a : path, size: stat.size, mtime: stat.mtime });
+      }
+      let total = entries.reduce((s, e) => s + e.size, 0);
+      if (total <= this.maxBytes)
+        return;
+      entries.sort((a, b) => {
+        const ar = referenced.has(a.key) ? 1 : 0;
+        const br = referenced.has(b.key) ? 1 : 0;
+        if (ar !== br)
+          return ar - br;
+        return a.mtime - b.mtime;
+      });
+      for (const e of entries) {
+        if (total <= this.maxBytes)
+          break;
+        await this.app.vault.adapter.remove(e.path).catch(() => void 0);
+        total -= e.size;
+        console.log(`${LOG14} Evicted ${e.key.slice(0, 8)}\u2026 (${e.size} bytes)`);
+      }
+    } catch (e) {
+      console.error(`${LOG14} Cache GC failed:`, e);
+    }
+  }
+};
+
+// workers/heavyWorker.ts
+init_PdfPageHasher();
+var LOG15 = "[DriveSync/Worker]";
+var WORKER_SOURCE = `
+function extractPageCount(str) {
+	var pageMatches = str.match(/\\/Type\\s*\\/Page(?!\\s*s)/g);
+	if (pageMatches && pageMatches.length > 0) return pageMatches.length;
+	var countMatches = str.match(/\\/Count\\s+(\\d+)/g);
+	if (countMatches && countMatches.length > 0) {
+		var max = 0;
+		for (var i = 0; i < countMatches.length; i++) {
+			var n = parseInt(countMatches[i].replace(/\\/Count\\s+/, ''), 10);
+			if (n > max) max = n;
+		}
+		return max;
+	}
+	return 0;
+}
+
+function toHex(buffer) {
+	var bytes = new Uint8Array(buffer);
+	var hex = '';
+	for (var i = 0; i < bytes.length; i++) {
+		hex += bytes[i].toString(16).padStart(2, '0');
+	}
+	return hex;
+}
+
+self.onmessage = async function (e) {
+	var id = e.data.id;
+	var bytes = e.data.bytes;
+	try {
+		var digest = await self.crypto.subtle.digest('SHA-256', bytes);
+		var hash = toHex(digest);
+		// latin1 decode so ASCII PDF tokens are readable.
+		var str = new TextDecoder('latin1').decode(new Uint8Array(bytes));
+		var pageCount = extractPageCount(str);
+		self.postMessage({ id: id, hash: hash, pageCount: pageCount });
+	} catch (err) {
+		self.postMessage({ id: id, error: String(err) });
+	}
+};
+`;
+var HeavyWorkerClient = class {
+  constructor(maxConcurrent) {
+    this.worker = null;
+    this.url = null;
+    this.nextId = 1;
+    this.pending = /* @__PURE__ */ new Map();
+    this.unavailable = false;
+    this.inFlight = 0;
+    this.queue = [];
+    const cores = typeof navigator !== "undefined" && navigator.hardwareConcurrency || 4;
+    this.maxConcurrent = Math.max(1, maxConcurrent != null ? maxConcurrent : cores - 1);
+  }
+  ensureWorker() {
+    if (this.unavailable)
+      return null;
+    if (this.worker)
+      return this.worker;
+    try {
+      const blob = new Blob([WORKER_SOURCE], { type: "application/javascript" });
+      this.url = URL.createObjectURL(blob);
+      this.worker = new Worker(this.url);
+      this.worker.onmessage = (e) => this.onMessage(e);
+      this.worker.onerror = (e) => {
+        console.error(`${LOG15} Worker error \u2014 falling back to sync:`, e.message);
+        this.failAll(e.message);
+        this.unavailable = true;
+      };
+      return this.worker;
+    } catch (e) {
+      console.warn(`${LOG15} Worker unavailable \u2014 using synchronous hashing:`, e);
+      this.unavailable = true;
+      return null;
+    }
+  }
+  onMessage(e) {
+    const { id, hash, pageCount, error } = e.data;
+    const p = this.pending.get(id);
+    if (!p)
+      return;
+    this.pending.delete(id);
+    this.release();
+    if (error)
+      p.reject(new Error(error));
+    else
+      p.resolve({ hash, pageCount });
+  }
+  failAll(reason) {
+    for (const [, p] of this.pending)
+      p.reject(new Error(reason));
+    this.pending.clear();
+  }
+  release() {
+    this.inFlight--;
+    const next = this.queue.shift();
+    if (next)
+      next();
+  }
+  /** Analyze a PDF off-thread, falling back to synchronous analysis on any failure. */
+  async analyze(bytes) {
+    const worker = this.ensureWorker();
+    if (!worker)
+      return analyzePdf(bytes);
+    if (this.inFlight >= this.maxConcurrent) {
+      await new Promise((r) => this.queue.push(r));
+    }
+    this.inFlight++;
+    const id = this.nextId++;
+    try {
+      return await new Promise((resolve, reject) => {
+        this.pending.set(id, { resolve, reject });
+        worker.postMessage({ id, bytes });
+      });
+    } catch (e) {
+      console.warn(`${LOG15} Off-thread analyze failed \u2014 using sync fallback:`, e);
+      this.release();
+      return analyzePdf(bytes);
+    }
+  }
+  terminate() {
+    var _a;
+    this.failAll("worker terminated");
+    (_a = this.worker) == null ? void 0 : _a.terminate();
+    this.worker = null;
+    if (this.url) {
+      URL.revokeObjectURL(this.url);
+      this.url = null;
+    }
+  }
+};
+
+// commands/VerifyIntegrity.ts
+var import_obsidian15 = require("obsidian");
+var crypto4 = __toESM(require("crypto"));
+async function verifyIntegrity(app, manifest) {
+  const rows = [];
+  let checked = 0;
+  for (const [driveFileId, entry] of manifest.entries()) {
+    checked++;
+    const file = app.vault.getAbstractFileByPath(entry.vaultPath);
+    if (!(file instanceof import_obsidian15.TFile)) {
+      rows.push({ driveFileId, vaultPath: entry.vaultPath, type: "manifest-only", detail: "vault file missing" });
+      continue;
+    }
+    if (entry.contentHash) {
+      try {
+        const bytes = await app.vault.adapter.readBinary(entry.vaultPath);
+        const hash = crypto4.createHash("sha256").update(Buffer.from(bytes)).digest("hex");
+        if (hash !== entry.contentHash) {
+          rows.push({ driveFileId, vaultPath: entry.vaultPath, type: "hash-mismatch", detail: "content differs from last sync" });
+        }
+      } catch (e) {
+        rows.push({ driveFileId, vaultPath: entry.vaultPath, type: "missing", detail: "unreadable" });
+      }
+    }
+  }
+  return { checked, rows };
+}
+var VerifyIntegrityModal = class extends import_obsidian15.Modal {
+  constructor(app, report, manifest, onFixed) {
+    super(app);
+    this.report = report;
+    this.manifest = manifest;
+    this.onFixed = onFixed;
+  }
+  onOpen() {
+    var _a, _b;
+    const { contentEl, report } = this;
+    contentEl.createEl("h3", { text: "Manifest integrity" });
+    contentEl.createEl("p", {
+      text: `Checked ${report.checked} entr${report.checked === 1 ? "y" : "ies"} \u2014 ${report.rows.length} issue(s) found.`,
+      cls: "setting-item-description"
+    });
+    if (report.rows.length === 0) {
+      contentEl.createEl("p", { text: "No drift detected. \u2705" });
+      return;
+    }
+    const groups = /* @__PURE__ */ new Map();
+    for (const r of report.rows) {
+      const arr = (_a = groups.get(r.type)) != null ? _a : [];
+      arr.push(r);
+      groups.set(r.type, arr);
+    }
+    for (const [type, rowsOfType] of groups) {
+      contentEl.createEl("h4", { text: `${type} (${rowsOfType.length})` });
+      for (const row of rowsOfType) {
+        const setting = new import_obsidian15.Setting(contentEl).setName(row.vaultPath).setDesc((_b = row.detail) != null ? _b : "");
+        if (type === "manifest-only") {
+          setting.addButton(
+            (b) => b.setButtonText("Remove from manifest").setWarning().onClick(async () => {
+              this.manifest.delete(row.driveFileId);
+              await this.manifest.save();
+              new import_obsidian15.Notice(`Removed manifest entry for ${row.vaultPath}`);
+              setting.settingEl.remove();
+              this.onFixed();
+            })
+          );
+        }
+      }
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
+// telemetry/ErrorReporter.ts
+var import_obsidian16 = require("obsidian");
+var LOG16 = "[DriveSync/Telemetry]";
+var ErrorReporter = class {
+  constructor(settings, version) {
+    this.settings = settings;
+    this.version = version;
+    this.installed = false;
+  }
+  updateSettings(settings) {
+    this.settings = settings;
+  }
+  install() {
+    if (this.installed)
+      return;
+    this.rejectionHandler = (e) => {
+      if (this.isOurs(e.reason))
+        this.report(e.reason);
+    };
+    this.errorHandler = (e) => {
+      if (this.isOurs(e.error))
+        this.report(e.error);
+    };
+    window.addEventListener("unhandledrejection", this.rejectionHandler);
+    window.addEventListener("error", this.errorHandler);
+    this.installed = true;
+  }
+  uninstall() {
+    if (this.rejectionHandler)
+      window.removeEventListener("unhandledrejection", this.rejectionHandler);
+    if (this.errorHandler)
+      window.removeEventListener("error", this.errorHandler);
+    this.installed = false;
+  }
+  /** Heuristic: only report errors whose stack mentions this plugin. */
+  isOurs(err) {
+    var _a;
+    const stack = err instanceof Error ? (_a = err.stack) != null ? _a : "" : "";
+    return /drive-folder-sync|drive-sync/i.test(stack);
+  }
+  /** Build the exact payload that would be sent (no network). Used by the preview button. */
+  build(err) {
+    var _a;
+    const e = err instanceof Error ? err : new Error(String(err));
+    return {
+      errorClass: e.name || "Error",
+      messageTemplate: this.redact(e.message || ""),
+      stackFrames: ((_a = e.stack) != null ? _a : "").split("\n").slice(1, 11).map((l) => this.redact(l.trim())),
+      pluginVersion: this.version,
+      at: new Date().toISOString()
+    };
+  }
+  /** Strip paths, file names and long literals. */
+  redact(s) {
+    return s.replace(/([a-zA-Z]:)?[\\/][^\s)'"]+/g, "<path>").replace(/\b[\w.-]+\.(md|pdf|json|png|jpg)\b/gi, "<file>").replace(/\b\S{65,}\b/g, "<redacted>");
+  }
+  async report(err) {
+    if (!this.settings.errorReportingEnabled || !this.settings.errorReportingEndpoint)
+      return;
+    try {
+      const payload = this.build(err);
+      await (0, import_obsidian16.requestUrl)({
+        url: this.settings.errorReportingEndpoint,
+        method: "POST",
+        contentType: "application/json",
+        body: JSON.stringify(payload)
+      });
+    } catch (e) {
+      console.warn(`${LOG16} Failed to send error report:`, e);
+    }
+  }
+};
+
+// ui/ChangelogModal.ts
+var import_obsidian17 = require("obsidian");
+var ChangelogModal = class extends import_obsidian17.Modal {
+  constructor(app, plugin, currentVersion, entries) {
+    super(app);
+    this.plugin = plugin;
+    this.currentVersion = currentVersion;
+    this.entries = entries;
+    this.dontShowAgain = true;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: `What's new in Drive Folder Sync ${this.currentVersion}` });
+    for (const e of this.entries) {
+      contentEl.createEl("h4", { text: e.version });
+      const pre = contentEl.createEl("div");
+      pre.style.cssText = "white-space: pre-wrap; font-size: 13px;";
+      pre.textContent = e.body.trim();
+    }
+    new import_obsidian17.Setting(contentEl).setName("Don't show this again").addToggle((t) => t.setValue(true).onChange((v) => {
+      this.dontShowAgain = v;
+    }));
+    new import_obsidian17.Setting(contentEl).addButton(
+      (b) => b.setButtonText("View releases on GitHub").onClick(() => {
+        window.open("https://github.com/connrado/drive-folder-sync/releases", "_blank");
+      })
+    ).addButton(
+      (b) => b.setButtonText("Close").setCta().onClick(async () => {
+        if (this.dontShowAgain) {
+          this.plugin.settings.lastSeenVersion = this.currentVersion;
+          await this.plugin.saveSettings();
+        }
+        this.close();
+      })
+    );
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+function parseChangelog(md) {
+  const sections = [];
+  const re = /^##\s+([0-9][^\n]*)$/gm;
+  const matches = [...md.matchAll(re)];
+  for (let i = 0; i < matches.length; i++) {
+    const version = matches[i][1].trim();
+    const start = matches[i].index + matches[i][0].length;
+    const end = i + 1 < matches.length ? matches[i + 1].index : md.length;
+    sections.push({ version, body: md.slice(start, end) });
+  }
+  return sections;
+}
+function isNewer(a, b) {
+  var _a, _b;
+  if (!b)
+    return true;
+  const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = ((_a = pa[i]) != null ? _a : 0) - ((_b = pb[i]) != null ? _b : 0);
+    if (d !== 0)
+      return d > 0;
+  }
+  return false;
+}
+
+// automation/AutomationLinter.ts
+var import_obsidian18 = require("obsidian");
+function lintAutomations(app, automations) {
+  var _a;
+  const issues = [];
+  const folderExists = (p) => p === "" || app.vault.getAbstractFileByPath(p) instanceof import_obsidian18.TFolder;
+  const noteExists = (p) => app.vault.getAbstractFileByPath(p) instanceof import_obsidian18.TFile;
+  for (const a of automations) {
+    const push = (severity, message) => issues.push({ automationId: a.id, severity, message });
+    if (a.triggerFolderPath && !folderExists(a.triggerFolderPath)) {
+      push("error", `Trigger folder does not exist: "${a.triggerFolderPath}"`);
+    }
+    const action = a.action;
+    if (action.targetNotePath && !noteExists(action.targetNotePath)) {
+      push("error", `Target note does not exist: "${action.targetNotePath}"`);
+    }
+    if (action.searchFolderPath && !folderExists(action.searchFolderPath)) {
+      push("error", `Search folder does not exist: "${action.searchFolderPath}"`);
+    }
+    if (action.newNoteFolder && !folderExists(action.newNoteFolder)) {
+      push("error", `New-note folder does not exist: "${action.newNoteFolder}"`);
+    }
+    if (action.newNoteTemplatePath && !noteExists(action.newNoteTemplatePath)) {
+      push("error", `New-note template does not exist: "${action.newNoteTemplatePath}"`);
+    }
+    if (action.matchConfidenceThreshold !== void 0) {
+      const t = action.matchConfidenceThreshold;
+      if (t < 0 || t > 1)
+        push("error", `matchConfidenceThreshold must be in [0, 1] (got ${t}).`);
+    }
+  }
+  const enabled = automations.filter((a) => a.enabled);
+  const seen = /* @__PURE__ */ new Map();
+  for (const a of enabled) {
+    const key = `${a.triggerFolderPath}|${a.action.type}|${(_a = a.action.targetNotePath) != null ? _a : ""}`;
+    const prev = seen.get(key);
+    if (prev) {
+      issues.push({ automationId: a.id, severity: "warn", message: `Shares trigger + action with "${prev}" (may be intentional).` });
+    } else {
+      seen.set(key, a.name);
+    }
+  }
+  return issues;
+}
+
+// commands/Audit.ts
+var import_obsidian19 = require("obsidian");
+async function runAudit(app, manifest, settings) {
+  const issues = [];
+  const entries = manifest.entries();
+  const knownPairIds = new Set(settings.syncPairs.map((p) => p.id));
+  const companionDriveIdsSeen = /* @__PURE__ */ new Map();
+  for (const [driveFileId, entry] of entries) {
+    if (entry.vaultPath) {
+      const exists = await app.vault.adapter.exists(entry.vaultPath);
+      if (!exists) {
+        issues.push({
+          category: "Missing vault file",
+          description: `"${entry.vaultPath}" is tracked in the manifest but no longer exists in the vault.`,
+          driveFileId,
+          path: entry.vaultPath
+        });
+      }
+    }
+    if (entry.companionPath) {
+      const exists = await app.vault.adapter.exists(entry.companionPath);
+      if (!exists) {
+        issues.push({
+          category: "Missing companion note",
+          description: `Companion note "${entry.companionPath}" does not exist in the vault.`,
+          driveFileId,
+          path: entry.companionPath
+        });
+      } else {
+        if (companionDriveIdsSeen.has(entry.companionPath)) {
+          issues.push({
+            category: "Duplicate companion",
+            description: `"${entry.companionPath}" is referenced by multiple manifest entries (also by Drive ID: ${companionDriveIdsSeen.get(entry.companionPath)}).`,
+            driveFileId,
+            path: entry.companionPath
+          });
+        } else {
+          companionDriveIdsSeen.set(entry.companionPath, driveFileId);
+        }
+        const companionFile = app.vault.getAbstractFileByPath(entry.companionPath);
+        if (companionFile instanceof import_obsidian19.TFile) {
+          const cache = app.metadataCache.getFileCache(companionFile);
+          const fm = cache == null ? void 0 : cache.frontmatter;
+          const companionOf = fm == null ? void 0 : fm["companion-of"];
+          if (companionOf) {
+            const linkMatch = companionOf.match(/\[\[([^\]]+)\]\]/);
+            const linkedStem = linkMatch == null ? void 0 : linkMatch[1];
+            if (linkedStem) {
+              const resolved = app.metadataCache.getFirstLinkpathDest(linkedStem, entry.companionPath);
+              if (!resolved) {
+                issues.push({
+                  category: "Broken companion-of link",
+                  description: `"${entry.companionPath}" has companion-of: [[${linkedStem}]] which does not resolve to any file.`,
+                  driveFileId,
+                  path: entry.companionPath
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+    if (entry.pairId && !knownPairIds.has(entry.pairId)) {
+      issues.push({
+        category: "Orphaned manifest entry",
+        description: `Drive file "${entry.vaultPath}" is associated with pair ID "${entry.pairId}" which no longer exists in settings.`,
+        driveFileId,
+        path: entry.vaultPath
+      });
+    }
+  }
+  const allMd = app.vault.getMarkdownFiles();
+  const manifestDriveIds = new Set(entries.map(([id]) => id));
+  for (const file of allMd) {
+    const cache = app.metadataCache.getFileCache(file);
+    const fm = cache == null ? void 0 : cache.frontmatter;
+    if (!fm)
+      continue;
+    const driveId = fm["driveFileId"];
+    if (!driveId)
+      continue;
+    if (!manifestDriveIds.has(driveId)) {
+      issues.push({
+        category: "Orphaned companion note",
+        description: `"${file.path}" references Drive ID "${driveId}" which is not tracked in the manifest.`,
+        path: file.path
+      });
+    }
+  }
+  return issues;
+}
+var AuditModal = class extends import_obsidian19.Modal {
+  constructor(app, issues, manifest, onFixed) {
+    super(app);
+    this.issues = issues;
+    this.manifest = manifest;
+    this.onFixed = onFixed;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Drive Sync \u2014 Health Audit" });
+    if (this.issues.length === 0) {
+      contentEl.createEl("p", { text: "No issues found. Your manifest and vault are in sync." });
+      const row = contentEl.createDiv();
+      row.style.cssText = "display:flex;justify-content:flex-end;margin-top:12px;";
+      const btn = row.createEl("button", { text: "Close" });
+      btn.addEventListener("click", () => this.close());
+      return;
+    }
+    contentEl.createEl("p", {
+      text: `Found ${this.issues.length} issue${this.issues.length !== 1 ? "s" : ""}:`
+    }).style.cssText = "color:var(--text-muted);margin-bottom:16px;";
+    const grouped = /* @__PURE__ */ new Map();
+    for (const issue of this.issues) {
+      if (!grouped.has(issue.category))
+        grouped.set(issue.category, []);
+      grouped.get(issue.category).push(issue);
+    }
+    const listEl = contentEl.createDiv();
+    listEl.style.cssText = "overflow-y:auto;max-height:400px;";
+    for (const [category, items] of grouped) {
+      listEl.createEl("h3", { text: `${category} (${items.length})` });
+      for (const issue of items) {
+        const row = listEl.createDiv();
+        row.style.cssText = "padding:8px;margin-bottom:6px;border:1px solid var(--background-modifier-border);border-radius:4px;font-size:13px;";
+        row.createEl("p", { text: issue.description }).style.cssText = "margin:0 0 6px;";
+        const btnRow = row.createDiv();
+        btnRow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;";
+        if (issue.path) {
+          const openBtn = btnRow.createEl("button", { text: "Open file" });
+          openBtn.addEventListener("click", () => {
+            const file = this.app.vault.getAbstractFileByPath(issue.path);
+            if (file instanceof import_obsidian19.TFile) {
+              this.app.workspace.getLeaf("tab").openFile(file);
+            }
+          });
+        }
+        if (issue.category === "Missing vault file" && issue.driveFileId) {
+          const fixBtn = btnRow.createEl("button", { text: "Remove from manifest" });
+          fixBtn.style.cssText = "color:var(--text-error);";
+          fixBtn.addEventListener("click", async () => {
+            this.manifest.delete(issue.driveFileId);
+            await this.manifest.save();
+            await this.onFixed();
+            new import_obsidian19.Notice(`Removed "${issue.path}" from manifest.`);
+            row.remove();
+          });
+        }
+        if (issue.category === "Missing companion note" && issue.driveFileId) {
+          const fixBtn = btnRow.createEl("button", { text: "Clear companion path" });
+          fixBtn.addEventListener("click", async () => {
+            const entry = this.manifest.get(issue.driveFileId);
+            if (entry) {
+              this.manifest.set(issue.driveFileId, { ...entry, companionPath: null });
+              await this.manifest.save();
+              await this.onFixed();
+              new import_obsidian19.Notice(`Cleared companion path for "${issue.path}".`);
+              row.remove();
+            }
+          });
+        }
+        if (issue.category === "Orphaned companion note" && issue.path) {
+          const fixBtn = btnRow.createEl("button", { text: "Open and review" });
+          fixBtn.addEventListener("click", () => {
+            const file = this.app.vault.getAbstractFileByPath(issue.path);
+            if (file instanceof import_obsidian19.TFile)
+              this.app.workspace.getLeaf("tab").openFile(file);
+          });
+        }
+      }
+    }
+    const closeRow = contentEl.createDiv();
+    closeRow.style.cssText = "display:flex;justify-content:flex-end;margin-top:12px;";
+    const closeBtn = closeRow.createEl("button", { text: "Close" });
+    closeBtn.addEventListener("click", () => this.close());
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+
 // types.ts
 var DEFAULT_SETTINGS = {
   clientId: "",
@@ -3444,9 +6740,13 @@ var DEFAULT_SETTINGS = {
   automations: [],
   deletionBehavior: "keep",
   archiveFolder: "Drive Sync Archive",
+  redownloadUserDeleted: true,
   driveArchiveFolderId: "",
   syncLogEnabled: false,
   syncLogPath: "Drive Sync/.sync-log.md",
+  syncActivityLogEnabled: false,
+  syncActivityLogLevel: "info",
+  conflictPolicy: "save-both",
   companionNotesEnabled: false,
   companionNotesFolder: "",
   companionNoteTemplatePath: "",
@@ -3463,21 +6763,40 @@ var DEFAULT_SETTINGS = {
   geminiEnabled: false,
   geminiModel: "gemini-2.0-flash",
   geminiPrompt: "Transcribe all text visible in this PDF exactly as written, preserving structure. Return plain text only.",
-  mistralApiKey: ""
+  mistralApiKey: "",
+  transcribeDefaultDest: "ask",
+  transcribeCompanionTemplate: "",
+  transcribeCompanionTemplatePath: "",
+  transcribeDailyTemplate: "",
+  transcribeNoteTemplate: "",
+  transcribeCompanionFallbackFolder: "",
+  transcribeDefaultNotePath: "",
+  useSqliteManifest: false,
+  useChangesApi: false,
+  downloadCacheEnabled: false,
+  downloadCacheMaxMb: 2048,
+  offThreadHashing: true,
+  lastSeenVersion: "",
+  errorReportingEnabled: false,
+  errorReportingEndpoint: ""
 };
 
 // main.ts
-var LOG10 = "[DriveSync]";
-var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
+var LOG17 = "[DriveSync]";
+var DriveFolderSyncPlugin = class extends import_obsidian20.Plugin {
   constructor() {
     super(...arguments);
     this.lastSyncResult = null;
+    /** Ring buffer of the last 50 bus events, for the live activity ticker (Phase 12.1). */
+    this.recentEvents = [];
+    /** Per-pair sync history for the health badge (Phase 12.2). Resets each session. */
+    this.pairHistory = /* @__PURE__ */ new Map();
     this.syncing = false;
   }
   async onload() {
-    console.log(`${LOG10} Loading plugin`);
+    console.log(`${LOG17} Loading plugin`);
     await this.loadSettings();
-    console.log(`${LOG10} Settings loaded:`, {
+    console.log(`${LOG17} Settings loaded:`, {
       syncPairs: this.settings.syncPairs.length,
       syncIntervalMinutes: this.settings.syncIntervalMinutes,
       deletionBehavior: this.settings.deletionBehavior,
@@ -3485,15 +6804,26 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       hasClientId: !!this.settings.clientId,
       hasClientSecret: !!this.settings.clientSecret
     });
-    this.manifestStore = new SyncManifestStore(this.app);
+    this.bus = new EventBus();
+    this.manifestStore = createManifestStore(this.app, this.settings, this.bus);
     await this.manifestStore.load().catch(
-      (e) => console.error(`${LOG10} Failed to pre-load manifest:`, e)
+      (e) => console.error(`${LOG17} Failed to pre-load manifest:`, e)
+    );
+    this.transcriptionStore = new TranscriptionStore(this.app);
+    await this.transcriptionStore.load().catch(
+      (e) => console.error(`${LOG17} Failed to pre-load transcription store:`, e)
     );
     this.companionManager = new CompanionNoteManager(this.app, this.settings);
-    this.automationEngine = new AutomationEngine(this.app, this.settings, this.manifestStore);
+    this.automationEngine = new AutomationEngine(this.app, this.settings, this.manifestStore, this.bus);
     this.syncLogger = new SyncLogger(this.app, this.settings);
-    const downloader = new DownloadManager(this.app);
-    this.auth = new GoogleAuth(this.app, this.settings);
+    this.syncActivityLog = new SyncActivityLog(this.app, this.settings);
+    this.cacheManager = this.settings.downloadCacheEnabled ? new CacheManager(this.app, this.settings.downloadCacheMaxMb * 1024 * 1024) : void 0;
+    const downloader = new DownloadManager(this.app, this.cacheManager);
+    this.heavyWorker = this.settings.offThreadHashing ? new HeavyWorkerClient() : void 0;
+    this.recycle = new Recycle(this.app, this.bus);
+    this.errorReporter = new ErrorReporter(this.settings, this.manifest.version);
+    this.errorReporter.install();
+    this.auth = new GoogleAuth(this.app, this.settings, this.bus);
     this.driveSync = new DriveSync(
       this.auth,
       downloader,
@@ -3501,36 +6831,48 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       this.app,
       this.manifestStore,
       this.companionManager,
-      this.automationEngine
+      this.automationEngine,
+      this.transcriptionStore,
+      this.bus,
+      this.heavyWorker,
+      this.recycle
     );
+    this.wireEventBus();
     this.scheduler = new Scheduler();
     this.registerView(SYNC_STATUS_VIEW_TYPE, (leaf) => new SyncStatusView(leaf, this));
     this.addRibbonIcon("refresh-cw", "Sync Drive folder", async () => {
       if (this.syncing) {
-        console.log(`${LOG10} Sync already in progress \u2014 ignoring ribbon click`);
-        new import_obsidian11.Notice("Sync already in progress\u2026");
+        console.log(`${LOG17} Sync already in progress \u2014 ignoring ribbon click`);
+        new import_obsidian20.Notice("Sync already in progress\u2026");
         return;
       }
-      console.log(`${LOG10} Manual sync triggered via ribbon`);
+      console.log(`${LOG17} Manual sync triggered via ribbon`);
       try {
         const result = await this.runSync();
         const msg = this.formatResult(result);
-        console.log(`${LOG10}`, msg);
-        new import_obsidian11.Notice(msg);
+        console.log(`${LOG17}`, msg);
+        new import_obsidian20.Notice(msg);
       } catch (e) {
-        console.error(`${LOG10} Sync failed:`, e);
-        new import_obsidian11.Notice(`Drive sync failed: ${e.message}`);
+        console.error(`${LOG17} Sync failed:`, e);
+        new import_obsidian20.Notice(`Drive sync failed: ${e.message}`);
       }
     });
     this.addRibbonIcon("layout-dashboard", "Drive Sync Status", () => {
       this.activateStatusView();
+    });
+    this.addRibbonIcon("file-search", "Drive Sync File Tracker", () => {
+      new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings, (vaultPath) => {
+        const f = this.app.vault.getAbstractFileByPath(vaultPath);
+        if (f instanceof import_obsidian20.TFile)
+          openTranscribePickerForFile(this.app, this, f);
+      }).open();
     });
     this.addSettingTab(new DriveSyncSettingTab(this.app, this));
     this.addCommand({
       id: "sync-now",
       name: "Sync now",
       callback: () => {
-        this.runSync(false).then((r) => new import_obsidian11.Notice(this.formatResult(r))).catch((e) => new import_obsidian11.Notice(`Drive sync failed: ${e.message}`));
+        this.runSync(false).then((r) => new import_obsidian20.Notice(this.formatResult(r))).catch((e) => new import_obsidian20.Notice(`Drive sync failed: ${e.message}`));
       }
     });
     this.addCommand({
@@ -3538,7 +6880,7 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       name: "Dry run",
       callback: () => {
         this.runSync(true).catch(
-          (e) => new import_obsidian11.Notice(`Drive sync failed: ${e.message}`)
+          (e) => new import_obsidian20.Notice(`Drive sync failed: ${e.message}`)
         );
       }
     });
@@ -3547,7 +6889,7 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       name: "Sync single pair\u2026",
       callback: () => {
         new SyncPairPickerModal(this.app, this.settings.syncPairs, (pair) => {
-          this.runSyncForPair(pair.id).then((r) => new import_obsidian11.Notice(this.formatResult(r))).catch((e) => new import_obsidian11.Notice(`Drive sync failed: ${e.message}`));
+          this.runSyncForPair(pair.id).then((r) => new import_obsidian20.Notice(this.formatResult(r))).catch((e) => new import_obsidian20.Notice(`Drive sync failed: ${e.message}`));
         }).open();
       }
     });
@@ -3556,8 +6898,41 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       name: "Transcribe current file\u2026",
       callback: () => {
         transcribeCurrentFile(this).catch(
-          (e) => new import_obsidian11.Notice(`Transcription failed: ${e.message}`)
+          (e) => new import_obsidian20.Notice(`Transcription failed: ${e.message}`)
         );
+      }
+    });
+    this.addCommand({
+      id: "file-tracker",
+      name: "Open file tracker",
+      callback: () => {
+        new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings, (vaultPath) => {
+          const f = this.app.vault.getAbstractFileByPath(vaultPath);
+          if (f instanceof import_obsidian20.TFile)
+            openTranscribePickerForFile(this.app, this, f);
+        }).open();
+      }
+    });
+    this.addCommand({
+      id: "force-full-retranscribe",
+      name: "Force full re-transcription of current file",
+      callback: () => {
+        const active = this.app.workspace.getActiveFile();
+        if (!active || !active.path.toLowerCase().endsWith(".pdf")) {
+          new import_obsidian20.Notice("Open a PDF file first.");
+          return;
+        }
+        const entry = this.manifestStore.findByVaultPath(active.path);
+        if (!entry) {
+          new import_obsidian20.Notice("This PDF is not tracked by Drive Sync.");
+          return;
+        }
+        const [driveFileId] = entry;
+        this.transcriptionStore.delete(driveFileId);
+        this.transcriptionStore.save().catch(
+          (e) => console.error(`${LOG17} Failed to save transcription store after force-clear:`, e)
+        );
+        new import_obsidian20.Notice(`Transcription record cleared for "${active.basename}". Re-sync to re-transcribe.`);
       }
     });
     this.addCommand({
@@ -3566,11 +6941,11 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       callback: () => {
         const active = this.settings.automations.filter((a) => a.enabled);
         if (active.length === 0) {
-          new import_obsidian11.Notice("No active automations configured.");
+          new import_obsidian20.Notice("No active automations configured.");
           return;
         }
         (async () => {
-          const notice = new import_obsidian11.Notice(
+          const notice = new import_obsidian20.Notice(
             `Running ${active.length} automation${active.length !== 1 ? "s" : ""}\u2026`,
             0
           );
@@ -3583,12 +6958,12 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
               errors += r.errors;
             }
             notice.hide();
-            new import_obsidian11.Notice(
+            new import_obsidian20.Notice(
               `All automations complete \u2014 ${ran} ran, ${skipped} skipped` + (errors > 0 ? `, ${errors} errors` : "")
             );
           } catch (e) {
             notice.hide();
-            new import_obsidian11.Notice(`Automation run failed: ${e.message}`);
+            new import_obsidian20.Notice(`Automation run failed: ${e.message}`);
           }
         })();
       }
@@ -3599,81 +6974,249 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       callback: () => {
         const active = this.settings.automations.filter((a) => a.enabled);
         if (active.length === 0) {
-          new import_obsidian11.Notice("No active automations configured.");
+          new import_obsidian20.Notice("No active automations configured.");
           return;
         }
         new AutomationPickerModal(this.app, active, (automation, force) => {
           (async () => {
-            const notice = new import_obsidian11.Notice(`Running "${automation.name}"\u2026`, 0);
+            const notice = new import_obsidian20.Notice(`Running "${automation.name}"\u2026`, 0);
             try {
               const r = await this.runAutomationOnExistingFiles(automation.id, { force });
               notice.hide();
-              new import_obsidian11.Notice(
+              new import_obsidian20.Notice(
                 `"${automation.name}" \u2014 ${r.ran} ran, ${r.skipped} skipped` + (r.errors > 0 ? `, ${r.errors} errors` : "")
               );
             } catch (e) {
               notice.hide();
-              new import_obsidian11.Notice(`Automation failed: ${e.message}`);
+              new import_obsidian20.Notice(`Automation failed: ${e.message}`);
             }
           })();
         }).open();
       }
     });
+    this.addCommand({
+      id: "run-automation-on-active-file",
+      name: "Run automation on active file\u2026",
+      callback: () => {
+        const active = this.app.workspace.getActiveFile();
+        if (!active) {
+          new import_obsidian20.Notice("Open a file first.");
+          return;
+        }
+        this.openAdHocAutomationPicker(active);
+      }
+    });
+    this.addCommand({
+      id: "run-all-automations-on-active-file",
+      name: "Run all automations on active file",
+      callback: () => {
+        const active = this.app.workspace.getActiveFile();
+        if (!active) {
+          new import_obsidian20.Notice("Open a file first.");
+          return;
+        }
+        this.runAllAutomationsAdHoc(active);
+      }
+    });
+    this.addCommand({
+      id: "create-companion-for-active-file",
+      name: "Create companion note for active file",
+      callback: () => {
+        const active = this.app.workspace.getActiveFile();
+        if (!active) {
+          new import_obsidian20.Notice("Open a file first.");
+          return;
+        }
+        new CreateCompanionModal(this.app, active, this.companionManager).open();
+      }
+    });
+    this.addCommand({
+      id: "view-sync-log",
+      name: "View sync activity log",
+      callback: () => {
+        new SyncLogModal(this.app, this.syncActivityLog).open();
+      }
+    });
+    this.addCommand({
+      id: "audit",
+      name: "Run health audit",
+      callback: () => {
+        (async () => {
+          const notice = new import_obsidian20.Notice("Running audit\u2026", 0);
+          try {
+            const issues = await runAudit(this.app, this.manifestStore, this.settings);
+            notice.hide();
+            new AuditModal(this.app, issues, this.manifestStore, async () => {
+            }).open();
+          } catch (e) {
+            notice.hide();
+            new import_obsidian20.Notice(`Audit failed: ${e.message}`);
+          }
+        })();
+      }
+    });
+    this.addCommand({
+      id: "verify-integrity",
+      name: "Verify manifest integrity",
+      callback: () => this.runVerifyIntegrity()
+    });
+    this.addCommand({
+      id: "restore-manifest",
+      name: "Restore manifest from backup\u2026",
+      callback: () => this.openRestoreManifest()
+    });
+    this.addCommand({
+      id: "open-recycle",
+      name: "Open recycle bin",
+      callback: () => this.openRecycleFolder()
+    });
+    this.addCommand({
+      id: "undo-last-sync",
+      name: "Undo last sync",
+      callback: () => this.undoLastSync()
+    });
+    this.addCommand({
+      id: "test-sync-pair",
+      name: "Test sync against a sandbox subfolder\u2026",
+      callback: () => {
+        if (this.settings.syncPairs.length === 0) {
+          new import_obsidian20.Notice("No sync pairs configured.");
+          return;
+        }
+        new SyncPairPickerModal(this.app, this.settings.syncPairs, (pair) => {
+          new TextPromptModal(this.app, "Sandbox subfolder", 'Subfolder path within the pair (e.g. "2026/Inbox")', "", (sub) => {
+            this.testSyncPair(pair.id, sub);
+          }).open();
+        }).open();
+      }
+    });
+    this.maybeShowChangelog();
     this.registerEvent(
       this.app.vault.on("rename", async (file, oldPath) => {
         const healed = this.manifestStore.healRename(oldPath, file.path);
         if (healed) {
           await this.manifestStore.save().catch(
-            (e) => console.error(`${LOG10} Failed to save manifest after rename heal:`, e)
+            (e) => console.error(`${LOG17} Failed to save manifest after rename heal:`, e)
           );
         }
       })
     );
+    this.registerEvent(
+      this.app.vault.on("delete", async (file) => {
+        const marked = this.manifestStore.markUserDeleted(file.path);
+        if (marked) {
+          console.log(`${LOG17} User deleted tracked file: ${file.path}`);
+          await this.manifestStore.save().catch(
+            (e) => console.error(`${LOG17} Failed to save manifest after user deletion:`, e)
+          );
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, abstractFile) => {
+        if (!(abstractFile instanceof import_obsidian20.TFile))
+          return;
+        const file = abstractFile;
+        const manifestEntry = this.manifestStore.findByVaultPath(file.path);
+        const isPdf = file.path.toLowerCase().endsWith(".pdf");
+        const providerEnabled = this.settings.geminiEnabled || !!this.settings.mistralApiKey;
+        if (isPdf && providerEnabled) {
+          menu.addItem(
+            (item) => item.setTitle("Transcribe\u2026").setIcon("mic").setSection("drive-sync").onClick(() => openTranscribePickerForFile(this.app, this, file))
+          );
+          menu.addItem(
+            (item) => item.setTitle("Transcribe to companion note").setIcon("mic").setSection("drive-sync").onClick(() => openTranscribePickerForFile(this.app, this, file, "companion"))
+          );
+          menu.addItem(
+            (item) => item.setTitle("Transcribe to today's daily note").setIcon("mic").setSection("drive-sync").onClick(() => openTranscribePickerForFile(this.app, this, file, "daily"))
+          );
+        }
+        menu.addItem(
+          (item) => item.setTitle("Create companion note").setIcon("file-plus").setSection("drive-sync").onClick(() => new CreateCompanionModal(this.app, file, this.companionManager).open())
+        );
+        menu.addItem(
+          (item) => item.setTitle("Show Drive Sync status\u2026").setIcon("info").setSection("drive-sync").onClick(() => new FileStatusModal(this.app, this, file).open())
+        );
+        if (this.settings.automations.some((a) => a.enabled)) {
+          menu.addItem(
+            (item) => item.setTitle("Run automation on this file\u2026").setIcon("zap").setSection("drive-sync").onClick(() => this.openAdHocAutomationPicker(file))
+          );
+        }
+        if (manifestEntry) {
+          const [driveFileId, entry] = manifestEntry;
+          menu.addItem(
+            (item) => item.setTitle("Sync this pair now").setIcon("refresh-cw").setSection("drive-sync").onClick(() => {
+              this.runSyncForPair(entry.pairId).then((r) => new import_obsidian20.Notice(this.formatResult(r))).catch((e) => new import_obsidian20.Notice(`Drive sync failed: ${e.message}`));
+            })
+          );
+          if (isPdf) {
+            menu.addItem(
+              (item) => item.setTitle("Force full re-transcription").setIcon("rotate-ccw").setSection("drive-sync").onClick(() => {
+                this.transcriptionStore.delete(driveFileId);
+                this.transcriptionStore.save().catch(
+                  (e) => console.error(`${LOG17} Failed to save transcription store:`, e)
+                );
+                new import_obsidian20.Notice(
+                  `Transcription record cleared for "${file.basename}". Re-sync to re-transcribe.`
+                );
+              })
+            );
+          }
+        }
+      })
+    );
     const isAuthorized = await this.auth.isAuthorized();
-    console.log(`${LOG10} Authorized: ${isAuthorized}`);
+    console.log(`${LOG17} Authorized: ${isAuthorized}`);
     if (isAuthorized) {
       console.log(
-        `${LOG10} Starting scheduler \u2014 interval: ${this.settings.syncIntervalMinutes} min`
+        `${LOG17} Starting scheduler \u2014 interval: ${this.settings.syncIntervalMinutes} min`
       );
       this.scheduler.start(
-        this.settings.syncIntervalMinutes,
+        this.effectiveInterval(),
         () => this.runSync()
       );
       if (this.settings.syncOnStartup) {
-        console.log(`${LOG10} syncOnStartup enabled \u2014 running initial sync`);
+        console.log(`${LOG17} syncOnStartup enabled \u2014 running initial sync`);
         this.runSync().catch(
-          (e) => console.error(`${LOG10} Startup sync failed:`, e)
+          (e) => console.error(`${LOG17} Startup sync failed:`, e)
         );
       }
     } else {
-      console.log(`${LOG10} Not authorized \u2014 scheduler not started`);
+      console.log(`${LOG17} Not authorized \u2014 scheduler not started`);
     }
-    console.log(`${LOG10} Plugin loaded`);
+    console.log(`${LOG17} Plugin loaded`);
   }
   onunload() {
-    console.log(`${LOG10} Unloading plugin \u2014 stopping scheduler`);
+    var _a, _b, _c;
+    console.log(`${LOG17} Unloading plugin \u2014 stopping scheduler`);
     this.scheduler.stop();
+    (_a = this.bus) == null ? void 0 : _a.clear();
+    (_b = this.heavyWorker) == null ? void 0 : _b.terminate();
+    (_c = this.errorReporter) == null ? void 0 : _c.uninstall();
   }
   async runSync(dryRun = false) {
     if (this.syncing) {
-      console.log(`${LOG10} runSync called while already syncing \u2014 skipped`);
+      console.log(`${LOG17} runSync called while already syncing \u2014 skipped`);
       return { downloaded: 0, skipped: 0, errors: 0, removed: 0, moved: 0, archived: 0 };
     }
     this.syncing = true;
-    console.log(`${LOG10} Sync started${dryRun ? " (dry run)" : ""}`);
+    console.log(`${LOG17} Sync started${dryRun ? " (dry run)" : ""}`);
     try {
       const result = await this.driveSync.sync(dryRun);
-      console.log(`${LOG10} Sync finished:`, result);
+      console.log(`${LOG17} Sync finished:`, result);
+      if (this.driveSync.consumeSettingsDirty())
+        await this.saveSettings();
       if (dryRun) {
         new DryRunModal(this.app, result).open();
       } else {
         this.lastSyncResult = result;
         this.pushResultToStatusView(result);
         await this.syncLogger.append(result);
+        await this.gcCache();
       }
       return result;
     } catch (e) {
-      console.error(`${LOG10} Sync threw an unhandled error:`, e);
+      console.error(`${LOG17} Sync threw an unhandled error:`, e);
       throw e;
     } finally {
       this.syncing = false;
@@ -3681,18 +7224,20 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
   }
   async runSyncForPair(pairId) {
     if (this.syncing) {
-      console.log(`${LOG10} runSyncForPair called while already syncing \u2014 skipped`);
+      console.log(`${LOG17} runSyncForPair called while already syncing \u2014 skipped`);
       return { downloaded: 0, skipped: 0, errors: 0, removed: 0, moved: 0, archived: 0 };
     }
     this.syncing = true;
-    console.log(`${LOG10} Single-pair sync started: ${pairId}`);
+    console.log(`${LOG17} Single-pair sync started: ${pairId}`);
     try {
       const result = await this.driveSync.syncSinglePair(pairId);
-      console.log(`${LOG10} Single-pair sync finished:`, result);
+      console.log(`${LOG17} Single-pair sync finished:`, result);
+      if (this.driveSync.consumeSettingsDirty())
+        await this.saveSettings();
       await this.syncLogger.append(result);
       return result;
     } catch (e) {
-      console.error(`${LOG10} Single-pair sync threw an unhandled error:`, e);
+      console.error(`${LOG17} Single-pair sync threw an unhandled error:`, e);
       throw e;
     } finally {
       this.syncing = false;
@@ -3704,12 +7249,285 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
   async runAutomationOnExistingFiles(automationId, opts = {}) {
     return this.automationEngine.runForAllMatchingFiles(automationId, opts);
   }
-  pushResultToStatusView(result) {
-    for (const leaf of this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE)) {
-      if (leaf.view instanceof SyncStatusView) {
-        leaf.view.updateResult(result);
-      }
+  async dryRunAutomationOnExistingFiles(automationId) {
+    return this.automationEngine.runForAllMatchingFiles(automationId, { dryRun: true });
+  }
+  openAdHocAutomationPicker(file) {
+    const active = this.settings.automations.filter((a) => a.enabled);
+    if (active.length === 0) {
+      new import_obsidian20.Notice("No active automations configured.");
+      return;
     }
+    new AutomationPickerModal(this.app, active, (automation, force) => {
+      (async () => {
+        var _a;
+        const notice = new import_obsidian20.Notice(`Running "${automation.name}" on "${file.basename}"\u2026`, 0);
+        try {
+          const r = await this.automationEngine.runForFileAdHoc(file.path, automation.id, { force });
+          notice.hide();
+          if (r.ran) {
+            new import_obsidian20.Notice(`"${automation.name}" ran on "${file.basename}".`);
+          } else if (r.error) {
+            new import_obsidian20.Notice(`"${automation.name}" failed: ${r.error}`);
+          } else {
+            new import_obsidian20.Notice(`"${automation.name}" skipped: ${(_a = r.skippedReason) != null ? _a : "no reason"}.`);
+          }
+        } catch (e) {
+          notice.hide();
+          new import_obsidian20.Notice(`Automation failed: ${e.message}`);
+        }
+      })();
+    }).open();
+  }
+  runAllAutomationsAdHoc(file) {
+    const active = this.settings.automations.filter((a) => a.enabled);
+    if (active.length === 0) {
+      new import_obsidian20.Notice("No active automations configured.");
+      return;
+    }
+    new RunAllAutomationsConfirmModal(this.app, file, active, (force) => {
+      (async () => {
+        const notice = new import_obsidian20.Notice(
+          `Running ${active.length} automation${active.length !== 1 ? "s" : ""} on "${file.basename}"\u2026`,
+          0
+        );
+        let ran = 0, skipped = 0, errors = 0;
+        try {
+          for (const automation of active) {
+            const r = await this.automationEngine.runForFileAdHoc(file.path, automation.id, { force });
+            if (r.ran)
+              ran++;
+            else if (r.error)
+              errors++;
+            else
+              skipped++;
+          }
+          notice.hide();
+          new import_obsidian20.Notice(
+            `Done on "${file.basename}" \u2014 ${ran} ran, ${skipped} skipped` + (errors > 0 ? `, ${errors} errors` : "")
+          );
+        } catch (e) {
+          notice.hide();
+          new import_obsidian20.Notice(`Run-all failed: ${e.message}`);
+        }
+      })();
+    }).open();
+  }
+  /**
+   * Phase 11.5 — subscribe the status view, activity log and notice handlers to the
+   * event bus instead of being called directly. Adding a new subscriber (e.g. a badge)
+   * requires zero changes in the producers.
+   */
+  wireEventBus() {
+    this.bus.onAny((rec) => {
+      this.recentEvents.push(rec);
+      if (this.recentEvents.length > 50) {
+        this.recentEvents.splice(0, this.recentEvents.length - 50);
+      }
+      this.refreshStatusViews((v) => v.onBusEvent(rec));
+    });
+    this.bus.on("sync-complete", ({ result }) => {
+      this.recordPairHistory(result);
+      this.refreshStatusViews((v) => v.updateResult(result));
+    });
+    this.bus.on("conflict", (p) => {
+      var _a;
+      void this.syncActivityLog.log({
+        level: "warn",
+        syncId: "bus",
+        file: p.vaultPath,
+        action: "conflict",
+        result: (_a = p.resolution) != null ? _a : "save-both",
+        details: p.backupPath
+      });
+    });
+    this.bus.on("auth-failed", (p) => {
+      void this.syncActivityLog.log({
+        level: "error",
+        syncId: "bus",
+        action: "auth-failed",
+        result: "expired",
+        details: p.reason
+      });
+    });
+    this.bus.on("auth-failed", (p) => {
+      new import_obsidian20.Notice(`Drive Sync: authentication expired \u2014 ${p.reason}. Re-authenticate in settings.`, 0);
+      this.scheduler.stop();
+    });
+    this.bus.on("auth-restored", () => {
+      new import_obsidian20.Notice("Drive Sync: authentication restored \u2014 resuming scheduled syncs.");
+      this.scheduler.start(this.effectiveInterval(), () => this.runSync());
+    });
+  }
+  /** Phase 13.3 — clamp the user's interval to a 60s floor. */
+  effectiveInterval() {
+    const min = 1 / 60;
+    if (this.settings.syncIntervalMinutes < min) {
+      console.warn(`${LOG17} syncIntervalMinutes below 60s floor \u2014 clamping.`);
+      return min;
+    }
+    return this.settings.syncIntervalMinutes;
+  }
+  refreshStatusViews(fn) {
+    for (const leaf of this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE)) {
+      if (leaf.view instanceof SyncStatusView)
+        fn(leaf.view);
+    }
+  }
+  pushResultToStatusView(result) {
+    this.bus.emit("sync-complete", { result });
+  }
+  // ── Phase 13 action methods (used by the Advanced settings tab + commands) ──
+  async runVerifyIntegrity() {
+    const notice = new import_obsidian20.Notice("Verifying manifest integrity\u2026", 0);
+    try {
+      const report = await verifyIntegrity(this.app, this.manifestStore);
+      notice.hide();
+      new VerifyIntegrityModal(this.app, report, this.manifestStore, () => void 0).open();
+    } catch (e) {
+      notice.hide();
+      new import_obsidian20.Notice(`Verify failed: ${e.message}`);
+    }
+  }
+  async openRestoreManifest() {
+    const backups = await this.manifestStore.listBackups();
+    if (backups.length === 0) {
+      new import_obsidian20.Notice("No manifest backups found yet.");
+      return;
+    }
+    new RestoreManifestModal(this.app, backups, (name) => {
+      new ConfirmModal(
+        this.app,
+        "Restore manifest?",
+        `This replaces the current manifest with backup "${name}". A fresh backup of the current state is taken first. Continue?`,
+        async () => {
+          try {
+            await this.manifestStore.restoreBackup(name);
+            new import_obsidian20.Notice(`Manifest restored from ${name}.`);
+          } catch (e) {
+            new import_obsidian20.Notice(`Restore failed: ${e.message}`);
+          }
+        }
+      ).open();
+    }).open();
+  }
+  async openRecycleFolder() {
+    const path = this.recycle.folderPath;
+    if (!await this.app.vault.adapter.exists(path))
+      await this.app.vault.adapter.mkdir(path);
+    try {
+      await navigator.clipboard.writeText(path);
+    } catch (e) {
+    }
+    new import_obsidian20.Notice(`Recycle bin: ${path}
+(path copied to clipboard)`);
+  }
+  async undoLastSync() {
+    const runs = await this.recycle.listRunIds();
+    if (runs.length === 0) {
+      new import_obsidian20.Notice("Nothing to undo \u2014 recycle bin is empty.");
+      return;
+    }
+    const latest = runs[0];
+    new ConfirmModal(
+      this.app,
+      "Undo last sync?",
+      `Restore ${latest.count} file(s) recycled in the most recent run (${new Date(latest.at).toLocaleString()})?`,
+      async () => {
+        const n = await this.recycle.restoreRun(latest.syncRunId);
+        new import_obsidian20.Notice(`Restored ${n} file(s) from the recycle bin.`);
+      }
+    ).open();
+  }
+  async testSyncPair(pairId, subfolder) {
+    if (this.syncing) {
+      new import_obsidian20.Notice("Sync already in progress\u2026");
+      return;
+    }
+    this.syncing = true;
+    const notice = new import_obsidian20.Notice(`Test sync of "${subfolder || "(root)"}"\u2026`, 0);
+    try {
+      const result = await this.driveSync.testSync(pairId, subfolder);
+      notice.hide();
+      new ConfirmModal(
+        this.app,
+        "Test sync complete",
+        this.formatResult(result),
+        () => void 0
+      ).open();
+    } catch (e) {
+      notice.hide();
+      new import_obsidian20.Notice(`Test sync failed: ${e.message}`);
+    } finally {
+      this.syncing = false;
+    }
+  }
+  previewErrorReport() {
+    const sample = this.errorReporter.build(new Error("Sample error for preview at drive-folder-sync"));
+    new ErrorReportPreviewModal(this.app, JSON.stringify(sample, null, 2), async () => {
+      await this.errorReporter.report(new Error("Test report from drive-folder-sync"));
+      new import_obsidian20.Notice(this.settings.errorReportingEndpoint ? "Test report sent." : "No endpoint set \u2014 nothing sent.");
+    }).open();
+  }
+  async maybeShowChangelog() {
+    const current = this.manifest.version;
+    if (!isNewer(current, this.settings.lastSeenVersion))
+      return;
+    try {
+      const path = `${this.app.vault.configDir}/plugins/${this.manifest.id}/CHANGELOG.md`;
+      if (!await this.app.vault.adapter.exists(path))
+        return;
+      const md = await this.app.vault.adapter.read(path);
+      const entries = parseChangelog(md).filter((e) => isNewer(e.version, this.settings.lastSeenVersion));
+      if (entries.length === 0)
+        return;
+      new ChangelogModal(this.app, this, current, entries).open();
+    } catch (e) {
+      console.error(`${LOG17} Failed to show changelog:`, e);
+    }
+  }
+  async gcCache() {
+    if (!this.cacheManager)
+      return;
+    const referenced = /* @__PURE__ */ new Set();
+    for (const [, entry] of this.manifestStore.entries()) {
+      if (entry.driveMd5)
+        referenced.add(entry.driveMd5);
+    }
+    await this.cacheManager.gc(referenced);
+  }
+  recordPairHistory(result) {
+    var _a, _b;
+    const now = Date.now();
+    const pairs = (_a = result.pairs) != null ? _a : {};
+    for (const [pairId, pr] of Object.entries(pairs)) {
+      const hist = (_b = this.pairHistory.get(pairId)) != null ? _b : [];
+      hist.push({ at: now, errors: pr.errors });
+      const cutoff = now - 60 * 60 * 1e3;
+      const trimmed = hist.filter((h, i) => i >= hist.length - 10 || h.at >= cutoff);
+      this.pairHistory.set(pairId, trimmed);
+    }
+  }
+  /** Phase 12.2 — compute a green/yellow/red health badge for a pair. */
+  getPairHealth(pairId) {
+    var _a;
+    const hist = (_a = this.pairHistory.get(pairId)) != null ? _a : [];
+    if (hist.length === 0) {
+      return { level: "unknown", color: "var(--text-faint)", tooltip: "No sync recorded this session." };
+    }
+    const now = Date.now();
+    const intervalMs = Math.max(1, this.settings.syncIntervalMinutes) * 60 * 1e3;
+    const last = hist[hist.length - 1];
+    const errorsInHour = hist.filter((h) => h.at >= now - 60 * 60 * 1e3 && h.errors > 0).length;
+    const last3 = hist.slice(-3);
+    const last3AllFailed = last3.length === 3 && last3.every((h) => h.errors > 0);
+    const stale = now - last.at > 2 * intervalMs;
+    const tip = (lvl) => `${lvl} \u2014 last sync ${Math.round((now - last.at) / 1e3)}s ago, ${errorsInHour} run(s) with errors in last hour, ${hist.length} run(s) tracked.`;
+    if (last3AllFailed)
+      return { level: "red", color: "#e5534b", tooltip: tip("Red: last 3 syncs failed") };
+    if (errorsInHour > 0 || stale)
+      return { level: "yellow", color: "#d29922", tooltip: tip("Yellow") };
+    return { level: "green", color: "#3fb950", tooltip: tip("Green") };
   }
   async activateStatusView() {
     const existing = this.app.workspace.getLeavesOfType(SYNC_STATUS_VIEW_TYPE);
@@ -3732,7 +7550,7 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
     this.migrateLegacySettings();
   }
   async saveSettings() {
-    console.log(`${LOG10} Saving settings`);
+    console.log(`${LOG17} Saving settings`);
     await this.saveData(this.settings);
     if (this.auth)
       this.auth.updateSettings(this.settings);
@@ -3744,14 +7562,23 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       this.driveSync.updateSettings(this.settings);
     if (this.syncLogger)
       this.syncLogger.updateSettings(this.settings);
+    if (this.syncActivityLog)
+      this.syncActivityLog.updateSettings(this.settings);
+    if (this.errorReporter)
+      this.errorReporter.updateSettings(this.settings);
+    const lint = lintAutomations(this.app, this.settings.automations);
+    const errors = lint.filter((l) => l.severity === "error");
+    if (errors.length > 0) {
+      console.warn(`${LOG17} Automation lint: ${errors.length} error(s)`, errors);
+    }
   }
   migrateLegacySettings() {
     const legacyId = this.settings.driveFolderId;
     if (legacyId && this.settings.syncPairs.length === 0) {
-      console.log(`${LOG10} Migrating legacy single-pair settings to syncPairs`);
+      console.log(`${LOG17} Migrating legacy single-pair settings to syncPairs`);
       this.settings.syncPairs = [
         {
-          id: crypto2.randomBytes(8).toString("hex"),
+          id: crypto5.randomBytes(8).toString("hex"),
           label: "Drive Sync",
           driveFolderId: legacyId,
           vaultDestFolder: this.settings.vaultDestFolder || "Drive Sync",
@@ -3761,7 +7588,7 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
       this.settings.driveFolderId = "";
       this.settings.vaultDestFolder = "";
       this.saveData(this.settings).catch(
-        (e) => console.error(`${LOG10} Failed to persist migration:`, e)
+        (e) => console.error(`${LOG17} Failed to persist migration:`, e)
       );
     }
   }
@@ -3770,7 +7597,7 @@ var DriveFolderSyncPlugin = class extends import_obsidian11.Plugin {
     return `Drive sync complete \u2014 ${result.downloaded} downloaded, ${result.skipped} up to date` + (((_a = result.moved) != null ? _a : 0) > 0 ? `, ${result.moved} moved` : "") + (result.removed > 0 ? `, ${result.removed} removed` : "") + (((_b = result.archived) != null ? _b : 0) > 0 ? `, ${result.archived} archived` : "") + (result.errors > 0 ? `, ${result.errors} errors` : "");
   }
 };
-var SyncPairPickerModal = class extends import_obsidian11.FuzzySuggestModal {
+var SyncPairPickerModal = class extends import_obsidian20.FuzzySuggestModal {
   constructor(app, pairs, onChoose) {
     super(app);
     this.pairs = pairs;
@@ -3787,7 +7614,7 @@ var SyncPairPickerModal = class extends import_obsidian11.FuzzySuggestModal {
     this.onChoose(pair);
   }
 };
-var AutomationPickerModal = class extends import_obsidian11.FuzzySuggestModal {
+var AutomationPickerModal = class extends import_obsidian20.FuzzySuggestModal {
   constructor(app, automations, onChoose) {
     super(app);
     this.automations = automations;
@@ -3806,7 +7633,7 @@ var AutomationPickerModal = class extends import_obsidian11.FuzzySuggestModal {
     }).open();
   }
 };
-var AutomationForceModal = class extends import_obsidian11.Modal {
+var AutomationForceModal = class extends import_obsidian20.Modal {
   constructor(app, automation, onConfirm) {
     super(app);
     this.automation = automation;
@@ -3816,15 +7643,186 @@ var AutomationForceModal = class extends import_obsidian11.Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.createEl("h3", { text: `Run "${this.automation.name}"` });
-    new import_obsidian11.Setting(contentEl).setName("Force re-run").setDesc("Re-run even for files already completed at the current Drive version.").addToggle((t) => t.setValue(false).onChange((v) => {
+    new import_obsidian20.Setting(contentEl).setName("Force re-run").setDesc("Re-run even for files already completed at the current Drive version.").addToggle((t) => t.setValue(false).onChange((v) => {
       this.force = v;
     }));
-    new import_obsidian11.Setting(contentEl).addButton(
+    new import_obsidian20.Setting(contentEl).addButton(
       (b) => b.setButtonText("Run").setCta().onClick(() => {
         this.close();
         this.onConfirm(this.force);
       })
     ).addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var RunAllAutomationsConfirmModal = class extends import_obsidian20.Modal {
+  constructor(app, file, automations, onConfirm) {
+    super(app);
+    this.file = file;
+    this.automations = automations;
+    this.onConfirm = onConfirm;
+    this.force = false;
+  }
+  onOpen() {
+    const { contentEl, file, automations } = this;
+    contentEl.createEl("h3", { text: `Run all automations on "${file.basename}"` });
+    contentEl.createEl("p", {
+      text: `The following ${automations.length} automation${automations.length !== 1 ? "s" : ""} will run on this file (folder triggers bypassed):`,
+      cls: "setting-item-description"
+    });
+    const list = contentEl.createEl("ul");
+    for (const a of automations) {
+      list.createEl("li", { text: `${a.name} \u2014 ${a.action.type}` });
+    }
+    new import_obsidian20.Setting(contentEl).setName("Force re-run").setDesc("Re-run even for tracked files already completed at the current Drive version.").addToggle((t) => t.setValue(false).onChange((v) => {
+      this.force = v;
+    }));
+    new import_obsidian20.Setting(contentEl).addButton(
+      (b) => b.setButtonText("Run all").setCta().onClick(() => {
+        this.close();
+        this.onConfirm(this.force);
+      })
+    ).addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var CreateCompanionModal = class extends import_obsidian20.Modal {
+  constructor(app, file, companionManager) {
+    super(app);
+    this.file = file;
+    this.companionManager = companionManager;
+  }
+  onOpen() {
+    var _a;
+    const { contentEl, file } = this;
+    contentEl.createEl("h3", { text: `Create companion note for "${file.basename}"` });
+    contentEl.createEl("p", {
+      text: "Choose where to place the companion note:",
+      cls: "setting-item-description"
+    });
+    new import_obsidian20.Setting(contentEl).setName("Alongside the file").setDesc(`Place note in: ${((_a = file.parent) == null ? void 0 : _a.path) || "(vault root)"}`).addButton(
+      (b) => b.setButtonText("Create here").setCta().onClick(async () => {
+        this.close();
+        await this.create("alongside");
+      })
+    );
+    new import_obsidian20.Setting(contentEl).setName("Vault root").setDesc("Place note in the top-level vault folder").addButton(
+      (b) => b.setButtonText("Create in root").onClick(async () => {
+        this.close();
+        await this.create("root");
+      })
+    );
+    new import_obsidian20.Setting(contentEl).addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+  }
+  async create(placement) {
+    try {
+      const path = await this.companionManager.createForArbitraryFile(this.file, placement);
+      new import_obsidian20.Notice(`Companion note created: ${path}`);
+      const created = this.app.vault.getAbstractFileByPath(path);
+      if (created instanceof import_obsidian20.TFile) {
+        this.app.workspace.getLeaf(false).openFile(created);
+      }
+    } catch (e) {
+      new import_obsidian20.Notice(`Failed to create companion note: ${e.message}`);
+    }
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var ConfirmModal = class extends import_obsidian20.Modal {
+  constructor(app, title, body, onConfirm) {
+    super(app);
+    this.title = title;
+    this.body = body;
+    this.onConfirm = onConfirm;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: this.title });
+    contentEl.createEl("p", { text: this.body, cls: "setting-item-description" });
+    new import_obsidian20.Setting(contentEl).addButton(
+      (b) => b.setButtonText("Confirm").setCta().onClick(async () => {
+        this.close();
+        await this.onConfirm();
+      })
+    ).addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var TextPromptModal = class extends import_obsidian20.Modal {
+  constructor(app, title, desc, initial, onSubmit) {
+    super(app);
+    this.title = title;
+    this.desc = desc;
+    this.onSubmit = onSubmit;
+    this.value = initial;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: this.title });
+    new import_obsidian20.Setting(contentEl).setName(this.desc).addText(
+      (t) => t.setValue(this.value).onChange((v) => {
+        this.value = v;
+      })
+    );
+    new import_obsidian20.Setting(contentEl).addButton(
+      (b) => b.setButtonText("Run").setCta().onClick(() => {
+        this.close();
+        this.onSubmit(this.value.trim());
+      })
+    ).addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()));
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
+var RestoreManifestModal = class extends import_obsidian20.FuzzySuggestModal {
+  constructor(app, backups, onChoose) {
+    super(app);
+    this.backups = backups;
+    this.onChoose = onChoose;
+    this.setPlaceholder("Pick a manifest backup to restore\u2026");
+  }
+  getItems() {
+    return this.backups.slice().reverse();
+  }
+  // newest first
+  getItemText(name) {
+    return name;
+  }
+  onChooseItem(name) {
+    this.onChoose(name);
+  }
+};
+var ErrorReportPreviewModal = class extends import_obsidian20.Modal {
+  constructor(app, json, onSend) {
+    super(app);
+    this.json = json;
+    this.onSend = onSend;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: "Error report preview" });
+    contentEl.createEl("p", {
+      text: "This is exactly what would be sent. Paths, file names and long literals are stripped.",
+      cls: "setting-item-description"
+    });
+    const pre = contentEl.createEl("pre");
+    pre.style.cssText = "max-height:50vh; overflow:auto; font-size:12px; white-space:pre-wrap;";
+    pre.textContent = this.json;
+    new import_obsidian20.Setting(contentEl).addButton(
+      (b) => b.setButtonText("Send test report").setCta().onClick(async () => {
+        this.close();
+        await this.onSend();
+      })
+    ).addButton((b) => b.setButtonText("Close").onClick(() => this.close()));
   }
   onClose() {
     this.contentEl.empty();

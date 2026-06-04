@@ -3,7 +3,7 @@ import type DriveFolderSyncPlugin from "../main";
 import { Automation, AutomationActionType, DeletionBehavior, PeriodicNotesPaths, PluginSettings, SyncPair } from "../types";
 import { AutomationDryRunModal } from "../ui/AutomationDryRunModal";
 
-type TabId = "account" | "sync" | "notes" | "automations" | "transcription";
+type TabId = "account" | "sync" | "notes" | "automations" | "transcription" | "advanced";
 
 export class DriveSyncSettingTab extends PluginSettingTab {
 	private activeTab: TabId = "account";
@@ -27,6 +27,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			{ id: "notes", label: "Notes" },
 			{ id: "automations", label: "Automations" },
 			{ id: "transcription", label: "Transcription" },
+			{ id: "advanced", label: "Advanced" },
 		];
 
 		const panes: Partial<Record<TabId, HTMLElement>> = {};
@@ -56,6 +57,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			else if (tab.id === "notes") this.renderNotesTab(pane);
 			else if (tab.id === "automations") this.renderAutomationsTab(pane);
 			else if (tab.id === "transcription") this.renderTranscriptionTab(pane);
+			else if (tab.id === "advanced") this.renderAdvancedTab(pane);
 		}
 
 		switchTab(this.activeTab);
@@ -1128,6 +1130,130 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 							this.display();
 						}).open();
 					})
+			);
+	}
+
+	private renderAdvancedTab(el: HTMLElement): void {
+		el.createEl("h3", { text: "Performance" });
+
+		new Setting(el)
+			.setName("Use Drive changes API")
+			.setDesc("Skip the full folder walk when nothing changed in Drive since the last sync. Falls back to a full scan whenever any change is detected.")
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.useChangesApi).onChange(async (v) => {
+					this.plugin.settings.useChangesApi = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(el)
+			.setName("Off-thread hashing")
+			.setDesc("Run PDF hashing and page-count scanning on a background worker so the UI stays responsive. Falls back to the main thread if a worker can't be created.")
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.offThreadHashing).onChange(async (v) => {
+					this.plugin.settings.offThreadHashing = v;
+					await this.plugin.saveSettings();
+					new Notice("Reload Obsidian for this to take full effect.");
+				})
+			);
+
+		new Setting(el)
+			.setName("Content-addressed download cache")
+			.setDesc("Reuse already-downloaded bytes when files move/rename/duplicate in Drive, keyed by Drive's md5. Zero bytes re-downloaded on a cache hit.")
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.downloadCacheEnabled).onChange(async (v) => {
+					this.plugin.settings.downloadCacheEnabled = v;
+					await this.plugin.saveSettings();
+					new Notice("Reload Obsidian for this to take full effect.");
+				})
+			);
+
+		new Setting(el)
+			.setName("Download cache cap (MB)")
+			.setDesc("LRU eviction keeps the cache under this size. Unreferenced entries are evicted first.")
+			.addText((txt) =>
+				txt
+					.setValue(String(this.plugin.settings.downloadCacheMaxMb))
+					.onChange(async (v) => {
+						const n = parseInt(v, 10);
+						if (!Number.isNaN(n) && n > 0) {
+							this.plugin.settings.downloadCacheMaxMb = n;
+							this.plugin.cacheManager?.setMaxBytes(n * 1024 * 1024);
+							await this.plugin.saveSettings();
+						}
+					})
+			);
+
+		new Setting(el)
+			.setName("SQLite-backed manifest (experimental)")
+			.setDesc("Adapter is in place but the SQLite backend is not yet bundled — leaving this on still uses the JSON store. See IMPROVEMENTS.md Phase 11.2.")
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.useSqliteManifest).onChange(async (v) => {
+					this.plugin.settings.useSqliteManifest = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		el.createEl("h3", { text: "Data & safety" });
+
+		new Setting(el)
+			.setName("Verify manifest integrity")
+			.setDesc("Walk the manifest, hash each vault file and report drift (missing / hash-mismatch / manifest-only).")
+			.addButton((b) =>
+				b.setButtonText("Run verify").onClick(() => this.plugin.runVerifyIntegrity())
+			);
+
+		new Setting(el)
+			.setName("Restore manifest from backup")
+			.setDesc("Pick a timestamped backup snapshot and restore it (2-step confirm).")
+			.addButton((b) =>
+				b.setButtonText("Restore…").onClick(() => this.plugin.openRestoreManifest())
+			);
+
+		new Setting(el)
+			.setName("Open recycle bin")
+			.setDesc("Open the folder holding pre-overwrite/pre-delete backups created by the sync engine.")
+			.addButton((b) =>
+				b.setButtonText("Open").onClick(() => this.plugin.openRecycleFolder())
+			);
+
+		new Setting(el)
+			.setName("Undo last sync")
+			.setDesc("Restore the files recycled during the most recent sync run (confirm modal).")
+			.addButton((b) =>
+				b.setButtonText("Undo…").onClick(() => this.plugin.undoLastSync())
+			);
+
+		el.createEl("h3", { text: "Error reporting" });
+
+		new Setting(el)
+			.setName("Anonymous error reporting")
+			.setDesc("Send stripped error reports (class + message template + stack frames only — no paths or file names) to the endpoint below. Off by default.")
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.errorReportingEnabled).onChange(async (v) => {
+					this.plugin.settings.errorReportingEnabled = v;
+					await this.plugin.saveSettings();
+				})
+			);
+
+		new Setting(el)
+			.setName("Reporting endpoint")
+			.setDesc("HTTPS URL that receives the JSON reports. Leave empty to disable sending.")
+			.addText((txt) =>
+				txt
+					.setPlaceholder("https://…")
+					.setValue(this.plugin.settings.errorReportingEndpoint)
+					.onChange(async (v) => {
+						this.plugin.settings.errorReportingEndpoint = v.trim();
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(el)
+			.setName("Preview a test report")
+			.setDesc("Show the exact JSON that would be sent, and optionally send it.")
+			.addButton((b) =>
+				b.setButtonText("Preview / send test").onClick(() => this.plugin.previewErrorReport())
 			);
 	}
 

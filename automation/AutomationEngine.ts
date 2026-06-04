@@ -1,6 +1,7 @@
 import { App, getAllTags, TFile } from "obsidian";
 import { Automation, AutomationAction, AutomationRunRecord, PeriodicNotesPaths, PluginSettings } from "../types";
 import type { SyncManifestStore } from "../sync/SyncManifest";
+import type { EventBus } from "../events/EventBus";
 
 const LOG = "[DriveSync/Automation]";
 
@@ -32,11 +33,26 @@ export class AutomationEngine {
 	constructor(
 		private app: App,
 		private settings: PluginSettings,
-		private manifest?: SyncManifestStore
+		private manifest?: SyncManifestStore,
+		private bus?: EventBus
 	) {}
 
 	updateSettings(settings: PluginSettings): void {
 		this.settings = settings;
+	}
+
+	setBus(bus: EventBus): void {
+		this.bus = bus;
+	}
+
+	private emitRun(vaultPath: string, automation: Automation, result: "success" | "skipped" | "error", error?: string): void {
+		this.bus?.emit("automation-run", {
+			vaultPath,
+			automationId: automation.id,
+			automationName: automation.name,
+			result,
+			...(error ? { error } : {}),
+		});
 	}
 
 	updateManifest(manifest: SyncManifestStore): void {
@@ -193,6 +209,7 @@ export class AutomationEngine {
 			console.log(`${LOG} Running automation "${automation.name}" for: ${vaultPath}`);
 			try {
 				await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, transcription);
+				this.emitRun(vaultPath, automation, "success");
 				if (driveFileId) {
 					this.manifest?.recordAutomationRun(driveFileId, automation.id, {
 						lastRunAt: new Date().toISOString(),
@@ -202,6 +219,7 @@ export class AutomationEngine {
 				}
 			} catch (e) {
 				console.error(`${LOG} Automation "${automation.name}" failed for "${vaultPath}":`, e);
+				this.emitRun(vaultPath, automation, "error", e instanceof Error ? e.message : String(e));
 				if (driveFileId) {
 					this.manifest?.recordAutomationRun(driveFileId, automation.id, {
 						lastRunAt: new Date().toISOString(),
@@ -294,6 +312,7 @@ export class AutomationEngine {
 		console.log(`${LOG} runForFileAdHoc: running "${automation.name}" for "${vaultPath}" (tracked=${tracked})`);
 		try {
 			await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, undefined);
+			this.emitRun(vaultPath, automation, "success");
 			if (driveFileId) {
 				this.manifest?.recordAutomationRun(driveFileId, automationId, {
 					lastRunAt: new Date().toISOString(),
@@ -306,6 +325,7 @@ export class AutomationEngine {
 		} catch (e) {
 			const msg = e instanceof Error ? e.message : String(e);
 			console.error(`${LOG} runForFileAdHoc: "${automation.name}" failed for "${vaultPath}":`, e);
+			this.emitRun(vaultPath, automation, "error", msg);
 			if (driveFileId) {
 				this.manifest?.recordAutomationRun(driveFileId, automationId, {
 					lastRunAt: new Date().toISOString(),

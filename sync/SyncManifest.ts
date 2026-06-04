@@ -1,13 +1,46 @@
 import { App } from "obsidian";
-import { AutomationRunRecord, ManifestEntry, SyncManifest } from "../types";
+import { AutomationRunRecord, ManifestEntry, PluginSettings, SyncManifest } from "../types";
+import type { EventBus } from "../events/EventBus";
 
 const MANIFEST_PATH = ".obsidian/drive-sync-manifest.json";
+const BACKUP_DIR = ".obsidian/drive-sync-manifest.backups";
 const LOG = "[DriveSync/Manifest]";
 
-export class SyncManifestStore {
+/** Phase 13.2 — bump when the persisted manifest shape changes. */
+export const MANIFEST_SCHEMA_VERSION = 1;
+const MAX_BACKUPS = 20;
+
+/**
+ * Phase 11.2 — adapter interface. `JsonManifestStore` (current behavior) and a future
+ * `SqliteManifestStore` both implement this; the rest of the codebase depends only on
+ * the interface, so the storage backend is swappable without touching call sites.
+ */
+export interface SyncManifestStore {
+	load(): Promise<void>;
+	save(): Promise<void>;
+	get(driveFileId: string): ManifestEntry | undefined;
+	set(driveFileId: string, entry: ManifestEntry): void;
+	delete(driveFileId: string): void;
+	entries(): [string, ManifestEntry][];
+	allForPair(pairId: string): [string, ManifestEntry][];
+	findByVaultPath(path: string): [string, ManifestEntry] | undefined;
+	findByCompanionPath(path: string): [string, ManifestEntry] | undefined;
+	recordAutomationRun(driveFileId: string, automationId: string, run: AutomationRunRecord): void;
+	getAutomationRun(driveFileId: string, automationId: string): AutomationRunRecord | undefined;
+	markUserDeleted(vaultPath: string): boolean;
+	clearUserDeleted(driveFileId: string): void;
+	healRename(oldPath: string, newPath: string): boolean;
+	/** Phase 13.2 — manifest backup management. */
+	listBackups(): Promise<string[]>;
+	restoreBackup(name: string): Promise<void>;
+}
+
+export class JsonManifestStore implements SyncManifestStore {
 	private data: SyncManifest = {};
 
-	constructor(private app: App) {}
+	constructor(private app: App, private bus?: EventBus) {}
+
+	setBus(bus: EventBus): void { this.bus = bus; }
 
 	async load(): Promise<void> {
 		try {
@@ -18,7 +51,11 @@ export class SyncManifestStore {
 				return;
 			}
 			const raw = await this.app.vault.adapter.read(MANIFEST_PATH);
-			this.data = JSON.parse(raw) as SyncManifest;
+			const parsed = JSON.parse(raw);
+			// Tolerate both the bare-map legacy shape and a future {version, entries} wrapper.
+			this.data = (parsed && parsed.__schemaVersion && parsed.entries)
+				? parsed.entries as SyncManifest
+				: parsed as SyncManifest;
 			console.log(`${LOG} Loaded ${Object.keys(this.data).length} manifest entries`);
 		} catch (e) {
 			console.error(`${LOG} Failed to load manifest — starting fresh:`, e);
@@ -44,23 +81,15 @@ export class SyncManifestStore {
 				console.error(`${LOG} Failed to save manifest:`, e2);
 			}
 		}
+		// Phase 13.2 — snapshot a timestamped backup after every successful write.
+		await this.writeBackup(content).catch((e) => console.error(`${LOG} Backup write failed:`, e));
+		this.bus?.emit("manifest-write", { entryCount: Object.keys(this.data).length });
 	}
 
-	get(driveFileId: string): ManifestEntry | undefined {
-		return this.data[driveFileId];
-	}
-
-	set(driveFileId: string, entry: ManifestEntry): void {
-		this.data[driveFileId] = entry;
-	}
-
-	delete(driveFileId: string): void {
-		delete this.data[driveFileId];
-	}
-
-	entries(): [string, ManifestEntry][] {
-		return Object.entries(this.data);
-	}
+	get(driveFileId: string): ManifestEntry | undefined { return this.data[driveFileId]; }
+	set(driveFileId: string, entry: ManifestEntry): void { this.data[driveFileId] = entry; }
+	delete(driveFileId: string): void { delete this.data[driveFileId]; }
+	entries(): [string, ManifestEntry][] { return Object.entries(this.data); }
 
 	allForPair(pairId: string): [string, ManifestEntry][] {
 		return this.entries().filter(([, entry]) => entry.pairId === pairId);
@@ -85,10 +114,6 @@ export class SyncManifestStore {
 		return this.data[driveFileId]?.automationRuns?.[automationId];
 	}
 
-	/**
-	 * Mark a vault path as user-deleted so the sync engine skips re-downloading it
-	 * until Drive's modifiedTime advances. Returns true if the entry was found.
-	 */
 	markUserDeleted(vaultPath: string): boolean {
 		const byVault = this.findByVaultPath(vaultPath);
 		if (!byVault) return false;
@@ -98,16 +123,11 @@ export class SyncManifestStore {
 		return true;
 	}
 
-	/** Clear the userDeletedAt flag so the file will be re-downloaded on next sync. */
 	clearUserDeleted(driveFileId: string): void {
 		const entry = this.data[driveFileId];
 		if (entry) delete entry.userDeletedAt;
 	}
 
-	/**
-	 * Update vaultPath or companionPath in-memory when the user renames a file in the vault.
-	 * Returns true if an entry was updated.
-	 */
 	healRename(oldPath: string, newPath: string): boolean {
 		const byVault = this.findByVaultPath(oldPath);
 		if (byVault) {
@@ -125,4 +145,59 @@ export class SyncManifestStore {
 		}
 		return false;
 	}
+
+	// ── Phase 13.2: schema-versioned backups ────────────────────────────────
+
+	private async writeBackup(content: string): Promise<void> {
+		if (!(await this.app.vault.adapter.exists(BACKUP_DIR))) {
+			await this.app.vault.adapter.mkdir(BACKUP_DIR);
+		}
+		const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+		const wrapped = JSON.stringify(
+			{ __schemaVersion: MANIFEST_SCHEMA_VERSION, savedAt: new Date().toISOString(), entries: JSON.parse(content) },
+			null, 2
+		);
+		await this.app.vault.adapter.write(`${BACKUP_DIR}/${ts}.json`, wrapped);
+		await this.gcBackups();
+	}
+
+	private async gcBackups(): Promise<void> {
+		const names = await this.listBackups();
+		if (names.length <= MAX_BACKUPS) return;
+		const toRemove = names.slice(0, names.length - MAX_BACKUPS); // oldest first
+		for (const name of toRemove) {
+			await this.app.vault.adapter.remove(`${BACKUP_DIR}/${name}`).catch(() => undefined);
+		}
+	}
+
+	async listBackups(): Promise<string[]> {
+		if (!(await this.app.vault.adapter.exists(BACKUP_DIR))) return [];
+		const listing = await this.app.vault.adapter.list(BACKUP_DIR);
+		return listing.files
+			.map((f) => f.split("/").pop() ?? f)
+			.filter((n) => n.endsWith(".json"))
+			.sort(); // ISO timestamps sort chronologically
+	}
+
+	async restoreBackup(name: string): Promise<void> {
+		const path = `${BACKUP_DIR}/${name}`;
+		const raw = await this.app.vault.adapter.read(path);
+		const parsed = JSON.parse(raw);
+		const entries = parsed.entries ?? parsed;
+		this.data = entries as SyncManifest;
+		await this.save();
+		console.log(`${LOG} Restored manifest from backup: ${name}`);
+	}
+}
+
+/**
+ * Phase 11.2 — factory. Returns the JSON store today. When `useSqliteManifest` is set
+ * and a bundled SQLite backend is available, this will return `SqliteManifestStore`
+ * (deferred — see IMPROVEMENTS.md Phase 11.2 decisions).
+ */
+export function createManifestStore(app: App, settings: PluginSettings, bus?: EventBus): SyncManifestStore {
+	if (settings.useSqliteManifest) {
+		console.warn(`${LOG} useSqliteManifest is on, but the SQLite backend is not bundled yet — using JSON store.`);
+	}
+	return new JsonManifestStore(app, bus);
 }

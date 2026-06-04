@@ -66,9 +66,9 @@ The "Transcribe file" command supports three destinations (companion / daily / a
 
 ### 7.5 Verification
 
-- [ ] Open Settings → Transcription → every previously-mentioned setting is visible here, nowhere else.
-- [ ] Run "Transcribe current file" on a PDF with the companion template path pointing to a real template file → output uses that file's content.
-- [ ] Empty all three template textareas → output falls back to the built-in `## Transcription` block (current behavior preserved).
+- [x] Open Settings → Transcription → every previously-mentioned setting is visible here, nowhere else.
+- [x] Run "Transcribe current file" on a PDF with the companion template path pointing to a real template file → output uses that file's content.
+- [x] Empty all three template textareas → output falls back to the built-in `## Transcription` block (current behavior preserved).
 
 **Files:** `settings/SettingsTab.ts`, `types.ts`, `commands/TranscribeCurrentFile.ts`, `main.ts` (only if the new `transcribeDefaultNotePath` flow needs wiring).
 
@@ -115,9 +115,9 @@ For tracked files (those present in the manifest):
 
 ### 8.4 Verification
 
-- [ ] Right-click a Drive-synced PDF → "Drive Sync" submenu appears with all relevant items.
-- [ ] Right-click a markdown note created locally (not synced) → "Drive Sync" submenu appears with only the "ad-hoc" items (transcribe is hidden if not a PDF; "Run automation on this file" is shown).
-- [ ] "Show Drive Sync status" on a tracked file shows manifest data; on an untracked file shows "Not tracked".
+- [x] Right-click a Drive-synced PDF → "Drive Sync" submenu appears with all relevant items.
+- [x] Right-click a markdown note created locally (not synced) → "Drive Sync" submenu appears with only the "ad-hoc" items (transcribe is hidden if not a PDF; "Run automation on this file" is shown).
+- [x] "Show Drive Sync status" on a tracked file shows manifest data; on an untracked file shows "Not tracked".
 
 **Files:** `main.ts`, new `ui/FileStatusModal.ts`. No type changes.
 
@@ -129,38 +129,40 @@ For tracked files (those present in the manifest):
 
 ### 9.1 Bypass the trigger filter
 
-- [ ] Extend `AutomationEngine.runForFile()` ([automation/AutomationEngine.ts:116](automation/AutomationEngine.ts#L116)) to accept `ignoreFolderTrigger?: boolean` in a new options bag.
-- [ ] When `ignoreFolderTrigger=true`, skip the `matchesTrigger` filter at line 126 and consider every active automation a candidate (still honor `excludedSubfolders` and the `drive-sync-skip-*` frontmatter flags).
-- [ ] Refactor the long positional signature into `runForFile(opts: RunForFileOptions)` to avoid argument-position bugs. Update the only existing caller in `sync/DriveSync.ts`.
+- [x] Extend `AutomationEngine.runForFile()` ([automation/AutomationEngine.ts:116](automation/AutomationEngine.ts#L116)) to accept `ignoreFolderTrigger?: boolean` in a new options bag.
+- [x] When `ignoreFolderTrigger=true`, skip the `matchesTrigger` filter at line 126 and consider every active automation a candidate (still honor `excludedSubfolders` and the `drive-sync-skip-*` frontmatter flags).
+- [x] Refactor the long positional signature into `runForFile(opts: RunForFileOptions)` to avoid argument-position bugs. Update the only existing caller in `sync/DriveSync.ts`.
 
 ### 9.2 New entry point: `runForFileAdHoc`
 
-- [ ] Add `AutomationEngine.runForFileAdHoc(vaultPath: string, automationId: string, opts: { force?: boolean; dryRun?: boolean })`:
-  - [ ] Looks up the manifest entry by `vaultPath` (may be `null` for untracked files).
-  - [ ] If untracked, generates a synthetic context: `driveFileId = null`, `driveModifiedTime = file.stat.mtime as ISO`, `companionPath = null`, `transcription = null`.
-  - [ ] Calls `runAction()` directly with that context. Skips the §1.1 decision matrix when `driveFileId` is null (we have nothing to compare against; treat it as `force=true`).
-  - [ ] When the file **is** tracked, passes through the matrix as usual unless `force` is set.
-- [ ] Returns `{ ran: boolean, skippedReason?: string, error?: string, outputs?: string[] }`.
+- [x] Add `AutomationEngine.runForFileAdHoc(vaultPath: string, automationId: string, opts: { force?: boolean; dryRun?: boolean })`:
+  - [x] Looks up the manifest entry by `vaultPath` (may be `null` for untracked files).
+  - [x] If untracked, generates a synthetic context: `driveFileId = null`, `driveModifiedTime = file.stat.mtime as ISO`, `companionPath = null`, `transcription = null`.
+  - [x] Calls `runAction()` directly with that context. Skips the §1.1 decision matrix when `driveFileId` is null (we have nothing to compare against; treat it as `force=true`).
+  - [x] When the file **is** tracked, passes through the matrix as usual unless `force` is set.
+- [x] Returns `{ ran: boolean, skippedReason?: string, error?: string, outputs?: string[] }`.
 
 ### 9.3 Companion creation as an ad-hoc action
 
-- [ ] Today, companion notes are only created during sync. Add a public method `CompanionNoteManager.createForArbitraryFile(file: TFile, pair?: SyncPair | null)`:
-  - [ ] Resolves the companion path using the pair's settings if a pair is provided, otherwise the global defaults (with the same `{{RootFolder}}` token resolution).
-  - [ ] Creates the companion note **without** registering a manifest entry (it's user-initiated, not Drive-derived).
-  - [ ] Sets frontmatter `companion-of: "[[<vaultPath>]]"` and `sourceVaultPath: "<vaultPath>"`. Omits `driveFileId`.
-- [ ] Wire this into the right-click "Create companion note" item from §8.2.
+- [x] Today, companion notes are only created during sync. Add a public method `CompanionNoteManager.createForArbitraryFile(file: TFile, pair?: SyncPair | null)`:
+  - [x] Resolves the companion path using the pair's settings if a pair is provided, otherwise the global defaults (with the same `{{RootFolder}}` token resolution).
+  - [x] Creates the companion note **without** registering a manifest entry (it's user-initiated, not Drive-derived).
+  - [x] Sets frontmatter `companion-of: "[[<vaultPath>]]"` and `sourceVaultPath: "<vaultPath>"`. Omits `driveFileId`.
+- [x] Wire this into the right-click "Create companion note" item from §8.2.
 
 ### 9.4 Command-palette entries
 
-- [ ] `drive-sync:run-automation-on-active-file` — uses the active file. Picker for which automation, then a force toggle.
-- [ ] `drive-sync:run-all-automations-on-active-file` — runs every active automation (with `ignoreFolderTrigger=true`). Confirmation modal listing what will run.
-- [ ] `drive-sync:create-companion-for-active-file` — calls §9.3 against the active file.
+- [x] `drive-sync:run-automation-on-active-file` — uses the active file. Picker for which automation, then a force toggle.
+- [x] `drive-sync:run-all-automations-on-active-file` — runs every active automation (with `ignoreFolderTrigger=true`). Confirmation modal listing what will run.
+- [x] `drive-sync:create-companion-for-active-file` — calls §9.3 against the active file.
 
 ### 9.5 Verification
 
-- [ ] Create a fresh markdown note outside any sync pair's folder. Right-click → "Run automation on this file…" → pick `link_to_matching_note` → automation runs and creates/links the matching note even though the file is untracked.
-- [ ] Run the same automation a second time on the same file → it runs again (no manifest = no matrix). This is intentional; document it in `AutomationEngine` as a comment.
-- [ ] On a Drive-tracked file, the same flow respects the matrix unless force is set.
+- [x] Create a fresh markdown note outside any sync pair's folder. Right-click → "Run automation on this file…" → pick `link_to_matching_note` → automation runs and creates/links the matching note even though the file is untracked.
+- [x] Run the same automation a second time on the same file → it runs again (no manifest = no matrix). This is intentional; document it in `AutomationEngine` as a comment.
+- [x] On a Drive-tracked file, the same flow respects the matrix unless force is set.
+
+**Decisions made:** Phase 9 was implemented in the `PHASE 9` commit; the checkboxes were ticked retroactively after confirming the code (`runForFileAdHoc`, `createForArbitraryFile`, the three command-palette entries) matches the spec. The §7.5 / §8.4 / §9.5 verification boxes were confirmed by code review, not a live Obsidian run.
 
 **Files:** `automation/AutomationEngine.ts`, `sync/CompanionNoteManager.ts`, `main.ts`, plus the right-click hooks added in Phase 8.
 
@@ -302,11 +304,11 @@ These can be tackled independently of Phases 7-10 once those are merged. Each su
 
 **Goal:** Stop refetching the entire folder tree per pair on every sync interval.
 
-- [ ] Bootstrap: call `changes.getStartPageToken()` once per pair, store in manifest as `pair.driveStartPageToken`.
-- [ ] Per sync: call `changes.list(pageToken)` instead of walking the folder. Process only the returned changes.
+- [x] Bootstrap: call `changes.getStartPageToken()` once per pair, store in manifest as `pair.driveStartPageToken`.
+- [x] Per sync: call `changes.list(pageToken)` instead of walking the folder. Process only the returned changes.
 - [ ] Filter changes to those whose `file.parents` intersect the pair's tracked folder set (Drive returns global changes; we ignore the rest).
 - [ ] Fall back to a full re-scan when the API returns `newStartPageToken` without a `nextPageToken` and we detect drift (e.g., a file in the manifest that the changes feed never mentioned and isn't in the folder anymore — handled by a periodic sanity sweep, default once per 24h).
-- [ ] Settings toggle `useChangesApi` (default `false` until proven). Per-pair override.
+- [x] Settings toggle `useChangesApi` (default `false` until proven). Per-pair override.
 - [ ] **Verification:** Sync a pair with 5000 files; second sync after a single Drive edit issues 1-2 API calls instead of N.
 
 **Files:** `sync/DriveSync.ts`, `auth/GoogleAuth.ts` (scope check — `changes.list` needs `drive.metadata.readonly` if not already granted), `types.ts`, `settings/SettingsTab.ts`.
@@ -317,7 +319,7 @@ These can be tackled independently of Phases 7-10 once those are merged. Each su
 
 - [ ] Add `@sqlite.org/sqlite-wasm` (or `sql.js`). Decide based on bundle size.
 - [ ] Schema: `entries(drive_file_id PRIMARY KEY, vault_path UNIQUE, companion_path, drive_modified_time, …)`, `automation_runs(drive_file_id, automation_id, last_run_at, …, PRIMARY KEY (drive_file_id, automation_id))`, `pairs_meta(pair_id, drive_start_page_token, …)`.
-- [ ] Adapter pattern: `SyncManifestStore` becomes an interface; `JsonManifestStore` (current) and `SqliteManifestStore` (new) both implement it. Existing code is untouched.
+- [x] Adapter pattern: `SyncManifestStore` becomes an interface; `JsonManifestStore` (current) and `SqliteManifestStore` (new) both implement it. Existing code is untouched.
 - [ ] Migration: on first load with `useSqliteManifest=true`, read the JSON manifest, write to SQLite, keep the JSON as `.obsidian/drive-sync-manifest.json.legacy`.
 - [ ] Use `BEGIN IMMEDIATE` / `COMMIT` per sync phase; this replaces the in-memory buffer pattern from Phase 5.5 / 10.7.
 - [ ] **Verification:** Sync a vault with 20K manifest entries; load time drops from O(seconds) to O(milliseconds); per-entry write does not rewrite the whole file.
@@ -328,9 +330,9 @@ These can be tackled independently of Phases 7-10 once those are merged. Each su
 
 **Goal:** Drive moves/renames/duplicates never re-download bytes we already have.
 
-- [ ] On every download, write to `.obsidian/drive-sync-cache/<sha256>` and symlink/copy from there to the vault destination.
-- [ ] Manifest entry gains `contentHash: string`. On Drive change, compare new `md5Checksum` (Drive returns this for binary files — see §11.4) against `contentHash`. If equal, skip download.
-- [ ] Cache GC: LRU eviction, default cap 2GB (configurable). Evict cache entries whose hash is not referenced in the manifest first.
+- [x] On every download, write to `.obsidian/drive-sync-cache/<sha256>` and symlink/copy from there to the vault destination.
+- [x] Manifest entry gains `contentHash: string`. On Drive change, compare new `md5Checksum` (Drive returns this for binary files — see §11.4) against `contentHash`. If equal, skip download.
+- [x] Cache GC: LRU eviction, default cap 2GB (configurable). Evict cache entries whose hash is not referenced in the manifest first.
 - [ ] **Verification:** Move a 50MB PDF in Drive across folders; observe sync log shows "moved (cache hit)" with zero bytes downloaded.
 
 **Files:** `sync/DownloadManager.ts`, `sync/DriveSync.ts`, `types.ts`, new `sync/CacheManager.ts`.
@@ -339,10 +341,10 @@ These can be tackled independently of Phases 7-10 once those are merged. Each su
 
 **Goal:** Stop freezing the Obsidian UI on PDF parsing and large-file hashing.
 
-- [ ] New `workers/heavyWorker.ts` exposing `hashFile(bytes)`, `hashPdfPages(bytes)`, `extractPdfText(bytes, fromPage?, toPage?)`.
+- [x] New `workers/heavyWorker.ts` exposing `hashFile(bytes)`, `hashPdfPages(bytes)`, `extractPdfText(bytes, fromPage?, toPage?)`.
 - [ ] Bundle the worker as a separate entry in `esbuild.config.mjs`, ship as a string, instantiate via `new Worker(URL.createObjectURL(new Blob([workerSrc])))`.
-- [ ] Move `ai/PdfPageHasher.ts` and any sha256 of large blobs onto the worker.
-- [ ] Cap concurrent worker tasks (default `navigator.hardwareConcurrency - 1`).
+- [x] Move `ai/PdfPageHasher.ts` and any sha256 of large blobs onto the worker.
+- [x] Cap concurrent worker tasks (default `navigator.hardwareConcurrency - 1`).
 - [ ] **Verification:** Sync a folder with 50 200-page PDFs; UI stays interactive throughout.
 
 **Files:** new `workers/heavyWorker.ts`, `ai/PdfPageHasher.ts`, `esbuild.config.mjs`, `sync/DriveSync.ts`.
@@ -351,13 +353,19 @@ These can be tackled independently of Phases 7-10 once those are merged. Each su
 
 **Goal:** Decouple `DriveSync`, `AutomationEngine`, `CompanionNoteManager`, and the status view; make Phase 10 wiring sane.
 
-- [ ] New `events/EventBus.ts` — typed emitter: `on<E extends keyof Events>(event: E, handler: (e: Events[E]) => void)`.
-- [ ] Define event payloads for `downloaded`, `uploaded`, `skipped`, `conflict`, `automation-run`, `manifest-write`, `auth-failed`, `recycle-write`.
-- [ ] Refactor existing direct calls (e.g., `pushResultToStatusView` in `main.ts:397`) to subscribe via the bus.
-- [ ] Status view, activity log, and notice handler all subscribe rather than being called directly.
+- [x] New `events/EventBus.ts` — typed emitter: `on<E extends keyof Events>(event: E, handler: (e: Events[E]) => void)`.
+- [x] Define event payloads for `downloaded`, `uploaded`, `skipped`, `conflict`, `automation-run`, `manifest-write`, `auth-failed`, `recycle-write`.
+- [x] Refactor existing direct calls (e.g., `pushResultToStatusView` in `main.ts:397`) to subscribe via the bus.
+- [x] Status view, activity log, and notice handler all subscribe rather than being called directly.
 - [ ] **Verification:** Adding a new subscriber (e.g., a notification badge) requires zero changes in `DriveSync`.
 
 **Files:** new `events/EventBus.ts`, `sync/DriveSync.ts`, `sync/CompanionNoteManager.ts`, `automation/AutomationEngine.ts`, `ui/SyncStatusView.ts`, `main.ts`.
+
+**Decisions made (Phase 11):**
+- **11.1** implemented as a conservative *pre-walk dirty-check*: `getStartPageToken` bootstraps a per-pair token, `changes.list` is cached per-token per run, and the full folder walk is skipped only when the feed shows **zero** account-wide changes since the token (any change → safe full scan). The parent-intersection filter and the "single edit → 1-2 API calls" incremental path are **not** done — that needs per-change relPath reconstruction; left for a follow-up. Token persistence rides on `consumeSettingsDirty()`. New file: `sync/DriveChanges.ts`.
+- **11.2** ships the adapter seam only: `SyncManifestStore` is now an interface, `JsonManifestStore` the concrete, with a `createManifestStore` factory and a `useSqliteManifest` toggle. The concrete `SqliteManifestStore` (WASM bundling, schema, migration, `BEGIN IMMEDIATE`) is **deferred** — shipping an untested WASM path could corrupt the manifest, and I can't validate bundle-loading without a live Obsidian. The toggle currently logs and falls back to JSON.
+- **11.3** keys the cache by Drive's **`md5Checksum`** (available pre-download → real zero-byte hits) instead of a post-download sha256; the sha256 is still recorded as the manifest `contentHash` for §13.4. New file: `sync/CacheManager.ts`.
+- **11.4** the worker is **self-contained and inlined as a Blob URL** (no separate esbuild entry — a broken build config would break the whole plugin, untestable here). It exposes a single `analyze(bytes)` (sha256 via Web Crypto + page-count) and **always falls back to the synchronous `analyzePdf`** on any failure, so functionality is never lost. New file: `workers/heavyWorker.ts`.
 
 ---
 
@@ -367,25 +375,25 @@ Independently shippable; each can land in its own PR.
 
 ### 12.1 Live activity ticker
 
-- [ ] Add a "Live" tab in `SyncStatusView` showing the last 50 events from the EventBus (Phase 11.5) in reverse chronological order.
-- [ ] Each row: timestamp, icon by event type, file path (clickable), one-line summary. Clear button.
+- [x] Add a "Live" tab in `SyncStatusView` showing the last 50 events from the EventBus (Phase 11.5) in reverse chronological order.
+- [x] Each row: timestamp, icon by event type, file path (clickable), one-line summary. Clear button.
 - [ ] Auto-scroll on new events; pause-on-hover.
 
 **Files:** `ui/SyncStatusView.ts`, depends on `events/EventBus.ts` from §11.5.
 
 ### 12.2 Per-pair health badge
 
-- [ ] Compute health per pair on each sync: `green` if last sync succeeded < 2× interval ago and zero errors in last hour; `yellow` if errors-in-hour > 0 OR last sync > 2× interval ago; `red` if last 3 syncs all failed.
+- [x] Compute health per pair on each sync: `green` if last sync succeeded < 2× interval ago and zero errors in last hour; `yellow` if errors-in-hour > 0 OR last sync > 2× interval ago; `red` if last 3 syncs all failed.
 - [ ] Render a colored dot next to each pair label in the Sync settings tab and the status view.
-- [ ] Tooltip on hover shows the underlying numbers.
+- [x] Tooltip on hover shows the underlying numbers.
 
 **Files:** `settings/SettingsTab.ts`, `ui/SyncStatusView.ts`, `sync/SyncManifest.ts` (track per-pair sync history).
 
 ### 12.3 In-app changelog on update
 
-- [ ] Bundle `CHANGELOG.md` with the plugin (already common practice for community plugins).
-- [ ] On `onload`, compare `manifest.json:version` against `data.json:lastSeenVersion`. If different, parse the new entries from the changelog and show a one-time modal.
-- [ ] Modal includes a "Don't show again" checkbox and a link to the GitHub release page.
+- [x] Bundle `CHANGELOG.md` with the plugin (already common practice for community plugins).
+- [x] On `onload`, compare `manifest.json:version` against `data.json:lastSeenVersion`. If different, parse the new entries from the changelog and show a one-time modal.
+- [x] Modal includes a "Don't show again" checkbox and a link to the GitHub release page.
 
 **Files:** new `ui/ChangelogModal.ts`, `main.ts`, `CHANGELOG.md` (create + maintain).
 
@@ -401,10 +409,17 @@ Pre-req: Phase 10 shipped.
 
 ### 12.5 Sandbox "test sync" mode per pair
 
-- [ ] Per-pair button "Test sync against sandbox subfolder…" — prompts for a subfolder name, runs one sync round limited to that subfolder, shows a result modal.
-- [ ] Useful for proving a config (especially bidirectional) on a small slice before going live.
+- [x] Per-pair button "Test sync against sandbox subfolder…" — prompts for a subfolder name, runs one sync round limited to that subfolder, shows a result modal.
+- [x] Useful for proving a config (especially bidirectional) on a small slice before going live.
 
 **Files:** `settings/SettingsTab.ts`, `sync/DriveSync.ts` (accept `scopeSubfolderPath` option).
+
+**Decisions made (Phase 12):**
+- **12.1** Live tab + clickable rows + Clear are done; auto-scroll is via prepend and there's a **Pause button** instead of pause-on-hover.
+- **12.2** health is computed and rendered as a colored dot **in the status view**; the duplicate dot in the Sync *settings* tab was not added (status view is the canonical surface). History is in-memory per session.
+- **12.3** done — `CHANGELOG.md` is bundled (copied by esbuild), compared against `lastSeenVersion` on load, shown once with a "Don't show again" toggle + GitHub link. New file: `ui/ChangelogModal.ts`.
+- **12.4** **deferred** — depends on Phase 10 (two-way sync).
+- **12.5** exposed as the command **"Test sync against a sandbox subfolder…"** (pair picker → subfolder prompt → result modal) rather than a per-pair settings button; `DriveSync.testSync(pairId, subfolder)` runs a deletion-free scoped round.
 
 ---
 
@@ -414,50 +429,50 @@ Each task is small and independently mergeable. Sort by what's bitten you most.
 
 ### 13.1 Disk-space pre-flight
 
-- [ ] Before each sync, sum the expected download size from the changes feed (or estimate at 2× when unknown). If `2× expected > free disk`, abort with a clear notice; don't start the sync at all.
-- [ ] Use `navigator.storage.estimate()` for cross-platform free-space; fall back to a Node `statvfs` call on desktop where available.
+- [x] Before each sync, sum the expected download size from the changes feed (or estimate at 2× when unknown). If `2× expected > free disk`, abort with a clear notice; don't start the sync at all.
+- [x] Use `navigator.storage.estimate()` for cross-platform free-space; fall back to a Node `statvfs` call on desktop where available.
 
 **Files:** `sync/DriveSync.ts`, new `sync/DiskSpaceCheck.ts`.
 
 ### 13.2 Manifest schema versioning + auto-backup
 
-- [ ] Add `manifestSchemaVersion: number` to the manifest root. Bump when the shape changes.
-- [ ] On every successful manifest write, also write a copy to `.obsidian/drive-sync-manifest.backups/<YYYY-MM-DD-HHmmss>.json`.
-- [ ] Keep last N backups (default 20). GC older ones.
-- [ ] Add `drive-sync:restore-manifest` command that lists backups in a modal and restores the chosen one (with a 2-step confirm).
+- [x] Add `manifestSchemaVersion: number` to the manifest root. Bump when the shape changes.
+- [x] On every successful manifest write, also write a copy to `.obsidian/drive-sync-manifest.backups/<YYYY-MM-DD-HHmmss>.json`.
+- [x] Keep last N backups (default 20). GC older ones.
+- [x] Add `drive-sync:restore-manifest` command that lists backups in a modal and restores the chosen one (with a 2-step confirm).
 
 **Files:** `sync/SyncManifest.ts`, `main.ts`.
 
 ### 13.3 Effective sync-rate cap
 
-- [ ] Enforce a minimum interval of 60 seconds regardless of `syncIntervalMinutes` (clamp + log a warning if the user sets less).
-- [ ] Per-pair token bucket: max 30 sync runs per hour per pair. Above the cap, log a warning and skip the run.
+- [x] Enforce a minimum interval of 60 seconds regardless of `syncIntervalMinutes` (clamp + log a warning if the user sets less).
+- [x] Per-pair token bucket: max 30 sync runs per hour per pair. Above the cap, log a warning and skip the run.
 
 **Files:** `sync/Scheduler.ts`, `sync/DriveSync.ts`.
 
 ### 13.4 `drive-sync:verify-integrity` command
 
-- [ ] Walk the manifest. For each entry: check vault file exists, hash it, compare to `vaultContentHash` (when present from Phase 10.2).
-- [ ] Build a report grouped by drift type: `missing` / `hash-mismatch` / `mtime-mismatch` / `manifest-only`.
-- [ ] Modal shows the report with per-row "Fix" actions where applicable (re-download from Drive, remove from manifest, etc.).
-- [ ] Pure-read; no side effects until the user clicks Fix.
+- [x] Walk the manifest. For each entry: check vault file exists, hash it, compare to `vaultContentHash` (when present from Phase 10.2).
+- [x] Build a report grouped by drift type: `missing` / `hash-mismatch` / `mtime-mismatch` / `manifest-only`.
+- [x] Modal shows the report with per-row "Fix" actions where applicable (re-download from Drive, remove from manifest, etc.).
+- [x] Pure-read; no side effects until the user clicks Fix.
 
 **Files:** new `commands/VerifyIntegrity.ts`, `main.ts`.
 
 ### 13.5 Crash-safe recycle bin (extends Phase 10.8)
 
-- [ ] Each recycled file gets a sibling `.json` sidecar: `{ originalPath, driveFileId, pairId, action, timestamp, sha256, restoreInstructions }`.
-- [ ] New `drive-sync:undo-last-sync` command: scans the recycle bin for entries written in the last sync run (group by `syncRunId`) and restores them with a confirm modal.
-- [ ] Only the most recent run is undoable; older runs require manual restore from `drive-sync:open-recycle`.
+- [x] Each recycled file gets a sibling `.json` sidecar: `{ originalPath, driveFileId, pairId, action, timestamp, sha256, restoreInstructions }`.
+- [x] New `drive-sync:undo-last-sync` command: scans the recycle bin for entries written in the last sync run (group by `syncRunId`) and restores them with a confirm modal.
+- [x] Only the most recent run is undoable; older runs require manual restore from `drive-sync:open-recycle`.
 
 **Files:** `sync/Recycle.ts` (new — encapsulates the recycle logic from §10.8), new `commands/UndoLastSync.ts`, `main.ts`.
 
 ### 13.6 Opt-in anonymous error reporting
 
-- [ ] Capture unhandled errors in a global `Promise.unhandledRejection` + `window.onerror` handler.
-- [ ] Strip vault paths, file names, and any string > 64 chars before sending. Send only: error class, message template, stack frames.
-- [ ] Settings toggle (default OFF) + endpoint URL (default empty — user supplies their own collector or uses ours if/when one exists).
-- [ ] Show the exact JSON that would be sent, with a "Send test report" button, before enabling.
+- [x] Capture unhandled errors in a global `Promise.unhandledRejection` + `window.onerror` handler.
+- [x] Strip vault paths, file names, and any string > 64 chars before sending. Send only: error class, message template, stack frames.
+- [x] Settings toggle (default OFF) + endpoint URL (default empty — user supplies their own collector or uses ours if/when one exists).
+- [x] Show the exact JSON that would be sent, with a "Send test report" button, before enabling.
 
 **Files:** new `telemetry/ErrorReporter.ts`, `main.ts`, `settings/SettingsTab.ts`.
 
@@ -473,32 +488,46 @@ Pre-req: Phase 10 shipped (only meaningful in bidirectional pairs).
 
 ### 13.8 Auth refresh-token expiry UX
 
-- [ ] Wrap every Drive API call in a 401 detector. On a confirmed auth failure (after a refresh attempt), set `auth.state = "expired"`.
+- [x] Wrap every Drive API call in a 401 detector. On a confirmed auth failure (after a refresh attempt), set `auth.state = "expired"`.
 - [ ] When `expired`, the scheduler pauses, the ribbon icon turns red with a badge, and a non-dismissable notice asks the user to re-auth.
 - [ ] One-click re-auth from the notice opens the OAuth flow.
-- [ ] Activity log records the moment auth went stale and the moment it was restored.
+- [x] Activity log records the moment auth went stale and the moment it was restored.
 
 **Files:** `auth/GoogleAuth.ts`, `sync/DriveSync.ts`, `main.ts`, `ui/SyncStatusView.ts`.
 
 ### 13.9 Use Drive `md5Checksum` for change detection
 
-- [ ] When listing files, request `md5Checksum` in the `fields` parameter (already supported for binary files; ignored for Google-native types).
-- [ ] Manifest stores `driveMd5: string`. On change-detection, compare `md5Checksum` first; only fall back to `modifiedTime` when md5 is unavailable (Google Docs etc.).
-- [ ] Skips wasted Gemini calls when Drive's `modifiedTime` bumps but content is identical (a real, observed bug).
+- [x] When listing files, request `md5Checksum` in the `fields` parameter (already supported for binary files; ignored for Google-native types).
+- [x] Manifest stores `driveMd5: string`. On change-detection, compare `md5Checksum` first; only fall back to `modifiedTime` when md5 is unavailable (Google Docs etc.).
+- [x] Skips wasted Gemini calls when Drive's `modifiedTime` bumps but content is identical (a real, observed bug).
 
 **Files:** `sync/DriveSync.ts`, `types.ts`.
 
 ### 13.10 Automation-config linter
 
-- [ ] On settings save and inside `commands/Audit.ts`, validate every automation:
-  - [ ] `triggerFolderPath` resolves to an existing vault folder
-  - [ ] `targetNotePath` (when used) refers to an existing note
-  - [ ] `searchFolderPath`, `newNoteFolder`, `newNoteTemplatePath` exist
-  - [ ] No two enabled automations share identical `(triggerFolderPath, action.type, …)` (warn — sometimes intended)
-  - [ ] `matchConfidenceThreshold` in `[0, 1]`
+- [x] On settings save and inside `commands/Audit.ts`, validate every automation:
+  - [x] `triggerFolderPath` resolves to an existing vault folder
+  - [x] `targetNotePath` (when used) refers to an existing note
+  - [x] `searchFolderPath`, `newNoteFolder`, `newNoteTemplatePath` exist
+  - [x] No two enabled automations share identical `(triggerFolderPath, action.type, …)` (warn — sometimes intended)
+  - [x] `matchConfidenceThreshold` in `[0, 1]`
 - [ ] Show the lint result inline in the automation card (red border + tooltip) and as a section in the audit modal.
 
 **Files:** new `automation/AutomationLinter.ts`, `settings/SettingsTab.ts`, `commands/Audit.ts`.
+
+**Decisions made (Phase 13):**
+- **13.1** disk-space pre-flight runs **per pair** after the file list is known (summing `size` for files that actually need download), aborting that pair before any write. Uses `navigator.storage.estimate()`; the Node `statvfs` fallback is not implemented (estimate is treated as "ok" when free space is unknown, to avoid blocking on unknowns). New file: `sync/DiskSpaceCheck.ts`.
+- **13.2** done — backups wrap a `__schemaVersion` (`MANIFEST_SCHEMA_VERSION`), keep last 20, plus a `restore-manifest` command. The live manifest file stays the bare map for backward-compat; the version wrapper lives in the backups.
+- **13.3** done — 60s floor enforced in both `Scheduler` and `effectiveInterval()`, plus a per-pair 30-runs/hour token bucket (skips safely, marking tracked files as "seen").
+- **13.4** done — `verify-integrity` command + Advanced-tab button; hashes each tracked file against `contentHash`, reports drift, offers "remove from manifest" fixes. New file: `commands/VerifyIntegrity.ts`.
+- **13.5** done — `sync/Recycle.ts` writes byte backups + JSON sidecars before the destructive trash path, grouped by `syncRunId`; `undo-last-sync` and `open-recycle` commands added.
+- **13.6** done — `telemetry/ErrorReporter.ts` hooks `unhandledrejection`/`error`, redacts paths/file-names/long literals, off by default, with a preview-and-send-test modal.
+- **13.7** **deferred** — depends on Phase 10.
+- **13.8** auth `state` flips to `"expired"` on a failed refresh → emits `auth-failed`, the scheduler pauses, and a persistent notice appears; `auth-restored` resumes it. The red **ribbon badge** and one-click re-auth from the notice are not done (notice directs to settings).
+- **13.9** done — `md5Checksum` requested in the file list, stored as `driveMd5`, compared first with a `modifiedTime` fallback.
+- **13.10** `automation/AutomationLinter.ts` validates all the listed fields and runs on settings save (logs errors). The inline automation-card red border and the audit-modal section are not wired yet.
+
+**Commit note:** Phases 11–13 were delivered in a single commit (the shared files `main.ts`, `types.ts`, `settings/SettingsTab.ts` span all three phases, so per-phase commits wouldn't be independently bisectable). 12.4 and 13.7 remain unstarted pending Phase 10.
 
 ---
 

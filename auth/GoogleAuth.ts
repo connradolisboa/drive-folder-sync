@@ -3,6 +3,7 @@ import * as crypto from "crypto";
 import * as http from "http";
 import { URL } from "url";
 import { DriveCredentials, PluginSettings } from "../types";
+import type { EventBus } from "../events/EventBus";
 
 // Electron shell — marked external in esbuild so it resolves at runtime
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -16,11 +17,30 @@ const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const SCOPE = "https://www.googleapis.com/auth/drive.readonly";
 const LOG = "[DriveSync/Auth]";
 
+export type AuthState = "ok" | "expired";
+
 export class GoogleAuth {
-	constructor(private app: App, private settings: PluginSettings) {}
+	/** Phase 13.8 — current auth health, surfaced to the scheduler/ribbon/UI. */
+	state: AuthState = "ok";
+
+	constructor(private app: App, private settings: PluginSettings, private bus?: EventBus) {}
 
 	updateSettings(settings: PluginSettings): void {
 		this.settings = settings;
+	}
+
+	private markExpired(reason: string): void {
+		if (this.state !== "expired") {
+			this.state = "expired";
+			this.bus?.emit("auth-failed", { reason });
+		}
+	}
+
+	private markOk(): void {
+		if (this.state === "expired") {
+			this.state = "ok";
+			this.bus?.emit("auth-restored", {});
+		}
 	}
 
 	async isAuthorized(): Promise<boolean> {
@@ -130,6 +150,7 @@ export class GoogleAuth {
 			access_token: data.access_token,
 			expiry: Date.now() + data.expires_in * 1000,
 		});
+		this.markOk();
 	}
 
 	private async refreshAccessToken(refreshToken: string): Promise<string> {
@@ -148,6 +169,8 @@ export class GoogleAuth {
 		if (!resp.ok) {
 			const body = await resp.text();
 			console.error(`${LOG} Token refresh failed — status ${resp.status}:`, body);
+			// Phase 13.8 — a failed refresh means the grant is stale; flag it for the UI.
+			this.markExpired(`token refresh failed (HTTP ${resp.status})`);
 			throw new Error(`Token refresh failed: ${resp.status} ${body}`);
 		}
 
@@ -161,6 +184,7 @@ export class GoogleAuth {
 		};
 
 		await this.saveCredentials(newCreds);
+		this.markOk();
 		return newCreds.access_token;
 	}
 
