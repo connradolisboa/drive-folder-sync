@@ -646,6 +646,43 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 		companionTitleSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
 		companionTemplateSetting.settingEl.toggle(this.plugin.settings.companionNotesEnabled);
 
+		// ── PDF embed display ───────────────────────────────────────────────
+		el.createEl("h3", { text: "PDF embed display" });
+
+		new Setting(el)
+			.setName("Windowed PDF embeds")
+			.setDesc(
+				"Show PDF embeds as a fixed-height scrollable window instead of letting them take over the whole page. " +
+				"Applies to all PDF embeds in the vault, in both Reading view and Live Preview."
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.pdfEmbedWindowed)
+					.onChange(async (val) => {
+						this.plugin.settings.pdfEmbedWindowed = val;
+						await this.plugin.saveSettings();
+						pdfHeightSetting.settingEl.toggle(val);
+					})
+			);
+
+		const pdfHeightSetting = new Setting(el)
+			.setName("Window height")
+			.setDesc("Height in pixels of the scrollable PDF embed window (minimum 100).")
+			.addText((text) =>
+				text
+					.setPlaceholder("400")
+					.setValue(String(this.plugin.settings.pdfEmbedWindowHeight))
+					.onChange(async (val) => {
+						const n = parseInt(val, 10);
+						if (!Number.isNaN(n) && n >= 100) {
+							this.plugin.settings.pdfEmbedWindowHeight = n;
+							await this.plugin.saveSettings();
+						}
+					})
+			);
+
+		pdfHeightSetting.settingEl.toggle(this.plugin.settings.pdfEmbedWindowed);
+
 		// ── Conflict resolution ─────────────────────────────────────────────
 		el.createEl("h3", { text: "Conflict resolution" });
 		el.createEl("p", {

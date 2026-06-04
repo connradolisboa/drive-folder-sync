@@ -32,6 +32,7 @@ import { runAudit, AuditModal } from "./commands/Audit";
 import { Automation, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
+const PDF_EMBED_STYLE_ID = "drive-sync-pdf-embed-style";
 
 export default class DriveFolderSyncPlugin extends Plugin {
 	settings: PluginSettings;
@@ -142,6 +143,8 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		});
 
 		this.addSettingTab(new DriveSyncSettingTab(this.app, this));
+
+		this.applyPdfEmbedStyle();
 
 		this.addCommand({
 			id: "sync-now",
@@ -545,6 +548,33 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		this.bus?.clear();
 		this.heavyWorker?.terminate();
 		this.errorReporter?.uninstall();
+		document.getElementById(PDF_EMBED_STYLE_ID)?.remove();
+	}
+
+	/**
+	 * Inject (or remove) a global stylesheet that caps PDF embeds to a fixed-height
+	 * scrollable window instead of letting them expand to the full document height.
+	 * Applies vault-wide in both Reading view and Live Preview. Idempotent — call it
+	 * on load and after every settings save.
+	 */
+	applyPdfEmbedStyle(): void {
+		document.getElementById(PDF_EMBED_STYLE_ID)?.remove();
+		if (!this.settings.pdfEmbedWindowed) return;
+
+		const h = Math.max(100, Math.round(this.settings.pdfEmbedWindowHeight) || 400);
+		const style = document.createElement("style");
+		style.id = PDF_EMBED_STYLE_ID;
+		style.textContent =
+			`.internal-embed.pdf-embed {\n` +
+			`\theight: ${h}px !important;\n` +
+			`}\n` +
+			`.internal-embed.pdf-embed .pdf-viewer-container,\n` +
+			`.internal-embed.pdf-embed .pdf-container {\n` +
+			`\theight: 100% !important;\n` +
+			`\tmax-height: ${h}px !important;\n` +
+			`\toverflow: auto !important;\n` +
+			`}\n`;
+		document.head.appendChild(style);
 	}
 
 	async runSync(dryRun = false): Promise<SyncResult> {
@@ -918,6 +948,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		if (this.syncLogger) this.syncLogger.updateSettings(this.settings);
 		if (this.syncActivityLog) this.syncActivityLog.updateSettings(this.settings);
 		if (this.errorReporter) this.errorReporter.updateSettings(this.settings);
+		this.applyPdfEmbedStyle();
 
 		// Phase 13.10 — surface automation-config problems on save.
 		const lint = lintAutomations(this.app, this.settings.automations, {

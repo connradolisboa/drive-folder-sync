@@ -145,6 +145,12 @@ export interface PluginSettings {
 	companionNoteTemplatePath: string; // vault path to .md template; empty = built-in default
 	companionNoteTitle: string;        // title template; empty = PDF stem; supports {{title}}, {{fileName}}, {{pairLabel}}, {{relativePath}}
 
+	// PDF embed display
+	/** When true, cap PDF embeds to a fixed-height scrollable window instead of full document height. Applies vault-wide in Reading view and Live Preview. */
+	pdfEmbedWindowed: boolean;
+	/** Height in px of the windowed PDF embed (when pdfEmbedWindowed is true). */
+	pdfEmbedWindowHeight: number;
+
 	// Periodic notes paths (used by embed_to_weekly_note etc.)
 	periodicNotesPaths: PeriodicNotesPaths;
 
@@ -206,6 +212,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	companionNotesFolder: "",
 	companionNoteTemplatePath: "",
 	companionNoteTitle: "",
+	pdfEmbedWindowed: false,
+	pdfEmbedWindowHeight: 400,
 	periodicNotesPaths: {
 		daily: "",
 		weekly: "",
