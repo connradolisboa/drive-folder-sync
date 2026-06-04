@@ -683,6 +683,22 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 
 		pdfHeightSetting.settingEl.toggle(this.plugin.settings.pdfEmbedWindowed);
 
+		new Setting(el)
+			.setName("Collapsible PDF embeds")
+			.setDesc(
+				"Add a title bar with a collapse button to each PDF embed. " +
+				"Clicking it hides the document while keeping the filename showing. " +
+				"Works in both Reading view and Live Preview."
+			)
+			.addToggle((toggle) =>
+				toggle
+					.setValue(this.plugin.settings.pdfEmbedCollapsible)
+					.onChange(async (val) => {
+						this.plugin.settings.pdfEmbedCollapsible = val;
+						await this.plugin.saveSettings();
+					})
+			);
+
 		// ── Conflict resolution ─────────────────────────────────────────────
 		el.createEl("h3", { text: "Conflict resolution" });
 		el.createEl("p", {

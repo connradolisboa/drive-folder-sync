@@ -56,6 +56,9 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	private syncLogger: SyncLogger;
 	private syncActivityLog: SyncActivityLog;
 	private syncing = false;
+	/** Watches for PDF embeds appearing in the DOM so collapse bars can be (re)attached. */
+	private pdfEmbedObserver: MutationObserver | null = null;
+	private pdfSweepScheduled = false;
 
 	async onload() {
 		console.log(`${LOG} Loading plugin`);
@@ -144,7 +147,9 @@ export default class DriveFolderSyncPlugin extends Plugin {
 
 		this.addSettingTab(new DriveSyncSettingTab(this.app, this));
 
-		this.applyPdfEmbedStyle();
+		this.refreshPdfEmbedFeatures();
+		// Re-sweep on layout changes so embeds in newly-opened panes get their collapse bars.
+		this.registerEvent(this.app.workspace.on("layout-change", () => this.enhanceAllPdfEmbeds()));
 
 		this.addCommand({
 			id: "sync-now",
@@ -548,33 +553,143 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		this.bus?.clear();
 		this.heavyWorker?.terminate();
 		this.errorReporter?.uninstall();
+		this.stopPdfEmbedObserver();
 		document.getElementById(PDF_EMBED_STYLE_ID)?.remove();
+		this.removeAllPdfEmbedBars();
 	}
 
 	/**
-	 * Inject (or remove) a global stylesheet that caps PDF embeds to a fixed-height
-	 * scrollable window instead of letting them expand to the full document height.
-	 * Applies vault-wide in both Reading view and Live Preview. Idempotent — call it
-	 * on load and after every settings save.
+	 * Apply both PDF-embed display features according to current settings:
+	 *  - windowing (fixed-height scrollable embeds) via injected CSS, and
+	 *  - collapsible embeds (a title bar + collapse toggle on each embed).
+	 * Idempotent — call on load and after every settings save.
+	 */
+	refreshPdfEmbedFeatures(): void {
+		this.applyPdfEmbedStyle();
+		if (this.settings.pdfEmbedCollapsible) {
+			this.startPdfEmbedObserver();
+			this.enhanceAllPdfEmbeds();
+		} else {
+			this.stopPdfEmbedObserver();
+			this.removeAllPdfEmbedBars();
+		}
+	}
+
+	/**
+	 * Inject (or remove) the global stylesheet backing the PDF-embed features:
+	 * the fixed-height windowing rules and the collapse bar / collapsed-state rules.
 	 */
 	applyPdfEmbedStyle(): void {
 		document.getElementById(PDF_EMBED_STYLE_ID)?.remove();
-		if (!this.settings.pdfEmbedWindowed) return;
+		const parts: string[] = [];
 
-		const h = Math.max(100, Math.round(this.settings.pdfEmbedWindowHeight) || 400);
+		if (this.settings.pdfEmbedWindowed) {
+			const h = Math.max(100, Math.round(this.settings.pdfEmbedWindowHeight) || 400);
+			// Skip the height cap while collapsed so the bar sits flush with no empty gap.
+			parts.push(
+				`.internal-embed.pdf-embed:not(.drive-sync-pdf-collapsed) {\n` +
+				`\theight: ${h}px !important;\n` +
+				`}\n` +
+				`.internal-embed.pdf-embed:not(.drive-sync-pdf-collapsed) .pdf-viewer-container,\n` +
+				`.internal-embed.pdf-embed:not(.drive-sync-pdf-collapsed) .pdf-container {\n` +
+				`\theight: 100% !important;\n` +
+				`\tmax-height: ${h}px !important;\n` +
+				`\toverflow: auto !important;\n` +
+				`}\n`
+			);
+		}
+
+		if (this.settings.pdfEmbedCollapsible) {
+			parts.push(
+				`.drive-sync-pdf-bar {\n` +
+				`\tdisplay: flex;\n\talign-items: center;\n\tgap: 6px;\n` +
+				`\tpadding: 4px 8px;\n\tcursor: pointer;\n\tuser-select: none;\n` +
+				`\tposition: relative;\n\tz-index: 1;\n` +
+				`\tbackground: var(--background-secondary);\n` +
+				`\tborder-bottom: 1px solid var(--background-modifier-border);\n` +
+				`\tfont-size: var(--font-ui-small);\n` +
+				`}\n` +
+				`.drive-sync-pdf-bar:hover { background: var(--background-modifier-hover); }\n` +
+				`.drive-sync-pdf-chevron { display: inline-block; width: 1em; text-align: center; color: var(--text-muted); }\n` +
+				`.drive-sync-pdf-bar-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }\n` +
+				`.internal-embed.pdf-embed.drive-sync-pdf-collapsed { height: auto !important; }\n` +
+				`.internal-embed.pdf-embed.drive-sync-pdf-collapsed > *:not(.drive-sync-pdf-bar) { display: none !important; }\n`
+			);
+		}
+
+		if (parts.length === 0) return;
 		const style = document.createElement("style");
 		style.id = PDF_EMBED_STYLE_ID;
-		style.textContent =
-			`.internal-embed.pdf-embed {\n` +
-			`\theight: ${h}px !important;\n` +
-			`}\n` +
-			`.internal-embed.pdf-embed .pdf-viewer-container,\n` +
-			`.internal-embed.pdf-embed .pdf-container {\n` +
-			`\theight: 100% !important;\n` +
-			`\tmax-height: ${h}px !important;\n` +
-			`\toverflow: auto !important;\n` +
-			`}\n`;
+		style.textContent = parts.join("\n");
 		document.head.appendChild(style);
+	}
+
+	private startPdfEmbedObserver(): void {
+		if (this.pdfEmbedObserver) return;
+		this.pdfEmbedObserver = new MutationObserver((mutations) => {
+			// Only react when an embed-ish node was inserted — ignore editor typing churn.
+			const relevant = mutations.some((m) =>
+				Array.from(m.addedNodes).some(
+					(n) =>
+						n instanceof HTMLElement &&
+						(n.matches(".internal-embed, .pdf-embed, .pdf-container") ||
+							!!n.querySelector(".internal-embed, .pdf-embed"))
+				)
+			);
+			if (!relevant || this.pdfSweepScheduled) return;
+			this.pdfSweepScheduled = true;
+			window.requestAnimationFrame(() => {
+				this.pdfSweepScheduled = false;
+				this.enhanceAllPdfEmbeds();
+			});
+		});
+		this.pdfEmbedObserver.observe(document.body, { childList: true, subtree: true });
+	}
+
+	private stopPdfEmbedObserver(): void {
+		this.pdfEmbedObserver?.disconnect();
+		this.pdfEmbedObserver = null;
+	}
+
+	/** Attach a collapse bar to every PDF embed currently in the DOM that lacks one. */
+	private enhanceAllPdfEmbeds(): void {
+		if (!this.settings.pdfEmbedCollapsible) return;
+		document
+			.querySelectorAll<HTMLElement>('.pdf-embed, .internal-embed[src*=".pdf"]')
+			.forEach((el) => this.enhancePdfEmbed(el));
+	}
+
+	/** Prepend a clickable title bar that toggles the collapsed state of one PDF embed. */
+	private enhancePdfEmbed(embed: HTMLElement): void {
+		if (!embed.classList.contains("internal-embed")) return;
+		if (embed.querySelector(":scope > .drive-sync-pdf-bar")) return; // already enhanced
+
+		const src = embed.getAttribute("src") ?? embed.getAttribute("alt") ?? "PDF";
+		let raw = src.split("/").pop() ?? src;
+		try { raw = decodeURIComponent(raw); } catch { /* leave as-is on malformed input */ }
+		const pageMatch = raw.match(/#page=(\d+)/i);
+		const name = raw.replace(/#.*$/, "");
+		const label = pageMatch ? `${name} (p. ${pageMatch[1]})` : name;
+		const collapsed = embed.classList.contains("drive-sync-pdf-collapsed");
+
+		const bar = embed.createDiv({ cls: "drive-sync-pdf-bar" });
+		embed.prepend(bar); // createDiv appends; move it to the top of the embed
+		const chevron = bar.createSpan({ cls: "drive-sync-pdf-chevron", text: collapsed ? "▸" : "▾" });
+		bar.createSpan({ cls: "drive-sync-pdf-bar-title", text: label });
+
+		bar.addEventListener("click", (e) => {
+			e.preventDefault();
+			e.stopPropagation();
+			const isCollapsed = embed.classList.toggle("drive-sync-pdf-collapsed");
+			chevron.textContent = isCollapsed ? "▸" : "▾";
+		});
+	}
+
+	private removeAllPdfEmbedBars(): void {
+		document.querySelectorAll(".drive-sync-pdf-bar").forEach((b) => b.remove());
+		document
+			.querySelectorAll(".drive-sync-pdf-collapsed")
+			.forEach((e) => e.classList.remove("drive-sync-pdf-collapsed"));
 	}
 
 	async runSync(dryRun = false): Promise<SyncResult> {
@@ -948,7 +1063,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		if (this.syncLogger) this.syncLogger.updateSettings(this.settings);
 		if (this.syncActivityLog) this.syncActivityLog.updateSettings(this.settings);
 		if (this.errorReporter) this.errorReporter.updateSettings(this.settings);
-		this.applyPdfEmbedStyle();
+		this.refreshPdfEmbedFeatures();
 
 		// Phase 13.10 — surface automation-config problems on save.
 		const lint = lintAutomations(this.app, this.settings.automations, {

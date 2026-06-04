@@ -150,6 +150,8 @@ export interface PluginSettings {
 	pdfEmbedWindowed: boolean;
 	/** Height in px of the windowed PDF embed (when pdfEmbedWindowed is true). */
 	pdfEmbedWindowHeight: number;
+	/** When true, add a clickable title bar to each PDF embed that collapses the embed, leaving the filename showing. */
+	pdfEmbedCollapsible: boolean;
 
 	// Periodic notes paths (used by embed_to_weekly_note etc.)
 	periodicNotesPaths: PeriodicNotesPaths;
@@ -214,6 +216,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	companionNoteTitle: "",
 	pdfEmbedWindowed: false,
 	pdfEmbedWindowHeight: 400,
+	pdfEmbedCollapsible: false,
 	periodicNotesPaths: {
 		daily: "",
 		weekly: "",
