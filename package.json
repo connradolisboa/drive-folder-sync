@@ -1,11 +1,12 @@
 {
   "name": "drive-folder-sync",
   "version": "1.0.0",
-  "description": "One-way sync from a Google Drive folder to your Obsidian vault",
+  "description": "Manage handwritten PDF notes in Obsidian: track, embed, transcribe, and sync them from Google Drive",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "node esbuild.config.mjs production"
+    "build": "node esbuild.config.mjs production",
+    "test": "node tests/run-tests.mjs"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",

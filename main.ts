@@ -134,12 +134,12 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			}
 		});
 
-		this.addRibbonIcon("layout-dashboard", "Drive Sync Status", () => {
+		this.addRibbonIcon("layout-dashboard", "PDF Manager Status", () => {
 			this.activateStatusView();
 		});
 
-		this.addRibbonIcon("file-search", "Drive Sync File Tracker", () => {
-			new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings, (vaultPath) => {
+		this.addRibbonIcon("file-search", "PDF Manager File Tracker", () => {
+			new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings, this.automationEngine, (vaultPath) => {
 						const f = this.app.vault.getAbstractFileByPath(vaultPath);
 						if (f instanceof TFile) openTranscribePickerForFile(this.app, this, f);
 					}).open();
@@ -197,7 +197,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 			id: "file-tracker",
 			name: "Open file tracker",
 			callback: () => {
-				new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings, (vaultPath) => {
+				new FileTrackerModal(this.app, this.manifestStore, this.transcriptionStore, this.settings, this.automationEngine, (vaultPath) => {
 						const f = this.app.vault.getAbstractFileByPath(vaultPath);
 						if (f instanceof TFile) openTranscribePickerForFile(this.app, this, f);
 					}).open();
@@ -215,7 +215,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 				}
 				const entry = this.manifestStore.findByVaultPath(active.path);
 				if (!entry) {
-					new Notice("This PDF is not tracked by Drive Sync.");
+					new Notice("This PDF is not tracked by PDF Manager.");
 					return;
 				}
 				const [driveFileId] = entry;
@@ -470,7 +470,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 				// ── Drive Sync status (any file) ──────────────────────────────────
 				menu.addItem((item) =>
 					item
-						.setTitle("Show Drive Sync status…")
+						.setTitle("Show PDF Manager status…")
 						.setIcon("info")
 						.setSection("drive-sync")
 						.onClick(() => new FileStatusModal(this.app, this, file).open())
@@ -856,11 +856,11 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		// Surface auth failures as a persistent, non-auto-dismissing notice + pause the
 		// scheduler until re-auth (Phase 13.8).
 		this.bus.on("auth-failed", (p) => {
-			new Notice(`Drive Sync: authentication expired — ${p.reason}. Re-authenticate in settings.`, 0);
+			new Notice(`PDF Manager: authentication expired — ${p.reason}. Re-authenticate in settings.`, 0);
 			this.scheduler.stop();
 		});
 		this.bus.on("auth-restored", () => {
-			new Notice("Drive Sync: authentication restored — resuming scheduled syncs.");
+			new Notice("PDF Manager: authentication restored — resuming scheduled syncs.");
 			this.scheduler.start(this.effectiveInterval(), () => this.runSync());
 		});
 	}

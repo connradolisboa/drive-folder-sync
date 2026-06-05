@@ -18,7 +18,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		this.injectStyles(containerEl);
 
-		containerEl.createEl("h2", { text: "Drive Folder Sync" });
+		containerEl.createEl("h2", { text: "PDF Manager" });
 
 		const nav = containerEl.createEl("nav", { cls: "drive-sync-tabs" });
 		const tabs: { id: TabId; label: string }[] = [
@@ -702,7 +702,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 		// ── Conflict resolution ─────────────────────────────────────────────
 		el.createEl("h3", { text: "Conflict resolution" });
 		el.createEl("p", {
-			text: "When Drive Sync detects that you've edited a companion note since the last sync, this policy controls what happens.",
+			text: "When PDF Manager detects that you've edited a companion note since the last sync, this policy controls what happens.",
 			cls: "setting-item-description",
 		});
 
@@ -1761,6 +1761,29 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				})();
 			});
 
+			// Reorder buttons — order is array position, which is also run order.
+			const UP_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>`;
+			const DOWN_ICON = `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`;
+			const last = this.plugin.settings.automations.length - 1;
+
+			const upBtn = this.addCardButton(controlsEl, UP_ICON, "Move up (runs earlier)", async () => {
+				if (i === 0) return;
+				const arr = this.plugin.settings.automations;
+				[arr[i - 1], arr[i]] = [arr[i], arr[i - 1]];
+				await this.plugin.saveSettings();
+				this.display();
+			});
+			if (i === 0) upBtn.disabled = true;
+
+			const downBtn = this.addCardButton(controlsEl, DOWN_ICON, "Move down (runs later)", async () => {
+				if (i === last) return;
+				const arr = this.plugin.settings.automations;
+				[arr[i + 1], arr[i]] = [arr[i], arr[i + 1]];
+				await this.plugin.saveSettings();
+				this.display();
+			});
+			if (i === last) downBtn.disabled = true;
+
 			// Delete button
 			this.addCardButton(controlsEl, TRASH_ICON, "Delete this automation", async () => {
 				this.plugin.settings.automations.splice(i, 1);
@@ -2125,6 +2148,48 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					text.inputEl.style.resize = "vertical";
 				});
 
+			const pageIndexEnabledSetting = new Setting(bodyEl)
+				.setName("Write page-index note")
+				.setDesc("Create/refresh a per-PDF note recording which pages were embedded into which dates.")
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.pageIndexEnabled ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.pageIndexEnabled = val;
+							await this.plugin.saveSettings();
+							updateActionFieldVisibility(this.plugin.settings.automations[i].action.type);
+						})
+				);
+
+			const pageIndexPathSetting = new Setting(bodyEl)
+				.setName("Page-index note path")
+				.setDesc(
+					"Path for the page-index note. Supports {{RootFolder}}, {{folderLN}} and {{title}} (PDF stem). " +
+					"Leave empty to place it next to the PDF as \"<title> — Page Index.md\"."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("{{title}} — Page Index.md")
+						.setValue(automation.action.pageIndexNotePath ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.pageIndexNotePath = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const pageIndexHeadingSetting = new Setting(bodyEl)
+				.setName("Page-index heading")
+				.setDesc("Heading for the managed page-index section. Default: \"## Page index\".")
+				.addText((text) =>
+					text
+						.setPlaceholder("## Page index")
+						.setValue(automation.action.pageIndexHeading ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.pageIndexHeading = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
 			const insertPositionSetting = new Setting(bodyEl)
 				.setName("Insert position")
 				.setDesc("Where in the note to insert the embed.")
@@ -2178,6 +2243,94 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					text.inputEl.style.resize = "vertical";
 				});
 
+			const transcribeToCompanionSetting = new Setting(bodyEl)
+				.setName("Also transcribe full PDF to companion")
+				.setDesc(
+					"After embedding, transcribe the whole PDF into the companion note's \"## Transcription\" section. " +
+					"Requires a companion note and a configured transcription provider (Settings → Transcription)."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.transcribeFullToCompanion ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.transcribeFullToCompanion = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const companionLinkSetting = new Setting(bodyEl)
+				.setName("Link companion back to the note")
+				.setDesc(
+					"Insert a [[wikilink]] to the daily/periodic note into the companion note " +
+					"(e.g. [[2026-06-06 Friday]]). Requires a companion note."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.companionLinkToPeriodicNote ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.companionLinkToPeriodicNote = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			// ── Composition (include results from earlier automations) ──────
+			const includeResultsIdsSetting = new Setting(bodyEl)
+				.setName("Include results from automations")
+				.setDesc(
+					"Comma-separated automation IDs whose page→date results should be rendered into this note " +
+					"as a managed section. The referenced automations must run before this one (move this card down)."
+				)
+				.addText((text) =>
+					text
+						.setPlaceholder("id1, id2")
+						.setValue((automation.action.includeResultsFromAutomationIds ?? []).join(", "))
+						.onChange(async (val) => {
+							const ids = val.split(",").map((s) => s.trim()).filter(Boolean);
+							this.plugin.settings.automations[i].action.includeResultsFromAutomationIds = ids.length ? ids : undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const includeResultsTypesSetting = new Setting(bodyEl)
+				.setName("Include results from action types")
+				.setDesc("Comma-separated action types to include (e.g. split_pages_to_daily_notes).")
+				.addText((text) =>
+					text
+						.setPlaceholder("split_pages_to_daily_notes")
+						.setValue((automation.action.includeResultsFromTypes ?? []).join(", "))
+						.onChange(async (val) => {
+							const types = val.split(",").map((s) => s.trim()).filter(Boolean) as AutomationActionType[];
+							this.plugin.settings.automations[i].action.includeResultsFromTypes = types.length ? types : undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const includeResultsHeadingSetting = new Setting(bodyEl)
+				.setName("Included-results heading")
+				.setDesc("Heading for the composed section. Default: \"## Included results\".")
+				.addText((text) =>
+					text
+						.setPlaceholder("## Daily embeds")
+						.setValue(automation.action.includeResultsHeading ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.includeResultsHeading = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			const includeResultsTemplateSetting = new Setting(bodyEl)
+				.setName("Included-results line template")
+				.setDesc("Per-line template. Placeholders: {{date}}, {{pages}}. Default: \"{{date}} → pages {{pages}}\".")
+				.addText((text) =>
+					text
+						.setPlaceholder("{{date}} → pages {{pages}}")
+						.setValue(automation.action.includeResultsTemplate ?? "")
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.includeResultsTemplate = val.trim() || undefined;
+							await this.plugin.saveSettings();
+						})
+				);
+
 			const isEmbedType = (type: AutomationActionType) =>
 				type === "embed_to_daily_note" ||
 				type === "embed_to_weekly_note" ||
@@ -2210,9 +2363,27 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				createDailyNoteSetting.settingEl.toggle(isSplitPages);
 				dailyNoteTemplateSetting.settingEl.toggle(isSplitPages);
 				pageEmbedTemplateSetting.settingEl.toggle(isSplitPages);
+				pageIndexEnabledSetting.settingEl.toggle(isSplitPages);
+				const pageIndexOn = this.plugin.settings.automations[i].action.pageIndexEnabled ?? false;
+				pageIndexPathSetting.settingEl.toggle(isSplitPages && pageIndexOn);
+				pageIndexHeadingSetting.settingEl.toggle(isSplitPages && pageIndexOn);
+				const isAppend = type === "append_to_note";
+				includeResultsIdsSetting.settingEl.toggle(isAppend);
+				includeResultsTypesSetting.settingEl.toggle(isAppend);
+				includeResultsHeadingSetting.settingEl.toggle(isAppend);
+				includeResultsTemplateSetting.settingEl.toggle(isAppend);
 				insertPositionSetting.settingEl.toggle(isEmbedType(type) || isSplitPages);
 				embedCompanionSetting.settingEl.toggle(isEmbedType(type) && !isLinkToNote && !isAnyTranscribeAction);
 				embedTemplateSetting.settingEl.toggle(isEmbedType(type) && !isAnyTranscribeAction);
+				// Embed extras only apply to the embed_to_<period> actions.
+				const isPeriodicEmbed =
+					type === "embed_to_daily_note" ||
+					type === "embed_to_weekly_note" ||
+					type === "embed_to_monthly_note" ||
+					type === "embed_to_quarterly_note" ||
+					type === "embed_to_yearly_note";
+				transcribeToCompanionSetting.settingEl.toggle(isPeriodicEmbed);
+				companionLinkSetting.settingEl.toggle(isPeriodicEmbed);
 			};
 			updateActionFieldVisibility(automation.action.type);
 		});

@@ -35,7 +35,7 @@ export class SyncStatusView extends ItemView {
 	}
 
 	getViewType(): string { return SYNC_STATUS_VIEW_TYPE; }
-	getDisplayText(): string { return "Drive Sync Status"; }
+	getDisplayText(): string { return "PDF Manager Status"; }
 	getIcon(): string { return "refresh-cw"; }
 
 	async onOpen(): Promise<void> { this.render(); }
@@ -58,7 +58,7 @@ export class SyncStatusView extends ItemView {
 	private render(): void {
 		const { contentEl } = this;
 		contentEl.empty();
-		contentEl.createEl("h4", { text: "Drive Sync Status" });
+		contentEl.createEl("h4", { text: "PDF Manager Status" });
 
 		// Tab bar
 		const tabs = contentEl.createDiv({ cls: "drive-sync-tabs" });

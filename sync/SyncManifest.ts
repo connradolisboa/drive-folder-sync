@@ -21,6 +21,8 @@ export interface SyncManifestStore {
 	get(driveFileId: string): ManifestEntry | undefined;
 	set(driveFileId: string, entry: ManifestEntry): void;
 	delete(driveFileId: string): void;
+	/** Remove every entry (used by the File Tracker's "Reset all tracking"). A backup is written on the next save. */
+	clear(): void;
 	entries(): [string, ManifestEntry][];
 	allForPair(pairId: string): [string, ManifestEntry][];
 	findByVaultPath(path: string): [string, ManifestEntry] | undefined;
@@ -89,6 +91,7 @@ export class JsonManifestStore implements SyncManifestStore {
 	get(driveFileId: string): ManifestEntry | undefined { return this.data[driveFileId]; }
 	set(driveFileId: string, entry: ManifestEntry): void { this.data[driveFileId] = entry; }
 	delete(driveFileId: string): void { delete this.data[driveFileId]; }
+	clear(): void { this.data = {}; }
 	entries(): [string, ManifestEntry][] { return Object.entries(this.data); }
 
 	allForPair(pairId: string): [string, ManifestEntry][] {

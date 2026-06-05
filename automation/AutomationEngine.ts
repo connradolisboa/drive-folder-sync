@@ -1,10 +1,20 @@
 import { App, getAllTags, TFile } from "obsidian";
-import { Automation, AutomationAction, AutomationRunRecord, PeriodicNotesPaths, PluginSettings } from "../types";
+import { Automation, AutomationAction, AutomationOutput, AutomationRunReport, AutomationRunRecord, PeriodicNotesPaths, PluginSettings } from "../types";
 import type { SyncManifestStore } from "../sync/SyncManifest";
 import type { EventBus } from "../events/EventBus";
 import { MistralClient } from "../ai/MistralClient";
+import { GeminiClient } from "../ai/GeminiClient";
+import { parseContextFromFilename, resolvePageDate } from "./DateResolver";
+import { resolveFolderTokens } from "../sync/pathTokens";
 
 const LOG = "[DriveSync/Automation]";
+
+// Sentinel markers wrapping the auto-managed block in a page-index note.
+const PAGE_INDEX_START = "<!-- drive-sync:page-index:start -->";
+const PAGE_INDEX_END = "<!-- drive-sync:page-index:end -->";
+// Sentinel markers wrapping an auto-managed "included results" composition block.
+const INCLUDED_RESULTS_START = "<!-- drive-sync:included-results:start -->";
+const INCLUDED_RESULTS_END = "<!-- drive-sync:included-results:end -->";
 
 export interface RunForFileOptions {
 	vaultPath: string;
@@ -187,6 +197,9 @@ export class AutomationEngine {
 			return;
 		}
 
+		// Per-file accumulator: later automations (in array order) can read earlier ones' results.
+		const report: AutomationRunReport = { byId: {}, byType: {} };
+
 		for (const automation of matching) {
 			if (skipList.includes(automation.id)) {
 				console.log(`${LOG} Skipping automation "${automation.name}" for "${vaultPath}" — in drive-sync-skip-automations`);
@@ -209,7 +222,12 @@ export class AutomationEngine {
 
 			console.log(`${LOG} Running automation "${automation.name}" for: ${vaultPath}`);
 			try {
-				await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, transcription);
+				const output = await this.runAction(automation.action, vaultPath, companionPath, driveCreatedTime, transcription, report);
+				if (output) {
+					output.automationId = automation.id;
+					report.byId[automation.id] = output;
+					(report.byType[automation.action.type] ??= []).push(output);
+				}
 				this.emitRun(vaultPath, automation, "success");
 				if (driveFileId) {
 					this.manifest?.recordAutomationRun(driveFileId, automation.id, {
@@ -400,20 +418,21 @@ export class AutomationEngine {
 		vaultPath: string,
 		companionPath?: string | null,
 		driveCreatedTime?: string,
-		transcription?: string
-	): Promise<void> {
+		transcription?: string,
+		report?: AutomationRunReport
+	): Promise<AutomationOutput | void> {
 		if (action.type === "embed_to_daily_note") {
-			await this.embedToDailyNote(vaultPath, companionPath, action, driveCreatedTime);
+			await this.embedToDailyNote(vaultPath, companionPath, action, driveCreatedTime, transcription);
 		} else if (action.type === "embed_to_weekly_note") {
-			await this.embedToPeriodicNote("weekly", vaultPath, companionPath, action, driveCreatedTime);
+			await this.embedToPeriodicNote("weekly", vaultPath, companionPath, action, driveCreatedTime, transcription);
 		} else if (action.type === "embed_to_monthly_note") {
-			await this.embedToPeriodicNote("monthly", vaultPath, companionPath, action, driveCreatedTime);
+			await this.embedToPeriodicNote("monthly", vaultPath, companionPath, action, driveCreatedTime, transcription);
 		} else if (action.type === "embed_to_quarterly_note") {
-			await this.embedToPeriodicNote("quarterly", vaultPath, companionPath, action, driveCreatedTime);
+			await this.embedToPeriodicNote("quarterly", vaultPath, companionPath, action, driveCreatedTime, transcription);
 		} else if (action.type === "embed_to_yearly_note") {
-			await this.embedToPeriodicNote("yearly", vaultPath, companionPath, action, driveCreatedTime);
+			await this.embedToPeriodicNote("yearly", vaultPath, companionPath, action, driveCreatedTime, transcription);
 		} else if (action.type === "append_to_note") {
-			await this.runAppendToNote(vaultPath, companionPath, action);
+			await this.runAppendToNote(vaultPath, companionPath, action, report);
 		} else if (action.type === "add_tag_to_companion") {
 			await this.runAddTagToCompanion(companionPath, action);
 		} else if (action.type === "link_to_matching_note") {
@@ -423,7 +442,7 @@ export class AutomationEngine {
 		} else if (action.type === "transcribe_to_companion") {
 			await this.runTranscribeToCompanion(companionPath, action, transcription);
 		} else if (action.type === "split_pages_to_daily_notes") {
-			await this.splitPagesToDailyNotes(vaultPath, action);
+			return await this.splitPagesToDailyNotes(vaultPath, action);
 		}
 	}
 
@@ -435,7 +454,7 @@ export class AutomationEngine {
 	private async splitPagesToDailyNotes(
 		vaultPath: string,
 		action: AutomationAction
-	): Promise<void> {
+	): Promise<AutomationOutput | void> {
 		const file = this.app.vault.getAbstractFileByPath(vaultPath);
 		if (!(file instanceof TFile)) {
 			console.log(`${LOG} split_pages_to_daily_notes: file not found: ${vaultPath}`);
@@ -464,34 +483,128 @@ export class AutomationEngine {
 		const pdfStem = file.basename;
 		const pattern = action.dailyNoteNamePattern || this.settings.periodicNotesPaths.daily;
 		const createMissing = action.createDailyNoteIfMissing !== false;
+		// Month/year context inferred from the PDF filename, used to resolve bare-day pages.
+		const ctx = parseContextFromFilename(fileName);
 
+		const pageMappings: NonNullable<AutomationOutput["pageMappings"]> = [];
 		let embedded = 0;
+
 		for (const { page, text } of pages) {
-			const dateStr = this.extractDate(text);
-			if (!dateStr) {
-				console.log(`${LOG} split_pages_to_daily_notes: no date found on page ${page} of "${fileName}" — skipping`);
+			const { date, source } = resolvePageDate(text, ctx);
+
+			if (!date) {
+				// No date on this page (e.g. a continuation page of the previous entry) — skip it.
+				// It's still recorded in pageMappings so the optional page-index note can show it.
+				console.log(
+					`${LOG} split_pages_to_daily_notes: no date on page ${page} of "${fileName}" — skipping`
+				);
+				pageMappings.push({ page, date: null, source });
 				continue;
 			}
 
 			let note = pattern
-				? this.findNoteByPattern(dateStr, pattern)
-				: this.findDailyNoteByFrontmatter(dateStr);
+				? this.findNoteByPattern(date, pattern)
+				: this.findDailyNoteByFrontmatter(date);
 
 			if (!note && createMissing) {
-				note = await this.createDailyNoteForDate(dateStr, pattern, action.dailyNoteTemplatePath);
+				note = await this.createDailyNoteForDate(date, pattern, action.dailyNoteTemplatePath);
 			}
 
 			if (!note) {
-				console.log(`${LOG} split_pages_to_daily_notes: no daily note for ${dateStr} (page ${page}) — skipping`);
+				console.log(`${LOG} split_pages_to_daily_notes: no daily note for ${date} (page ${page}) — skipping`);
+				pageMappings.push({ page, date: null, source: "unresolved" });
 				continue;
 			}
 
-			const line = this.buildPageEmbedLine(action.pageEmbedTemplate, fileName, pdfStem, page, dateStr);
+			const line = this.buildPageEmbedLine(action.pageEmbedTemplate, fileName, pdfStem, page, date);
 			await this.insertEmbed(note, line, action.insertPosition);
+			pageMappings.push({ page, date, source });
 			embedded++;
 		}
 
 		console.log(`${LOG} split_pages_to_daily_notes: embedded ${embedded}/${pages.length} pages of "${fileName}"`);
+
+		if (action.pageIndexEnabled) {
+			await this.writePageIndexNote(file, pdfStem, action, pageMappings);
+		}
+
+		return {
+			automationId: "",
+			type: "split_pages_to_daily_notes",
+			pageMappings,
+			outputs: [`split-pages:${embedded}/${pages.length} pages of "${fileName}"`],
+		};
+	}
+
+	/**
+	 * Write/refresh a per-PDF "page index" note recording which pages were embedded into which dates.
+	 * The managed section lives between sentinel markers so re-sync regenerates only that block,
+	 * preserving any surrounding user prose.
+	 */
+	private async writePageIndexNote(
+		file: TFile,
+		pdfStem: string,
+		action: AutomationAction,
+		pageMappings: NonNullable<AutomationOutput["pageMappings"]>
+	): Promise<void> {
+		const template = (action.pageIndexNotePath ?? "").trim() || `${pdfStem} — Page Index.md`;
+		const parentDir = file.parent && file.parent.path !== "/" ? `${file.parent.path}/` : "";
+		const raw = resolveFolderTokens(template, file.path).replace(/\{\{title\}\}/g, pdfStem);
+		// A bare filename (no folder tokens, no slash) lands next to the PDF.
+		const notePath = raw.includes("/") ? raw : `${parentDir}${raw}`;
+
+		const note = await this.ensureNote(notePath);
+		if (!note) {
+			console.warn(`${LOG} writePageIndexNote: could not create index note at "${notePath}"`);
+			return;
+		}
+
+		const heading = (action.pageIndexHeading ?? "").trim() || "## Page index";
+		const block = `${PAGE_INDEX_START}\n${heading}\n${this.renderPageIndexBody(pageMappings)}\n${PAGE_INDEX_END}`;
+
+		const existing = await this.app.vault.read(note);
+		const next = this.replaceManagedBlock(existing, PAGE_INDEX_START, PAGE_INDEX_END, block);
+		if (next !== existing) await this.app.vault.modify(note, next);
+		console.log(`${LOG} writePageIndexNote: updated "${note.path}"`);
+	}
+
+	/** Render the page-index list, grouped by date (ascending), with unresolved pages last. */
+	private renderPageIndexBody(pageMappings: NonNullable<AutomationOutput["pageMappings"]>): string {
+		const byDate = new Map<string, number[]>();
+		for (const { page, date } of pageMappings) {
+			const key = date ?? "(no date)";
+			const list = byDate.get(key) ?? [];
+			list.push(page);
+			byDate.set(key, list);
+		}
+		const dates = [...byDate.keys()].sort((a, b) => {
+			if (a === "(no date)") return 1;
+			if (b === "(no date)") return -1;
+			return a.localeCompare(b);
+		});
+		return dates
+			.map((d) => {
+				const pages = (byDate.get(d) ?? []).sort((a, b) => a - b);
+				const label = pages.length === 1 ? `page ${pages[0]}` : `pages ${pages.join(", ")}`;
+				return `- ${d} → ${label}`;
+			})
+			.join("\n");
+	}
+
+	/**
+	 * Replace the content between `start` and `end` markers with `block`. When the markers are
+	 * absent, append `block` (which already includes the markers) to the end of the note.
+	 */
+	private replaceManagedBlock(content: string, start: string, end: string, block: string): string {
+		const startIdx = content.indexOf(start);
+		const endIdx = content.indexOf(end);
+		if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+			const before = content.slice(0, startIdx);
+			const after = content.slice(endIdx + end.length);
+			return `${before}${block}${after}`;
+		}
+		const sep = content.length === 0 ? "" : content.endsWith("\n") ? "\n" : "\n\n";
+		return `${content}${sep}${block}\n`;
 	}
 
 	/**
@@ -538,6 +651,17 @@ export class AutomationEngine {
 			console.log(`${LOG} createDailyNoteForDate: could not resolve a path for ${dateStr} — set a daily note path in Settings → Notes.`);
 			return null;
 		}
+
+		const note = await this.ensureNote(notePath, templatePath);
+		if (note) console.log(`${LOG} createDailyNoteForDate: daily note "${note.path}" ready for ${dateStr}`);
+		return note;
+	}
+
+	/**
+	 * Get an existing note at `notePath`, or create it (seeding from `templatePath` when given),
+	 * ensuring parent folders exist. Appends ".md" if missing.
+	 */
+	private async ensureNote(notePath: string, templatePath?: string): Promise<TFile | null> {
 		if (!notePath.endsWith(".md")) notePath += ".md";
 
 		const existing = this.app.vault.getAbstractFileByPath(notePath);
@@ -549,7 +673,7 @@ export class AutomationEngine {
 			if (templateFile instanceof TFile) {
 				content = await this.app.vault.read(templateFile);
 			} else {
-				console.warn(`${LOG} createDailyNoteForDate: template not found: ${templatePath}`);
+				console.warn(`${LOG} ensureNote: template not found: ${templatePath}`);
 			}
 		}
 
@@ -566,9 +690,7 @@ export class AutomationEngine {
 			}
 		}
 
-		const note = await this.app.vault.create(notePath, content);
-		console.log(`${LOG} createDailyNoteForDate: created daily note "${notePath}" for ${dateStr}`);
-		return note;
+		return this.app.vault.create(notePath, content);
 	}
 
 	/** Resolve a daily note path from the core Daily Notes plugin's folder + format settings. */
@@ -592,7 +714,8 @@ export class AutomationEngine {
 		vaultPath: string,
 		companionPath: string | null | undefined,
 		action: AutomationAction,
-		driveCreatedTime?: string
+		driveCreatedTime?: string,
+		transcription?: string
 	): Promise<void> {
 		const fileName = vaultPath.split("/").pop();
 		if (!fileName) return;
@@ -620,6 +743,7 @@ export class AutomationEngine {
 		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
 		const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
 		await this.insertEmbed(dailyNote, line, action.insertPosition);
+		await this.applyEmbedExtras(action, vaultPath, companionPath, dailyNote, transcription);
 	}
 
 	private async embedToPeriodicNote(
@@ -627,7 +751,8 @@ export class AutomationEngine {
 		vaultPath: string,
 		companionPath: string | null | undefined,
 		action: AutomationAction,
-		driveCreatedTime?: string
+		driveCreatedTime?: string,
+		transcription?: string
 	): Promise<void> {
 		const fileName = vaultPath.split("/").pop();
 		if (!fileName) return;
@@ -657,12 +782,79 @@ export class AutomationEngine {
 		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
 		const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
 		await this.insertEmbed(note, line, action.insertPosition);
+		await this.applyEmbedExtras(action, vaultPath, companionPath, note, transcription);
+	}
+
+	/**
+	 * Optional embed extras (opt-in per action): after embedding, push the full PDF transcription
+	 * into the companion note's `## Transcription` section, and/or add a [[periodic note]] backlink
+	 * to the companion. No-op unless a flag is set and a companion note exists.
+	 */
+	private async applyEmbedExtras(
+		action: AutomationAction,
+		vaultPath: string,
+		companionPath: string | null | undefined,
+		periodicNote: TFile,
+		transcription?: string
+	): Promise<void> {
+		if (!action.transcribeFullToCompanion && !action.companionLinkToPeriodicNote) return;
+
+		if (!companionPath) {
+			console.log(`${LOG} embed extras: no companion note for "${vaultPath}" — skipping extras`);
+			return;
+		}
+		const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
+		if (!(companionFile instanceof TFile)) {
+			console.log(`${LOG} embed extras: companion note not found: ${companionPath}`);
+			return;
+		}
+
+		if (action.transcribeFullToCompanion) {
+			const text = transcription ?? (await this.transcribeFullPdf(vaultPath)) ?? undefined;
+			if (text) {
+				await this.runTranscribeToCompanion(companionPath, action, text);
+			} else {
+				console.log(`${LOG} embed extras: no transcription available for "${vaultPath}" — skipping companion transcription`);
+			}
+		}
+
+		if (action.companionLinkToPeriodicNote) {
+			await this.insertEmbed(companionFile, `[[${periodicNote.basename}]]`, "top");
+		}
+	}
+
+	/** Transcribe a full PDF with the configured provider. Returns null on failure / missing config. */
+	private async transcribeFullPdf(vaultPath: string): Promise<string | null> {
+		const file = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (!(file instanceof TFile) || file.extension.toLowerCase() !== "pdf") return null;
+
+		const provider = this.settings.transcriptionProvider ?? "gemini";
+		if (provider === "mistral" && !this.settings.mistralApiKey) {
+			console.warn(`${LOG} transcribeFullPdf: Mistral selected but no API key configured`);
+			return null;
+		}
+		if (provider === "gemini" && !this.settings.geminiApiKey) {
+			console.warn(`${LOG} transcribeFullPdf: Gemini selected but no API key configured`);
+			return null;
+		}
+		try {
+			const bytes = await this.app.vault.readBinary(file);
+			const client: GeminiClient | MistralClient =
+				provider === "mistral"
+					? new MistralClient(this.settings.mistralApiKey)
+					: new GeminiClient(this.settings.geminiApiKey, this.settings.geminiModel, this.settings.geminiPrompt);
+			return await client.transcribePdf(bytes);
+		} catch (e) {
+			console.error(`${LOG} transcribeFullPdf: failed for "${vaultPath}":`, e);
+			return null;
+		}
 	}
 
 	private async runAppendToNote(
 		vaultPath: string,
 		companionPath: string | null | undefined,
-		action: AutomationAction
+		action: AutomationAction,
+		report?: AutomationRunReport
 	): Promise<void> {
 		if (!action.targetNotePath) {
 			console.warn(`${LOG} append_to_note: no targetNotePath configured`);
@@ -679,6 +871,64 @@ export class AutomationEngine {
 		const dateStr = this.extractDate(fileName);
 		const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
 		await this.insertEmbed(target, line, action.insertPosition);
+
+		// Composition: render earlier automations' results into a managed section of this note.
+		const included = this.renderIncludedResults(action, report);
+		if (included) {
+			const fresh = await this.app.vault.read(target);
+			const next = this.replaceManagedBlock(fresh, INCLUDED_RESULTS_START, INCLUDED_RESULTS_END, included);
+			if (next !== fresh) await this.app.vault.modify(target, next);
+		}
+	}
+
+	/**
+	 * Build the managed "included results" block for a composing automation, pulling page→date
+	 * mappings from earlier automations referenced by id and/or action type in the run report.
+	 * Returns null when nothing is configured or no matching results exist.
+	 */
+	private renderIncludedResults(action: AutomationAction, report?: AutomationRunReport): string | null {
+		if (!report) return null;
+		const ids = action.includeResultsFromAutomationIds ?? [];
+		const types = action.includeResultsFromTypes ?? [];
+		if (ids.length === 0 && types.length === 0) return null;
+
+		const outputs: AutomationOutput[] = [];
+		const seen = new Set<AutomationOutput>();
+		for (const id of ids) {
+			const o = report.byId[id];
+			if (o && !seen.has(o)) { outputs.push(o); seen.add(o); }
+		}
+		for (const t of types) {
+			for (const o of report.byType[t] ?? []) {
+				if (!seen.has(o)) { outputs.push(o); seen.add(o); }
+			}
+		}
+
+		// Aggregate page mappings across the referenced outputs, grouped by date.
+		const byDate = new Map<string, number[]>();
+		for (const o of outputs) {
+			for (const { page, date } of o.pageMappings ?? []) {
+				const key = date ?? "(no date)";
+				const list = byDate.get(key) ?? [];
+				list.push(page);
+				byDate.set(key, list);
+			}
+		}
+		if (byDate.size === 0) return null;
+
+		const dates = [...byDate.keys()].sort((a, b) => {
+			if (a === "(no date)") return 1;
+			if (b === "(no date)") return -1;
+			return a.localeCompare(b);
+		});
+		const lineTpl = (action.includeResultsTemplate ?? "").trim() || "{{date}} → pages {{pages}}";
+		const lines = dates.map((d) => {
+			const pages = (byDate.get(d) ?? []).sort((a, b) => a - b);
+			return "- " + lineTpl.replace(/\{\{date\}\}/g, d).replace(/\{\{pages\}\}/g, pages.join(", "));
+		});
+
+		const heading = (action.includeResultsHeading ?? "").trim() || "## Included results";
+		return `${INCLUDED_RESULTS_START}\n${heading}\n${lines.join("\n")}\n${INCLUDED_RESULTS_END}`;
 	}
 
 	private async runAddTagToCompanion(

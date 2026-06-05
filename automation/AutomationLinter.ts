@@ -20,7 +20,10 @@ export function lintAutomations(
 	const folderExists = (p: string) => p === "" || app.vault.getAbstractFileByPath(p) instanceof TFolder;
 	const noteExists = (p: string) => app.vault.getAbstractFileByPath(p) instanceof TFile;
 
+	const idToIndex = new Map(automations.map((a, i) => [a.id, i]));
+
 	for (const a of automations) {
+		const idx = idToIndex.get(a.id) ?? 0;
 		const push = (severity: "error" | "warn", message: string) =>
 			issues.push({ automationId: a.id, severity, message });
 
@@ -49,6 +52,25 @@ export function lintAutomations(
 		}
 		if (a.enabled && action.type === "split_pages_to_daily_notes" && opts.mistralConfigured === false) {
 			push("warn", "split_pages_to_daily_notes needs a Mistral API key (Settings → Transcription) — it will no-op until one is set.");
+		}
+		if (action.pageIndexEnabled && action.type !== "split_pages_to_daily_notes") {
+			push("warn", "pageIndexEnabled only applies to split_pages_to_daily_notes — it will be ignored here.");
+		}
+
+		// Composition checks: references must exist and run before this automation.
+		for (const refId of action.includeResultsFromAutomationIds ?? []) {
+			if (!idToIndex.has(refId)) {
+				push("error", `Composition references unknown automation id: "${refId}".`);
+			} else if ((idToIndex.get(refId) ?? 0) >= idx) {
+				const refName = automations[idToIndex.get(refId) ?? 0]?.name ?? refId;
+				push("warn", `Composed source "${refName}" runs at or after this automation — reorder it earlier so its results are available.`);
+			}
+		}
+		for (const refType of action.includeResultsFromTypes ?? []) {
+			const earlier = automations.some((b, i) => i < idx && b.action.type === refType);
+			if (!earlier) {
+				push("warn", `No automation of type "${refType}" runs before this one — composed results may be empty.`);
+			}
 		}
 	}
 

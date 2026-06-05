@@ -1,3 +1,6 @@
 node_modules/
 dist/
 .obsidian/drive-sync-credentials.json
+
+# Test build artifacts
+.test-build/

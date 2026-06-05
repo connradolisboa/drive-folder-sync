@@ -278,6 +278,16 @@ export interface AutomationAction {
 	/** When true, embed the companion note instead of the PDF file. */
 	embedCompanion?: boolean;
 	/**
+	 * For embed_to_* actions: after embedding, transcribe the full PDF into the companion note's
+	 * `## Transcription` section. Requires a companion note and a configured transcription provider.
+	 */
+	transcribeFullToCompanion?: boolean;
+	/**
+	 * For embed_to_* actions: insert a [[<periodic note basename>]] link into the companion note,
+	 * linking it back to the daily/weekly/etc. note the PDF was embedded into.
+	 */
+	companionLinkToPeriodicNote?: boolean;
+	/**
 	 * Template for the line inserted into the target note.
 	 * Supports: {{embed}} → ![[target]], {{link}} → [[target]],
 	 *           {{target}} → embed target name, {{title}} → PDF stem, {{date}} → YYYY-MM-DD.
@@ -316,6 +326,40 @@ export interface AutomationAction {
 	 * Leave empty to use the default: {{embed}}.
 	 */
 	pageEmbedTemplate?: string;
+	/** For split_pages_to_daily_notes: when true, also write a per-PDF page-index note recording which pages went to which date. */
+	pageIndexEnabled?: boolean;
+	/**
+	 * For split_pages_to_daily_notes: vault path for the page-index note.
+	 * Supports {{RootFolder}}, {{folderLN}} and {{title}} (PDF stem).
+	 * Default when empty: "<stem> — Page Index.md" next to the PDF.
+	 */
+	pageIndexNotePath?: string;
+	/** For split_pages_to_daily_notes: heading for the managed page-index section. Default "## Page index". */
+	pageIndexHeading?: string;
+	/** Composition: pull earlier automations' results (by id) from the per-file run report into this note. */
+	includeResultsFromAutomationIds?: string[];
+	/** Composition: pull earlier automations' results (by action type) from the per-file run report into this note. */
+	includeResultsFromTypes?: AutomationActionType[];
+	/** Composition: heading for the included-results section. Default "## Included results". */
+	includeResultsHeading?: string;
+	/** Composition: per-line template for included results. Placeholders {{date}}, {{pages}}. Default "{{date}} → pages {{pages}}". */
+	includeResultsTemplate?: string;
+}
+
+/** One automation's structured output, accumulated into the per-file run report. */
+export interface AutomationOutput {
+	automationId: string;
+	type: AutomationActionType;
+	/** Page→date mappings produced by split_pages_to_daily_notes. */
+	pageMappings?: Array<{ page: number; date: string | null; source: string }>;
+	/** Human-readable outputs (mirrors AutomationRunRecord.outputs). */
+	outputs?: string[];
+}
+
+/** Per-file, in-memory accumulator letting later automations read earlier ones' results. */
+export interface AutomationRunReport {
+	byId: Record<string, AutomationOutput>;
+	byType: Partial<Record<AutomationActionType, AutomationOutput[]>>;
 }
 
 export interface Automation {

@@ -1,5 +1,6 @@
 import { App, TFile } from "obsidian";
 import { DriveFile, PluginSettings, SyncPair } from "../types";
+import { resolveFolderTokens } from "./pathTokens";
 
 const LOG = "[DriveSync/Companion]";
 
@@ -246,19 +247,7 @@ export class CompanionNoteManager {
 	 *   {{folderL2}}   → "Books"  (dirs[dirs.length - 2])
 	 */
 	private resolvePathTokens(template: string, vaultFilePath: string): string {
-		const parts = vaultFilePath.split("/");
-		parts.pop(); // strip filename
-		const dirs = parts.filter(Boolean);
-
-		return template.replace(/\{\{([^}]+)\}\}/g, (match, token: string) => {
-			if (token === "RootFolder") return dirs[0] ?? "";
-			const lm = token.match(/^folderL(\d+)$/);
-			if (lm) {
-				const level = parseInt(lm[1], 10);
-				return dirs[dirs.length - level] ?? "";
-			}
-			return match; // leave unrecognised tokens as-is
-		});
+		return resolveFolderTokens(template, vaultFilePath);
 	}
 
 	/**

@@ -25,7 +25,7 @@ export class FileStatusModal extends Modal {
 		const { contentEl, file } = this;
 		contentEl.empty();
 
-		contentEl.createEl("h2", { text: `Drive Sync — ${file.basename}` }).style.marginTop = "0";
+		contentEl.createEl("h2", { text: `PDF Manager — ${file.basename}` }).style.marginTop = "0";
 
 		const manifest = this.plugin.manifestStore;
 		const transcriptionStore = this.plugin.transcriptionStore;

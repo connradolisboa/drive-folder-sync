@@ -1,9 +1,14 @@
-import { App, Modal, TFile } from "obsidian";
+import { App, FuzzySuggestModal, Modal, Notice, Setting, TFile } from "obsidian";
 import type { SyncManifestStore } from "../sync/SyncManifest";
 import type { TranscriptionStore, TranscriptionEntry } from "../ai/TranscriptionStore";
+import type { AutomationEngine } from "../automation/AutomationEngine";
 import type { PluginSettings } from "../types";
 
 const ONE_DAY_MS = 86_400_000;
+
+/** Sentinel pair id for files added to tracking locally (not synced from Drive). DriveSync's
+ * removal pass only iterates over configured sync pairs, so these entries are never reconciled. */
+export const LOCAL_PAIR_ID = "__local__";
 
 const MICRO_BTN =
 	"font-size: 11px; padding: 1px 5px; border-radius: 4px; cursor: pointer; " +
@@ -34,6 +39,7 @@ export class FileTrackerModal extends Modal {
 		private manifest: SyncManifestStore,
 		private transcriptionStore: TranscriptionStore,
 		private settings: PluginSettings,
+		private automationEngine: AutomationEngine,
 		private onRetranscribe?: (vaultPath: string) => void
 	) {
 		super(app);
@@ -63,9 +69,10 @@ export class FileTrackerModal extends Modal {
 		const { contentEl } = this;
 		contentEl.empty();
 
-		const pairLabelMap = Object.fromEntries(
+		const pairLabelMap: Record<string, string> = Object.fromEntries(
 			this.settings.syncPairs.map((p) => [p.id, p.label])
 		);
+		pairLabelMap[LOCAL_PAIR_ID] = "Local";
 
 		const allRows = this.buildRows();
 		const transcribed = allRows.filter((r) => r.ts).length;
@@ -73,9 +80,26 @@ export class FileTrackerModal extends Modal {
 		// ── Header ────────────────────────────────────────────────────────────
 		const header = contentEl.createDiv();
 		header.style.cssText = "flex-shrink: 0; padding-bottom: 12px;";
-		header.createEl("h2", { text: "File Tracker" }).style.margin = "0 0 4px";
+
+		const titleRow = header.createDiv();
+		titleRow.style.cssText = "display: flex; align-items: center; justify-content: space-between; gap: 8px;";
+		titleRow.createEl("h2", { text: "File Tracker" }).style.margin = "0 0 4px";
+
+		const headerBtns = titleRow.createDiv();
+		headerBtns.style.cssText = "display: flex; gap: 6px; flex-shrink: 0;";
+
+		const addBtn = headerBtns.createEl("button", { text: "+ Add file…" });
+		addBtn.style.cssText = MICRO_BTN;
+		addBtn.title = "Track a PDF that already lives in your vault (not synced from Drive)";
+		addBtn.addEventListener("click", () => this.promptAddFile());
+
+		const resetBtn = headerBtns.createEl("button", { text: "Reset all tracking" });
+		resetBtn.style.cssText = MICRO_BTN + " color: var(--text-error);";
+		resetBtn.title = "Stop tracking every file (clears the manifest). Files on disk are not deleted.";
+		resetBtn.addEventListener("click", () => this.promptResetAll());
+
 		header.createEl("p", {
-			text: `${allRows.length} files synced · ${transcribed} transcribed`,
+			text: `${allRows.length} files tracked · ${transcribed} transcribed`,
 			cls: "setting-item-description",
 		}).style.margin = "0 0 10px";
 
@@ -154,6 +178,7 @@ export class FileTrackerModal extends Modal {
 			{ label: "Transcription", key: "transcribed" },
 			{ label: "Pages", key: null, tip: "Page count at last transcription. Arrow shows growth detected on re-download." },
 			{ label: "Destinations", key: null },
+			{ label: "Actions", key: null },
 		];
 
 		for (const col of cols) {
@@ -335,6 +360,122 @@ export class FileTrackerModal extends Modal {
 				this.destLink(tdDest, icon, label, dest.path, dest.transcribedAt);
 			}
 		}
+
+		// ── Actions ───────────────────────────────────────────────────────────
+		const tdActions = tr.createEl("td");
+		tdActions.style.cssText = "padding: 7px 10px; white-space: nowrap;";
+		const actWrap = tdActions.createDiv();
+		actWrap.style.cssText = "display: flex; gap: 4px; flex-wrap: nowrap;";
+
+		const rerunBtn = actWrap.createEl("button", { text: "Re-run" });
+		rerunBtn.title = "Run matching automations for this file again";
+		rerunBtn.style.cssText = MICRO_BTN;
+		rerunBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			void this.rerunAutomations(row);
+		});
+
+		const editBtn = actWrap.createEl("button", { text: "Edit" });
+		editBtn.title = "Edit the recorded companion/vault path for this file";
+		editBtn.style.cssText = MICRO_BTN;
+		editBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			this.promptEditEntry(row);
+		});
+
+		const untrackBtn = actWrap.createEl("button", { text: "Untrack" });
+		untrackBtn.title = "Stop tracking this file (the file on disk is not deleted)";
+		untrackBtn.style.cssText = MICRO_BTN + " color: var(--text-error);";
+		untrackBtn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			void this.untrack(row);
+		});
+	}
+
+	// ── Per-row actions ─────────────────────────────────────────────────────────
+
+	private async rerunAutomations(row: Row): Promise<void> {
+		await this.automationEngine.runForFile({
+			vaultPath: row.vaultPath,
+			companionPath: row.companionPath,
+			driveFileId: row.driveFileId,
+			driveModifiedTime: row.driveModifiedTime,
+			force: true,
+		});
+		await this.manifest.save();
+		new Notice(`Re-ran automations for "${basename(row.vaultPath)}".`);
+	}
+
+	private async untrack(row: Row): Promise<void> {
+		this.manifest.delete(row.driveFileId);
+		this.transcriptionStore.delete(row.driveFileId);
+		await this.manifest.save();
+		await this.transcriptionStore.save();
+		new Notice(`Stopped tracking "${basename(row.vaultPath)}".`);
+		this.render();
+	}
+
+	private promptEditEntry(row: Row): void {
+		new EditEntryModal(this.app, row, async (companionPath, vaultPath) => {
+			const entry = this.manifest.get(row.driveFileId);
+			if (!entry) return;
+			this.manifest.set(row.driveFileId, {
+				...entry,
+				vaultPath: vaultPath.trim() || entry.vaultPath,
+				companionPath: companionPath.trim() || null,
+			});
+			await this.manifest.save();
+			new Notice(`Updated tracking record for "${basename(row.vaultPath)}".`);
+			this.render();
+		}).open();
+	}
+
+	private promptAddFile(): void {
+		const tracked = new Set(this.manifest.entries().map(([, e]) => e.vaultPath));
+		const candidates = this.app.vault
+			.getFiles()
+			.filter((f) => f.extension.toLowerCase() === "pdf" && !tracked.has(f.path));
+
+		if (candidates.length === 0) {
+			new Notice("No untracked PDFs found in the vault.");
+			return;
+		}
+
+		new AddFilePickerModal(this.app, candidates, async (file) => {
+			const id = `local:${(globalThis.crypto?.randomUUID?.() ?? String(Date.now()) + Math.random())}`;
+			this.manifest.set(id, {
+				vaultPath: file.path,
+				companionPath: null,
+				driveModifiedTime: new Date(file.stat.mtime).toISOString(),
+				pairId: LOCAL_PAIR_ID,
+			});
+			await this.manifest.save();
+			new Notice(`Now tracking "${file.name}".`);
+			this.render();
+		}).open();
+	}
+
+	private promptResetAll(): void {
+		const ids = this.manifest.entries().map(([id]) => id);
+		if (ids.length === 0) {
+			new Notice("Nothing is being tracked.");
+			return;
+		}
+		new ConfirmModal(
+			this.app,
+			"Reset all tracking?",
+			`This stops tracking all ${ids.length} file(s) and clears their transcription records. ` +
+				`A manifest backup is saved automatically. Files on disk are NOT deleted.`,
+			"Reset all",
+			async () => {
+				for (const id of ids) this.transcriptionStore.delete(id);
+				this.manifest.clear();
+				await this.manifest.save();
+				await this.transcriptionStore.save();
+				new Notice("Cleared all tracking.");
+				this.render();
+			}
+		).open();
 	}
 
 	private destLink(
@@ -358,6 +499,111 @@ export class FileTrackerModal extends Modal {
 			this.app.workspace.getLeaf(false).openFile(file);
 			this.close();
 		}
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+// ── Supporting modals ───────────────────────────────────────────────────────────
+
+/** Edit the recorded vault/companion path for a tracked file (manifest record only). */
+class EditEntryModal extends Modal {
+	constructor(
+		app: App,
+		private row: Row,
+		private onSave: (companionPath: string, vaultPath: string) => void | Promise<void>
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: `Edit tracking — ${basename(this.row.vaultPath)}` });
+		contentEl.createEl("p", {
+			text: "Changes only update PDF Manager's record, not the files on disk.",
+			cls: "setting-item-description",
+		});
+
+		let vaultPath = this.row.vaultPath;
+		let companionPath = this.row.companionPath ?? "";
+
+		new Setting(contentEl)
+			.setName("Vault path")
+			.setDesc("Path of the tracked file within the vault.")
+			.addText((t) =>
+				t.setValue(vaultPath).onChange((v) => {
+					vaultPath = v;
+				})
+			);
+
+		new Setting(contentEl)
+			.setName("Companion note path")
+			.setDesc("Path of the companion note (leave empty for none).")
+			.addText((t) =>
+				t.setPlaceholder("Notes/My File.md").setValue(companionPath).onChange((v) => {
+					companionPath = v;
+				})
+			);
+
+		new Setting(contentEl).addButton((b) =>
+			b.setButtonText("Save").setCta().onClick(async () => {
+				await this.onSave(companionPath, vaultPath);
+				this.close();
+			})
+		);
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+/** Fuzzy picker to choose an untracked vault PDF to start tracking. */
+class AddFilePickerModal extends FuzzySuggestModal<TFile> {
+	constructor(app: App, private files: TFile[], private onPick: (file: TFile) => void) {
+		super(app);
+		this.setPlaceholder("Pick a PDF to track…");
+	}
+
+	getItems(): TFile[] {
+		return this.files;
+	}
+
+	getItemText(file: TFile): string {
+		return file.path;
+	}
+
+	onChooseItem(file: TFile): void {
+		this.onPick(file);
+	}
+}
+
+/** Generic confirm dialog with a destructive primary action. */
+class ConfirmModal extends Modal {
+	constructor(
+		app: App,
+		private titleText: string,
+		private bodyText: string,
+		private confirmLabel: string,
+		private onConfirm: () => void | Promise<void>
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: this.titleText });
+		contentEl.createEl("p", { text: this.bodyText, cls: "setting-item-description" });
+		new Setting(contentEl)
+			.addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+			.addButton((b) =>
+				b.setButtonText(this.confirmLabel).setWarning().onClick(async () => {
+					await this.onConfirm();
+					this.close();
+				})
+			);
 	}
 
 	onClose(): void {

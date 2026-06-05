@@ -1,9 +1,9 @@
 {
   "id": "drive-folder-sync",
-  "name": "Drive Folder Sync",
+  "name": "PDF Manager",
   "version": "1.1.0",
   "minAppVersion": "1.4.0",
-  "description": "One-way sync from a Google Drive folder to your vault.",
+  "description": "Manage handwritten PDF notes in Obsidian: track, embed, transcribe, and sync them from Google Drive.",
   "author": "connrado",
   "authorUrl": "",
   "isDesktopOnly": true
