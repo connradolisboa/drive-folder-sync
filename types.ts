@@ -64,6 +64,13 @@ export interface SyncPair {
 	driveStartPageToken?: string;
 	/** Phase 11.1 — per-pair override for the global useChangesApi toggle. */
 	useChangesApi?: boolean;
+	/**
+	 * After a file is confirmed synced to the vault, move the Drive copy to Drive trash.
+	 * The vault copy becomes vault-owned: it is protected from the deletion pass even
+	 * after Drive purges the trash. Requires full Drive access (reconnect the account
+	 * if it was authorized under the old read-only scope).
+	 */
+	deleteFromDriveAfterSync?: boolean;
 }
 
 export interface AutomationRunRecord {
@@ -84,6 +91,12 @@ export interface ManifestEntry {
 	userDeletedAt?: string;  // ISO — user deleted from vault; skip re-sync until Drive advances
 	companionMtime?: number; // ms — filesystem mtime when companion was last written (conflict detection)
 	driveTrashed?: boolean;  // true when file is in Drive trash (not permanently deleted)
+	/**
+	 * ISO — the plugin moved the Drive copy to trash on purpose after syncing
+	 * (delete-after-sync). The vault copy is vault-owned from here on: the deletion
+	 * pass must never remove it, even once Drive purges the trashed file for good.
+	 */
+	deletedFromDriveAt?: string;
 	/** When true, automatic AI transcription is skipped for this file during sync. */
 	transcriptionDisabled?: boolean;
 	/** Phase 13.9 — Drive md5Checksum at last sync; primary change-detection signal for binary files. */
@@ -313,6 +326,28 @@ export interface AutomationAction {
 	/** For transcribe_to_periodic_note: template for the content inserted. Supports {{transcription}}, {{title}}, {{date}}, {{link}}, {{embed}}. */
 	transcriptionTemplate?: string;
 	/**
+	 * For transcribe_to_periodic_note: when true, also embed the PDF (or the companion note, if
+	 * embedCompanion is set) into the same periodic note via the {{embed}}/{{link}} placeholders —
+	 * the embed itself is built from embedTemplate, same as the embed_to_* actions.
+	 * Only affects the *default* transcriptionTemplate (see transcriptionPosition below); a custom
+	 * transcriptionTemplate can reference {{embed}} regardless of this flag.
+	 */
+	embedFile?: boolean;
+	/**
+	 * For transcribe_to_periodic_note, when embedFile is true and transcriptionTemplate is left empty:
+	 * whether the transcription text is placed above or below the embed in the auto-built default.
+	 * Ignored once a custom transcriptionTemplate is set — order the {{embed}}/{{transcription}}
+	 * placeholders there instead.
+	 */
+	transcriptionPosition?: "above_embed" | "below_embed";
+	/**
+	 * For transcribe_to_companion (and transcribeFullToCompanion on embed_to_* actions): where the
+	 * "## Transcription" section is placed the first time it's inserted — "top" lands it right after
+	 * frontmatter (e.g. above a PDF embed placed later in the note), "bottom" (default) appends it at
+	 * the end. Once the section exists, later runs update it in place regardless of this setting.
+	 */
+	transcriptionInsertPosition?: "top" | "bottom";
+	/**
 	 * For split_pages_to_daily_notes: when true (the default), create the daily note if one
 	 * does not already exist for a page's date. When false, pages with no existing daily note are skipped.
 	 */
@@ -320,10 +355,18 @@ export interface AutomationAction {
 	/** For split_pages_to_daily_notes: vault path to a template note copied into a newly created daily note. */
 	dailyNoteTemplatePath?: string;
 	/**
+	 * For split_pages_to_daily_notes: what to insert into each daily note when no
+	 * pageEmbedTemplate is set. "embed" (the default) → the PDF page embed,
+	 * "transcription" → the page's OCR text, "both" → embed followed by the OCR text.
+	 * A custom pageEmbedTemplate overrides this — its placeholders decide the content.
+	 */
+	pageContentMode?: "embed" | "transcription" | "both";
+	/**
 	 * For split_pages_to_daily_notes: template for the line inserted into each daily note.
 	 * Placeholders: {{embed}} → ![[file.pdf#page=N]], {{pagelink}} → [[file.pdf#page=N]],
-	 *               {{link}} → [[file.pdf]], {{page}} → N, {{title}} → PDF stem, {{date}} → YYYY-MM-DD.
-	 * Leave empty to use the default: {{embed}}.
+	 *               {{link}} → [[file.pdf]], {{page}} → N, {{title}} → PDF stem, {{date}} → YYYY-MM-DD,
+	 *               {{transcription}} → the page's OCR text.
+	 * Leave empty to use the default implied by pageContentMode ({{embed}} when unset).
 	 */
 	pageEmbedTemplate?: string;
 	/** For split_pages_to_daily_notes: when true, also write a per-PDF page-index note recording which pages went to which date. */
@@ -402,6 +445,8 @@ export interface SyncResult {
 export interface DriveFileEntry {
 	file: DriveFile;
 	relPath: string; // relative path within the synced root, e.g. "Notes/2024"
+	/** Drive ID of the folder the file was listed in — used for wrapper-folder cleanup after delete-after-sync. */
+	parentFolderId?: string;
 }
 
 export interface DriveFileEntryWithPair extends DriveFileEntry {

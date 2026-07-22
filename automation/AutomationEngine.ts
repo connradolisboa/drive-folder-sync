@@ -516,7 +516,7 @@ export class AutomationEngine {
 				continue;
 			}
 
-			const line = this.buildPageEmbedLine(action.pageEmbedTemplate, fileName, pdfStem, page, date);
+			const line = this.buildPageEmbedLine(action, fileName, pdfStem, page, date, text);
 			await this.insertEmbed(note, line, action.insertPosition);
 			pageMappings.push({ page, date, source });
 			embedded++;
@@ -608,27 +608,48 @@ export class AutomationEngine {
 	}
 
 	/**
-	 * Build the line inserted into a daily note for one PDF page.
+	 * Build the content inserted into a daily note for one PDF page.
 	 * Placeholders: {{embed}} → ![[file#page=N]], {{pagelink}} → [[file#page=N]],
-	 *               {{link}} → [[file]], {{page}} → N, {{title}} → stem, {{date}} → YYYY-MM-DD.
-	 * Default (no template): {{embed}}.
+	 *               {{link}} → [[file]], {{page}} → N, {{title}} → stem, {{date}} → YYYY-MM-DD,
+	 *               {{transcription}} → the page's OCR text.
+	 * With no template, pageContentMode picks the default: "embed" → {{embed}},
+	 * "transcription" → the OCR text, "both" → embed followed by the OCR text.
 	 */
 	private buildPageEmbedLine(
-		template: string | undefined,
+		action: AutomationAction,
 		fileName: string,
 		pdfStem: string,
 		page: number,
-		dateStr: string
+		dateStr: string,
+		pageText: string
 	): string {
 		const embed = `![[${fileName}#page=${page}]]`;
-		const tpl = template && template.trim() ? template : "{{embed}}";
+		const template = action.pageEmbedTemplate;
+		const mode = action.pageContentMode ?? "embed";
+		const defaultTpl =
+			mode === "transcription" ? "{{transcription}}"
+			: mode === "both" ? "{{embed}}\n\n{{transcription}}"
+			: "{{embed}}";
+		const tpl = template && template.trim() ? template : defaultTpl;
 		return tpl
 			.replace(/\{\{embed\}\}/g, embed)
 			.replace(/\{\{pagelink\}\}/g, `[[${fileName}#page=${page}]]`)
 			.replace(/\{\{link\}\}/g, `[[${fileName}]]`)
 			.replace(/\{\{page\}\}/g, String(page))
 			.replace(/\{\{title\}\}/g, pdfStem)
-			.replace(/\{\{date\}\}/g, dateStr);
+			.replace(/\{\{date\}\}/g, dateStr)
+			.replace(/\{\{transcription\}\}/g, this.cleanOcrPageText(pageText));
+	}
+
+	/**
+	 * Prepare a page's OCR markdown for insertion into a note: drop Mistral's
+	 * image placeholders (e.g. "![img-0.jpeg](img-0.jpeg)"), which would render
+	 * as broken links in the vault, and trim surrounding whitespace.
+	 */
+	private cleanOcrPageText(text: string): string {
+		return text
+			.replace(/!\[[^\]]*\]\([^)]*\)\n?/g, "")
+			.trim();
 	}
 
 	/**
@@ -1068,16 +1089,28 @@ export class AutomationEngine {
 
 		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
 		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
+		// {{embed}} goes through the same embedTemplate mechanism as embed_to_* actions,
+		// so "also embed the file" is templated the same way everywhere.
+		const embedLine = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
 
-		const template = action.transcriptionTemplate
-			?? `\n## Transcription from [[${pdfStem}]]\n\n{{transcription}}`;
+		const header = `## Transcription from [[${pdfStem}]]\n\n{{transcription}}`;
+		let defaultTemplate: string;
+		if (action.embedFile) {
+			defaultTemplate =
+				action.transcriptionPosition === "above_embed"
+					? `\n${header}\n\n{{embed}}`
+					: `\n{{embed}}\n\n${header}`;
+		} else {
+			defaultTemplate = `\n${header}`;
+		}
+		const template = action.transcriptionTemplate ?? defaultTemplate;
 
 		const content = template
 			.replace(/\{\{transcription\}\}/g, transcription)
 			.replace(/\{\{title\}\}/g, pdfStem)
 			.replace(/\{\{date\}\}/g, dateStr)
 			.replace(/\{\{link\}\}/g, `[[${embedTarget}]]`)
-			.replace(/\{\{embed\}\}/g, `![[${embedTarget}]]`);
+			.replace(/\{\{embed\}\}/g, embedLine);
 
 		console.log(`${LOG} transcribe_to_periodic_note: appending to ${note.path}`);
 		await this.insertEmbed(note, content, action.insertPosition);
@@ -1351,20 +1384,29 @@ export class AutomationEngine {
 		// Build the section content, respecting a custom template if set
 		const template = action.transcriptionTemplate ?? "{{transcription}}";
 		const sectionBody = template.replace(/\{\{transcription\}\}/g, transcription);
+		const block = header + "\n\n" + sectionBody + "\n";
 
 		let newContent: string;
 		const sectionIdx = content.indexOf(headerNewline);
 		if (sectionIdx !== -1) {
-			// Replace existing section up to next ## heading or end of file
+			// Section already exists — update it in place; position only governs first insertion.
 			const searchFrom = sectionIdx + 1;
 			const nextSection = content.indexOf("\n## ", searchFrom);
 			const sectionEnd = nextSection !== -1 ? nextSection : content.length;
 			newContent =
 				content.slice(0, sectionIdx) +
-				"\n\n" + header + "\n\n" + sectionBody + "\n" +
+				"\n\n" + block +
 				content.slice(sectionEnd);
+		} else if ((action.transcriptionInsertPosition ?? "bottom") === "top") {
+			const fmEnd = content.indexOf("\n---\n", 3);
+			if (fmEnd !== -1) {
+				const insertPos = fmEnd + 5;
+				newContent = content.slice(0, insertPos) + "\n" + block + "\n" + content.slice(insertPos);
+			} else {
+				newContent = block + "\n" + content;
+			}
 		} else {
-			newContent = content.trimEnd() + "\n\n" + header + "\n\n" + sectionBody + "\n";
+			newContent = content.trimEnd() + "\n\n" + block;
 		}
 
 		await this.app.vault.modify(companionFile, newContent);

@@ -18,17 +18,20 @@ export class DownloadManager {
 	/**
 	 * Downloads a Drive file to the vault.
 	 * Returns the vault-relative path and whether the bytes came from the cache.
+	 * `targetFileName` overrides the Drive name (already sanitized) — used for
+	 * duplicate-name handling, e.g. "Note (2).pdf".
 	 */
 	async download(
 		file: DriveFile,
 		token: string,
 		destFolder: string,
-		relPath: string
+		relPath: string,
+		targetFileName?: string
 	): Promise<DownloadOutcome> {
 		const folderPath = relPath ? `${destFolder}/${relPath}` : destFolder;
 		await this.ensureFolder(folderPath);
 
-		const safeName = this.sanitizeFilename(file.name);
+		const safeName = targetFileName ?? this.sanitizeFilename(file.name);
 		const localPath = `${folderPath}/${safeName}`;
 
 		// Phase 11.3 — content-addressed cache hit (zero bytes downloaded).

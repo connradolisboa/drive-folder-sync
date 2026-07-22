@@ -56,6 +56,39 @@ export function lintAutomations(
 		if (action.pageIndexEnabled && action.type !== "split_pages_to_daily_notes") {
 			push("warn", "pageIndexEnabled only applies to split_pages_to_daily_notes — it will be ignored here.");
 		}
+		if (action.pageContentMode && action.type !== "split_pages_to_daily_notes") {
+			push("warn", "pageContentMode only applies to split_pages_to_daily_notes — it will be ignored here.");
+		}
+		if (action.embedFile && action.type !== "transcribe_to_periodic_note") {
+			push("warn", "embedFile only applies to transcribe_to_periodic_note — it will be ignored here.");
+		}
+		if (action.transcriptionPosition && !(action.type === "transcribe_to_periodic_note" && action.embedFile)) {
+			push("warn", "transcriptionPosition only applies when transcribe_to_periodic_note has \"Also embed the file\" on — it will be ignored here.");
+		}
+		if (action.transcriptionPosition && action.transcriptionTemplate?.trim()) {
+			push("warn", "transcriptionPosition is ignored once a custom Transcription template is set — order {{embed}}/{{transcription}} in the template instead.");
+		}
+		const isPeriodicEmbed =
+			action.type === "embed_to_daily_note" ||
+			action.type === "embed_to_weekly_note" ||
+			action.type === "embed_to_monthly_note" ||
+			action.type === "embed_to_quarterly_note" ||
+			action.type === "embed_to_yearly_note";
+		if (
+			action.transcriptionInsertPosition &&
+			action.type !== "transcribe_to_companion" &&
+			!(isPeriodicEmbed && action.transcribeFullToCompanion)
+		) {
+			push("warn", "transcriptionInsertPosition only applies to transcribe_to_companion, or an embed action with \"Also transcribe full PDF to companion\" on — it will be ignored here.");
+		}
+		if (
+			action.pageContentMode &&
+			action.pageContentMode !== "embed" &&
+			action.pageEmbedTemplate?.trim() &&
+			!action.pageEmbedTemplate.includes("{{transcription}}")
+		) {
+			push("warn", "Page content is set to include the transcription, but the custom page embed template has no {{transcription}} placeholder — the template wins, so no transcription will be inserted.");
+		}
 
 		// Composition checks: references must exist and run before this automation.
 		for (const refId of action.includeResultsFromAutomationIds ?? []) {

@@ -14,7 +14,10 @@ const REDIRECT_PORT = 42813;
 const REDIRECT_URI = `http://localhost:${REDIRECT_PORT}`;
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
-const SCOPE = "https://www.googleapis.com/auth/drive.readonly";
+// Full Drive access — required for the delete-after-sync features (moving synced
+// files to Drive trash). Tokens granted under the previous drive.readonly scope
+// keep working for reads; users must reconnect once to enable deletion.
+const SCOPE = "https://www.googleapis.com/auth/drive";
 const LOG = "[DriveSync/Auth]";
 
 export type AuthState = "ok" | "expired";

@@ -13,6 +13,7 @@ const EVENT_ICON: Record<EventName, string> = {
 	skipped: "minus",
 	moved: "move",
 	removed: "trash",
+	"drive-trashed": "trash-2",
 	conflict: "alert-triangle",
 	"automation-run": "zap",
 	"manifest-write": "save",

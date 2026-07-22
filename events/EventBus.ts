@@ -21,6 +21,8 @@ export interface EventMap {
 	moved: { fromPath: string; toPath: string; pairId: string; cacheHit?: boolean };
 	/** A file was removed/archived from the vault. */
 	removed: { vaultPath: string; pairId: string; behavior: string };
+	/** The plugin moved a synced file's Drive copy to Drive trash (delete-after-sync). */
+	"drive-trashed": { vaultPath: string; pairId: string; driveFileId: string };
 	/** A companion-note (or sync) conflict was detected. */
 	conflict: { vaultPath: string; backupPath?: string; resolution?: string };
 	/** An automation ran (or was skipped) for a file. */

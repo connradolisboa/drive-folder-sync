@@ -103,9 +103,13 @@ export class CompanionNoteManager {
 		pair: SyncPair,
 		relPath: string,
 		pdfVaultPath: string,
-		transcription?: string
+		transcription?: string,
+		notePathOverride?: string
 	): Promise<string> {
-		const notePath = this.companionPath(pair, relPath, file.name);
+		// Name after the actual vault file (which may carry a duplicate-name suffix
+		// like "Note (2).pdf"), not the raw Drive name.
+		const vaultFileName = pdfVaultPath.split("/").pop() ?? file.name;
+		const notePath = notePathOverride ?? this.companionPath(pair, relPath, vaultFileName);
 		console.log(`${LOG} Creating companion note: ${notePath}`);
 
 		const template = await this.loadTemplate(pair);
@@ -129,7 +133,7 @@ export class CompanionNoteManager {
 			if (createdFile instanceof TFile) {
 				await this.app.fileManager.processFrontMatter(createdFile, (fm) => {
 					const stem = pdfVaultPath.replace(/\.[^.]+$/, "");
-					fm["companion"] = `[[${file.name}]]`;
+					fm["companion"] = `[[${vaultFileName}]]`;
 					fm["companion-of"] = `[[${stem}]]`;
 					fm["sourceVaultPath"] = pdfVaultPath;
 					fm["sourceDriveModifiedTime"] = file.modifiedTime;
@@ -277,8 +281,13 @@ export class CompanionNoteManager {
 		}
 	}
 
-	private resolveTitle(file: DriveFile, pair: SyncPair, relPath: string): string {
-		const stem = file.name.replace(/\.pdf$/i, "");
+	private resolveTitle(
+		file: DriveFile,
+		pair: SyncPair,
+		relPath: string,
+		effectiveFileName: string = file.name
+	): string {
+		const stem = effectiveFileName.replace(/\.pdf$/i, "");
 		const titleTemplate = (
 			pair.companionNoteTitle !== undefined
 				? pair.companionNoteTitle
@@ -289,7 +298,7 @@ export class CompanionNoteManager {
 
 		return titleTemplate
 			.replaceAll("{{title}}", stem)
-			.replaceAll("{{fileName}}", file.name)
+			.replaceAll("{{fileName}}", effectiveFileName)
 			.replaceAll("{{pairLabel}}", pair.label)
 			.replaceAll("{{relativePath}}", relPath);
 	}
@@ -302,14 +311,17 @@ export class CompanionNoteManager {
 		pdfVaultPath: string,
 		transcription?: string
 	): string {
-		const stem = file.name.replace(/\.pdf$/i, "");
+		// Name/link tokens follow the actual vault file, which may carry a
+		// duplicate-name suffix ("Note (2).pdf") differing from the Drive name.
+		const vaultFileName = pdfVaultPath.split("/").pop() ?? file.name;
+		const stem = vaultFileName.replace(/\.pdf$/i, "");
 		const syncDate = new Date().toISOString();
-		const title = this.resolveTitle(file, pair, relPath);
+		const title = this.resolveTitle(file, pair, relPath, vaultFileName);
 		const sourceVaultStem = pdfVaultPath.replace(/\.[^.]+$/, "");
 
 		return template
 			.replaceAll("{{title}}", title)
-			.replaceAll("{{fileName}}", file.name)
+			.replaceAll("{{fileName}}", vaultFileName)
 			.replaceAll("{{fileLink}}", `[[${stem}]]`)
 			.replaceAll("{{sourceVaultPath}}", pdfVaultPath)
 			.replaceAll("{{sourceVaultStem}}", sourceVaultStem)

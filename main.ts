@@ -16,6 +16,7 @@ import { FileTrackerModal } from "./ui/FileTrackerModal";
 import { SyncLogModal } from "./ui/SyncLogModal";
 import { AutomationDryRunModal } from "./ui/AutomationDryRunModal";
 import { ConflictModal } from "./ui/ConflictModal";
+import { DriveFilePickerModal } from "./ui/DriveFilePickerModal";
 import { FileStatusModal } from "./ui/FileStatusModal";
 import { TranscriptionStore } from "./ai/TranscriptionStore";
 import { EventBus, BusRecord } from "./events/EventBus";
@@ -179,6 +180,21 @@ export default class DriveFolderSyncPlugin extends Plugin {
 					this.runSyncForPair(pair.id)
 						.then((r) => new Notice(this.formatResult(r)))
 						.catch((e) => new Notice(`Drive sync failed: ${(e as Error).message}`));
+				}).open();
+			},
+		});
+
+		this.addCommand({
+			id: "pull-file-from-drive",
+			name: "Pull file from Drive…",
+			callback: () => {
+				const active = this.settings.syncPairs.filter((p) => p.enabled && p.driveFolderId.trim());
+				if (active.length === 0) {
+					new Notice("No enabled sync pairs — add one in Settings first.");
+					return;
+				}
+				new SyncPairPickerModal(this.app, active, (pair) => {
+					new DriveFilePickerModal(this.app, this.driveSync, this.settings, this.manifestStore, pair).open();
 				}).open();
 			},
 		});

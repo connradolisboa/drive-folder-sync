@@ -50,6 +50,13 @@ export class DriveSync {
 
 	/** Groups recycle-bin entries written during one sync run (Phase 13.5). */
 	private currentSyncRunId = newSyncRunId();
+	/**
+	 * In-flight path claims for the current run (path → driveFileId). Concurrent
+	 * processEntry workers for two same-named new files would otherwise both resolve
+	 * to the same vault path before either writes its manifest entry. Cleared at the
+	 * start of every run.
+	 */
+	private pathClaims = new Map<string, string>();
 	/** Phase 13.3 — per-pair token bucket: timestamps of recent runs for rate-limiting. */
 	private pairRunTimestamps = new Map<string, number[]>();
 
@@ -152,6 +159,7 @@ export class DriveSync {
 		await this.manifest.load();
 		this.changesClient?.resetRunCache();
 		this.currentSyncRunId = newSyncRunId();
+		this.pathClaims.clear();
 
 		console.log(`${LOG} Fetching access token`);
 		const token = await this.auth.getValidAccessToken();
@@ -241,7 +249,10 @@ export class DriveSync {
 					const trashedIds = pairTrashedIds.get(pair.id) ?? new Set<string>();
 					const pairEntries = this.manifest.allForPair(pair.id);
 					for (const [driveId, entry] of pairEntries) {
-						if (!globalSeenIds.has(driveId) && !seenIds.has(driveId) && !trashedIds.has(driveId)) {
+						if (
+							!globalSeenIds.has(driveId) && !seenIds.has(driveId) &&
+							!trashedIds.has(driveId) && !entry.deletedFromDriveAt
+						) {
 							result.wouldRemove!.push(entry.vaultPath);
 						}
 					}
@@ -260,6 +271,7 @@ export class DriveSync {
 		await this.manifest.load();
 		this.changesClient?.resetRunCache();
 		this.currentSyncRunId = newSyncRunId();
+		this.pathClaims.clear();
 
 		console.log(`${LOG} Fetching access token for single-pair sync`);
 		const token = await this.auth.getValidAccessToken();
@@ -295,6 +307,7 @@ export class DriveSync {
 	 */
 	async testSync(pairId: string, subfolderPath: string): Promise<SyncResult> {
 		await this.manifest.load();
+		this.pathClaims.clear();
 		const token = await this.auth.getValidAccessToken();
 		const pair = this.settings.syncPairs.find((p) => p.id === pairId);
 		if (!pair) throw new Error(`Sync pair not found: ${pairId}`);
@@ -322,6 +335,165 @@ export class DriveSync {
 		await this.manifest.save();
 		await this.transcriptionStore?.save();
 		return result;
+	}
+
+	// ── Single-file pull (Drive file picker) ──────────────────────────────────
+
+	/** List every active (non-trashed) PDF in a pair's Drive folder, honoring the pair's subfolder rules. */
+	async listPairFiles(pair: SyncPair): Promise<DriveFileEntry[]> {
+		const token = await this.auth.getValidAccessToken();
+		const all = await this.collectFiles(
+			pair.driveFolderId, "", token,
+			pair.excludedSubfolders ?? [],
+			pair.excludeRootFiles ?? false,
+			pair.rootFilesOnly ?? false
+		);
+		return all.filter((e) => !e.file.trashed);
+	}
+
+	/**
+	 * Pull a single Drive file into the vault (Drive file picker). Runs the normal
+	 * processEntry pipeline (download, companion, matching automations), then optionally
+	 * a specific automation (forced) and/or moves the Drive copy to trash.
+	 */
+	async pullFile(
+		pair: SyncPair,
+		entry: DriveFileEntry,
+		opts: { deleteFromDrive?: boolean; automationId?: string } = {}
+	): Promise<{ vaultPath: string | null; downloaded: boolean; trashed: boolean; automationRan: boolean; error?: string }> {
+		await this.manifest.load();
+		this.pathClaims.clear();
+		const token = await this.auth.getValidAccessToken();
+		const companionEnabled = pair.companionNotesEnabled ?? this.settings.companionNotesEnabled;
+
+		const r = await this.processEntry(entry, pair, token, companionEnabled);
+		const vaultPath = this.manifest.get(entry.file.id)?.vaultPath ?? null;
+
+		let error: string | undefined;
+		let automationRan = false;
+		let trashed = false;
+
+		if (r.errors > 0 || !vaultPath) {
+			error = `Sync failed for "${entry.file.name}" — see console for details.`;
+		} else {
+			if (opts.automationId && this.automationEngine) {
+				try {
+					const res = await this.automationEngine.runForFileAdHoc(vaultPath, opts.automationId, { force: true });
+					automationRan = res.ran;
+					if (!res.ran) console.log(`${LOG} pullFile: automation skipped — ${res.skippedReason}`);
+				} catch (e) {
+					error = `Automation failed: ${e instanceof Error ? e.message : String(e)}`;
+				}
+			}
+			if (opts.deleteFromDrive) {
+				try {
+					await this.trashSyncedDriveFile(entry.file.id, pair, token, entry);
+					trashed = !!this.manifest.get(entry.file.id)?.deletedFromDriveAt;
+				} catch (e) {
+					error = e instanceof Error ? e.message : String(e);
+				}
+			}
+		}
+
+		await this.manifest.save();
+		await this.transcriptionStore?.save();
+		return { vaultPath, downloaded: r.downloaded > 0, trashed, automationRan, error };
+	}
+
+	// ── Delete-after-sync (Drive trash) ───────────────────────────────────────
+
+	/**
+	 * Move the Drive copy of a successfully synced file to Drive trash and mark the
+	 * manifest entry as vault-owned (deletedFromDriveAt) so the deletion pass never
+	 * removes the vault copy — even after Drive purges the trash for good.
+	 * No-ops when already done or when the vault copy can't be verified to exist.
+	 * Returns true when the file was trashed by this call.
+	 */
+	private async trashSyncedDriveFile(
+		driveFileId: string,
+		pair: SyncPair,
+		token: string,
+		driveEntry?: DriveFileEntry
+	): Promise<boolean> {
+		const entry = this.manifest.get(driveFileId);
+		if (!entry) return false;
+		if (entry.deletedFromDriveAt) return false; // already trashed by us
+		// Never trash the only copy — the vault file must verifiably exist.
+		if (!(await this.app.vault.adapter.exists(entry.vaultPath))) {
+			console.warn(`${LOG} delete-after-sync: vault copy missing — keeping Drive file: ${entry.vaultPath}`);
+			return false;
+		}
+		await this.trashDriveFile(driveFileId, token);
+		this.manifest.set(driveFileId, {
+			...entry,
+			deletedFromDriveAt: new Date().toISOString(),
+			driveTrashed: true,
+		});
+		console.log(`${LOG} delete-after-sync: moved Drive copy to trash: ${entry.vaultPath}`);
+		this.bus?.emit("drive-trashed", { vaultPath: entry.vaultPath, pairId: pair.id, driveFileId });
+
+		// Wrapper-folder cleanup: a folder named after the file that held only that file
+		// is left empty by the trash above — trash it too. Never fails the file op.
+		if (driveEntry) {
+			try {
+				await this.maybeTrashWrapperFolder(driveEntry, pair, token);
+			} catch (e) {
+				console.warn(`${LOG} delete-after-sync: wrapper-folder cleanup failed for "${entry.vaultPath}":`, e);
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * After a file's Drive copy was trashed: if its parent folder has the same name as
+	 * the file (the "Books/My Book/My Book.pdf" wrapper pattern) and now holds nothing
+	 * else, move the folder to Drive trash as well. The pair's root folder is never touched.
+	 */
+	private async maybeTrashWrapperFolder(
+		driveEntry: DriveFileEntry,
+		pair: SyncPair,
+		token: string
+	): Promise<void> {
+		const parentId = driveEntry.parentFolderId;
+		if (!parentId || parentId === pair.driveFolderId) return;
+
+		const stem = driveEntry.file.name.replace(/\.[^.]+$/, "");
+		const parentName = driveEntry.relPath.split("/").pop() ?? "";
+		if (parentName !== stem) return;
+
+		const remaining = await this.listItems<{ id: string }>(
+			token,
+			`'${parentId}' in parents and trashed=false`,
+			"files(id)"
+		);
+		if (remaining.length > 0) {
+			console.log(
+				`${LOG} delete-after-sync: wrapper folder "${parentName}" still has ${remaining.length} item(s) — keeping it`
+			);
+			return;
+		}
+
+		await this.trashDriveFile(parentId, token);
+		console.log(`${LOG} delete-after-sync: trashed empty wrapper folder "${parentName}" (${parentId})`);
+	}
+
+	/** files.update {trashed:true} — recoverable for ~30 days, matching the Drive UI's "delete". */
+	private async trashDriveFile(fileId: string, token: string): Promise<void> {
+		const resp = await this.fetchWithRetry(`${FILES_API}/${fileId}`, {
+			method: "PATCH",
+			headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ trashed: true }),
+		});
+		if (!resp.ok) {
+			const body = await resp.text();
+			if (resp.status === 403) {
+				throw new Error(
+					"Drive delete rejected (403) — the account was authorized read-only. " +
+					"Disconnect and reconnect your Google account to grant full Drive access."
+				);
+			}
+			throw new Error(`Drive files.update (trash) failed: ${resp.status} ${body}`);
+		}
 	}
 
 	// ── Phase 1: collect + process files ──────────────────────────────────────
@@ -461,6 +633,13 @@ export class DriveSync {
 		for (const [driveId, entry] of pairEntries) {
 			if (seenIds.has(driveId)) continue; // still present in this pair
 
+			if (entry.deletedFromDriveAt) {
+				// The plugin trashed the Drive copy on purpose (delete-after-sync) —
+				// the vault copy is vault-owned now; never remove it, even after Drive
+				// purges the trashed file for good.
+				continue;
+			}
+
 			if (globalSeenIds.has(driveId)) {
 				// File moved to another pair — pairId already updated in processEntry;
 				// skip deletion so the other pair owns it.
@@ -577,10 +756,12 @@ export class DriveSync {
 				? this.collapseRelPath(entry.relPath, entry.file.name)
 				: entry.relPath;
 
-			const expectedVaultPath = this.computeVaultPath(
-				pair.vaultDestFolder,
-				effectiveRelPath,
-				entry.file.name
+			// Duplicate-name handling: distinct Drive files sharing a name get a stable
+			// numbered suffix instead of silently overwriting each other in the vault.
+			const expectedVaultPath = await this.resolvePathCollision(
+				entry.file.id,
+				this.computeVaultPath(pair.vaultDestFolder, effectiveRelPath, entry.file.name),
+				"vault"
 			);
 
 			const existing = this.manifest.get(entry.file.id);
@@ -620,7 +801,8 @@ export class DriveSync {
 					entry.file,
 					token,
 					pair.vaultDestFolder,
-					effectiveRelPath
+					effectiveRelPath,
+					expectedVaultPath.split("/").pop()
 				);
 
 				// Attempt AI transcription (non-blocking on failure)
@@ -677,12 +859,20 @@ export class DriveSync {
 						if (conflictPath) r.conflicts = [...(r.conflicts ?? []), conflictPath];
 						companionPath = resolvedCompanionPath;
 					} else {
+						// Companion name follows the (possibly deduped) vault filename, and the
+						// note path itself is deduped against other files' companions.
+						const companionTarget = await this.resolvePathCollision(
+							entry.file.id,
+							this.companion.companionPath(pair, entry.relPath, vaultPath.split("/").pop() ?? entry.file.name),
+							"companion"
+						);
 						companionPath = await this.companion.create(
 							entry.file,
 							pair,
 							entry.relPath,
 							vaultPath,
-							transcription
+							transcription,
+							companionTarget
 						);
 					}
 					// 5.4: Record mtime for concurrent-edit detection on the next sync
@@ -756,13 +946,25 @@ export class DriveSync {
 				this.bus?.emit("moved", { fromPath: existing.vaultPath, toPath: expectedVaultPath, pairId: pair.id });
 				r.moved!++;
 			} else {
-				// Clear driveTrashed if file was previously in trash but is now active and unchanged
-				if (existing?.driveTrashed) {
-					this.manifest.set(entry.file.id, { ...existing, driveTrashed: undefined });
+				// Clear trash/vault-owned flags if file was previously trashed but is now active and unchanged
+				if (existing?.driveTrashed || existing?.deletedFromDriveAt) {
+					this.manifest.set(entry.file.id, { ...existing, driveTrashed: undefined, deletedFromDriveAt: undefined });
 				}
 				console.log(`${LOG} Up to date, skipping: ${displayPath}`);
 				this.bus?.emit("skipped", { vaultPath: existing?.vaultPath ?? expectedVaultPath, pairId: pair.id, reason: "up to date" });
 				r.skipped++;
+			}
+
+			// Delete-after-sync: the vault verifiably holds the current version — trash the Drive copy.
+			// A failure here never fails the file itself (the sync succeeded); it's surfaced separately.
+			if (pair.deleteFromDriveAfterSync) {
+				try {
+					await this.trashSyncedDriveFile(entry.file.id, pair, token, entry);
+				} catch (e) {
+					const msg = e instanceof Error ? e.message : String(e);
+					console.error(`${LOG} delete-after-sync failed for "${displayPath}":`, e);
+					this.bus?.emit("error", { message: `Delete-after-sync failed for "${displayPath}": ${msg}`, context: "delete-after-sync" });
+				}
 			}
 		} catch (e) {
 			console.error(`${LOG} Failed to sync "${displayPath}":`, e);
@@ -790,10 +992,14 @@ export class DriveSync {
 
 		// Rename companion note if it exists
 		if (existing.companionPath && companionEnabled) {
-			const newCompanionPath = this.companion.companionPath(
-				pair,
-				entry.relPath,
-				entry.file.name
+			const newCompanionPath = await this.resolvePathCollision(
+				entry.file.id,
+				this.companion.companionPath(
+					pair,
+					entry.relPath,
+					newVaultPath.split("/").pop() ?? entry.file.name
+				),
+				"companion"
 			);
 			if (newCompanionPath !== existing.companionPath) {
 				await this.companion.rename(existing.companionPath, newCompanionPath);
@@ -892,6 +1098,66 @@ export class DriveSync {
 		// "keep" and "delete_only_companion" for PDF: do nothing
 	}
 
+	// ── Duplicate-name handling ───────────────────────────────────────────────
+
+	/**
+	 * Resolve path collisions between distinct Drive files that share a name.
+	 * When `desiredPath` already belongs to another tracked file (manifest) or was
+	 * claimed earlier in this run, a numbered suffix is appended before the
+	 * extension — "Note (2).pdf", "Note (3).pdf"… (Windows/Drive convention).
+	 * A file keeps its previously assigned numbered path across syncs, so names
+	 * never thrash between runs; if the clean name frees up later, the normal
+	 * move detection renames the file back.
+	 */
+	private async resolvePathCollision(
+		ownerId: string,
+		desiredPath: string,
+		kind: "vault" | "companion"
+	): Promise<string> {
+		const find = kind === "vault"
+			? (p: string) => this.manifest.findByVaultPath(p)
+			: (p: string) => this.manifest.findByCompanionPath(p);
+		const taken = (p: string): boolean => {
+			const claimant = this.pathClaims.get(p);
+			if (claimant && claimant !== ownerId) return true;
+			const found = find(p);
+			return !!found && found[0] !== ownerId;
+		};
+		const claim = (p: string): string => {
+			this.pathClaims.set(p, ownerId);
+			return p;
+		};
+
+		if (!taken(desiredPath)) return claim(desiredPath);
+
+		const dot = desiredPath.lastIndexOf(".");
+		const slash = desiredPath.lastIndexOf("/");
+		const hasExt = dot > slash;
+		const base = hasExt ? desiredPath.slice(0, dot) : desiredPath;
+		const ext = hasExt ? desiredPath.slice(dot) : "";
+
+		// Prefer the numbered variant this file already owns — stable across syncs.
+		const existing = this.manifest.get(ownerId);
+		const current = kind === "vault" ? existing?.vaultPath : existing?.companionPath;
+		if (current) {
+			const escaped = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			const variant = new RegExp(`^${escaped(base)} \\(\\d+\\)${escaped(ext)}$`);
+			if (variant.test(current) && !taken(current)) return claim(current);
+		}
+
+		for (let n = 2; n < 1000; n++) {
+			const candidate = `${base} (${n})${ext}`;
+			if (taken(candidate)) continue;
+			// Never clobber an untracked vault file that happens to sit at a candidate
+			// path (e.g. the user's own "Note (2).pdf").
+			if (await this.app.vault.adapter.exists(candidate)) continue;
+			console.log(`${LOG} Name collision: "${desiredPath}" taken — using "${candidate}"`);
+			return claim(candidate);
+		}
+		// Practically unreachable; guarantees termination.
+		return claim(`${base} (${Date.now()})${ext}`);
+	}
+
 	private collapseRelPath(relPath: string, fileName: string): string {
 		if (!relPath) return relPath;
 		const parts = relPath.split("/");
@@ -945,7 +1211,7 @@ export class DriveSync {
 		const entries: DriveFileEntry[] =
 			(excludeRootFiles && isRoot)
 				? (console.log(`${LOG} Skipping ${files.length} root-level file(s) (excludeRootFiles=true)`), [])
-				: files.map((f) => ({ file: f, relPath }));
+				: files.map((f) => ({ file: f, relPath, parentFolderId: folderId }));
 
 		if (!rootFilesOnly) {
 			for (const folder of subfolders) {
