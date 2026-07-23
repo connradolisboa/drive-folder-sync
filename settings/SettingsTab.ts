@@ -2152,6 +2152,24 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					text.inputEl.style.resize = "vertical";
 				});
 
+			const deleteAfterTranscriptionSetting = new Setting(bodyEl)
+				.setName("Delete file after transcription")
+				.setDesc(
+					"Once the transcription above has actually been written (skipped/unchanged runs don't count), " +
+					"remove the source PDF from the vault (system trash) and Drive (Drive trash, recoverable ~30 days), " +
+					"and strip any embeds/links to it left by other automations — they'd otherwise point at a deleted " +
+					"file. Requires full Drive access — if you connected your Google account before this option " +
+					"existed, disconnect and reconnect it once."
+				)
+				.addToggle((toggle) =>
+					toggle
+						.setValue(automation.action.deleteFileAfterTranscription ?? false)
+						.onChange(async (val) => {
+							this.plugin.settings.automations[i].action.deleteFileAfterTranscription = val;
+							await this.plugin.saveSettings();
+						})
+				);
+
 			// ── split_pages_to_daily_notes options ──────────────────────────
 			const createDailyNoteSetting = new Setting(bodyEl)
 				.setName("Create daily note if missing")
@@ -2467,6 +2485,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				embedFileSetting.settingEl.toggle(isTranscribePeriodicAction);
 				transcriptionPositionSetting.settingEl.toggle(isTranscribePeriodicAction && embedFileOn);
 				transcriptionTemplateSetting.settingEl.toggle(isAnyTranscribeAction);
+				deleteAfterTranscriptionSetting.settingEl.toggle(isAnyTranscribeAction);
 				createDailyNoteSetting.settingEl.toggle(isSplitPages);
 				dailyNoteTemplateSetting.settingEl.toggle(isSplitPages);
 				pageContentModeSetting.settingEl.toggle(isSplitPages);

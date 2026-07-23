@@ -477,6 +477,47 @@ export class DriveSync {
 		console.log(`${LOG} delete-after-sync: trashed empty wrapper folder "${parentName}" (${parentId})`);
 	}
 
+	// ── Delete-after-transcription ─────────────────────────────────────────────
+
+	/**
+	 * An automation with "Delete file after transcription" enabled has just written the PDF's
+	 * text into a note and asked for the source to be removed on both sides. Back up the bytes,
+	 * trash the vault copy, then trash the Drive copy — only once Drive confirms the trash do we
+	 * stop tracking it. If the Drive call throws, the vault's own delete listener has already
+	 * marked the manifest entry userDeletedAt, so the next sync redownloads it (Drive is still
+	 * the source of truth, unlike a real user deletion).
+	 */
+	private async deleteSourceAfterTranscription(
+		vaultPath: string,
+		driveFileId: string,
+		pair: SyncPair,
+		token: string,
+		displayPath: string
+	): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (!(file instanceof TFile)) return;
+
+		if (this.recycle) {
+			try {
+				const bytes = await this.app.vault.adapter.readBinary(vaultPath);
+				await this.recycle.backup(vaultPath, bytes, {
+					driveFileId, pairId: pair.id, action: "delete-after-transcription", syncRunId: this.currentSyncRunId,
+				});
+			} catch (e) {
+				console.error(`${LOG} delete-after-transcription: recycle backup failed for "${vaultPath}":`, e);
+			}
+		}
+
+		console.log(`${LOG} delete-after-transcription: trashing vault file: ${vaultPath}`);
+		await this.app.vault.trash(file, true);
+
+		await this.trashDriveFile(driveFileId, token);
+		this.manifest.delete(driveFileId);
+
+		console.log(`${LOG} delete-after-transcription: removed "${displayPath}" from vault, Drive, and manifest`);
+		this.bus?.emit("deleted-after-transcription", { vaultPath, pairId: pair.id, driveFileId });
+	}
+
 	/** files.update {trashed:true} — recoverable for ~30 days, matching the Drive UI's "delete". */
 	private async trashDriveFile(fileId: string, token: string): Promise<void> {
 		const resp = await this.fetchWithRetry(`${FILES_API}/${fileId}`, {
@@ -923,7 +964,7 @@ export class DriveSync {
 					// Fall back to manifest's stored companion path when companion notes are
 					// currently disabled — lets transcribe_to_companion find an existing note.
 					const automationCompanionPath = companionPath ?? resolvedCompanionPath ?? null;
-					await this.automationEngine.runForFile({
+					const automationResult = await this.automationEngine.runForFile({
 						vaultPath,
 						companionPath: automationCompanionPath,
 						driveCreatedTime: entry.file.createdTime,
@@ -931,6 +972,19 @@ export class DriveSync {
 						driveFileId: entry.file.id,
 						driveModifiedTime: entry.file.modifiedTime,
 					});
+
+					if (automationResult.deleteRequested) {
+						try {
+							await this.deleteSourceAfterTranscription(vaultPath, entry.file.id, pair, token, displayPath);
+						} catch (e) {
+							const msg = e instanceof Error ? e.message : String(e);
+							console.error(`${LOG} delete-after-transcription failed for "${displayPath}":`, e);
+							this.bus?.emit("error", {
+								message: `Delete-after-transcription failed for "${displayPath}": ${msg}`,
+								context: "delete-after-transcription",
+							});
+						}
+					}
 				}
 
 				console.log(`${LOG} Downloaded: ${displayPath}${cacheHit ? " (cache hit)" : ""}`);

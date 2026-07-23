@@ -348,6 +348,15 @@ export interface AutomationAction {
 	 */
 	transcriptionInsertPosition?: "top" | "bottom";
 	/**
+	 * For transcribe_to_companion / transcribe_to_periodic_note: once the transcription has
+	 * actually been written for this run, delete the source PDF — trashed in the vault and
+	 * trashed in Drive (recoverable ~30 days on both sides) — and strip any wikilinks/embeds
+	 * pointing at it left by other automations, since they'd otherwise point at a deleted file.
+	 * No-ops on runs where a transcription wasn't produced (e.g. skipped as already-run).
+	 * Requires full Drive access (delete scope).
+	 */
+	deleteFileAfterTranscription?: boolean;
+	/**
 	 * For split_pages_to_daily_notes: when true (the default), create the daily note if one
 	 * does not already exist for a page's date. When false, pages with no existing daily note are skipped.
 	 */

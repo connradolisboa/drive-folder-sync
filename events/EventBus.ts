@@ -23,6 +23,8 @@ export interface EventMap {
 	removed: { vaultPath: string; pairId: string; behavior: string };
 	/** The plugin moved a synced file's Drive copy to Drive trash (delete-after-sync). */
 	"drive-trashed": { vaultPath: string; pairId: string; driveFileId: string };
+	/** An automation's "delete file after transcription" removed the source PDF from vault + Drive. */
+	"deleted-after-transcription": { vaultPath: string; pairId: string; driveFileId: string };
 	/** A companion-note (or sync) conflict was detected. */
 	conflict: { vaultPath: string; backupPath?: string; resolution?: string };
 	/** An automation ran (or was skipped) for a file. */

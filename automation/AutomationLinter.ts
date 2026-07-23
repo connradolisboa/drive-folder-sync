@@ -82,6 +82,13 @@ export function lintAutomations(
 			push("warn", "transcriptionInsertPosition only applies to transcribe_to_companion, or an embed action with \"Also transcribe full PDF to companion\" on — it will be ignored here.");
 		}
 		if (
+			action.deleteFileAfterTranscription &&
+			action.type !== "transcribe_to_companion" &&
+			action.type !== "transcribe_to_periodic_note"
+		) {
+			push("warn", "deleteFileAfterTranscription only applies to transcribe_to_companion or transcribe_to_periodic_note — it will be ignored here.");
+		}
+		if (
 			action.pageContentMode &&
 			action.pageContentMode !== "embed" &&
 			action.pageEmbedTemplate?.trim() &&

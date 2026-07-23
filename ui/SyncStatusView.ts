@@ -14,6 +14,7 @@ const EVENT_ICON: Record<EventName, string> = {
 	moved: "move",
 	removed: "trash",
 	"drive-trashed": "trash-2",
+	"deleted-after-transcription": "file-x",
 	conflict: "alert-triangle",
 	"automation-run": "zap",
 	"manifest-write": "save",
@@ -229,6 +230,7 @@ export class SyncStatusView extends ItemView {
 			case "moved": return { text: `Moved → ${p.toPath}`, path: p.toPath as string };
 			case "removed": return { text: `Removed ${p.vaultPath} (${p.behavior})`, path: p.vaultPath as string };
 			case "conflict": return { text: `Conflict: ${p.vaultPath}`, path: p.vaultPath as string };
+			case "deleted-after-transcription": return { text: `Deleted after transcription: ${p.vaultPath}`, path: p.vaultPath as string };
 			case "automation-run": return { text: `${p.automationName}: ${p.result} on ${p.vaultPath}`, path: p.vaultPath as string };
 			case "manifest-write": return { text: `Manifest saved (${p.entryCount} entries)` };
 			case "auth-failed": return { text: `Auth failed: ${p.reason}` };

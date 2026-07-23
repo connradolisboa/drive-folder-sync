@@ -28,6 +28,11 @@ export interface RunForFileOptions {
 	ignoreFolderTrigger?: boolean;
 }
 
+export interface RunForFileResult {
+	/** True when a transcribe action with deleteFileAfterTranscription wrote a transcription this run — the caller should remove the source file from the vault and Drive. */
+	deleteRequested: boolean;
+}
+
 export interface AdHocRunResult {
 	ran: boolean;
 	skippedReason?: string;
@@ -159,7 +164,7 @@ export class AutomationEngine {
 		return { matched, ran, skipped, errors, ...(opts.dryRun ? { preview } : {}) };
 	}
 
-	async runForFile(opts: RunForFileOptions): Promise<void> {
+	async runForFile(opts: RunForFileOptions): Promise<RunForFileResult> {
 		const {
 			vaultPath,
 			companionPath,
@@ -175,7 +180,7 @@ export class AutomationEngine {
 			(a) => a.enabled && (ignoreFolderTrigger || this.matchesTrigger(a, vaultPath))
 		);
 
-		if (matching.length === 0) return;
+		if (matching.length === 0) return { deleteRequested: false };
 
 		// 6.2: Read skip flags from companion frontmatter
 		let skipAll = false;
@@ -194,11 +199,14 @@ export class AutomationEngine {
 
 		if (skipAll) {
 			console.log(`${LOG} Skipping all automations for "${vaultPath}" — drive-sync-skip-all: true`);
-			return;
+			return { deleteRequested: false };
 		}
 
 		// Per-file accumulator: later automations (in array order) can read earlier ones' results.
 		const report: AutomationRunReport = { byId: {}, byType: {} };
+		// Set when a transcribe action with deleteFileAfterTranscription actually wrote a
+		// transcription this run — signals the caller to remove the source file (vault + Drive).
+		let deleteRequested = false;
 
 		for (const automation of matching) {
 			if (skipList.includes(automation.id)) {
@@ -236,6 +244,14 @@ export class AutomationEngine {
 						result: "success",
 					});
 				}
+				if (
+					(automation.action.type === "transcribe_to_companion" ||
+						automation.action.type === "transcribe_to_periodic_note") &&
+					automation.action.deleteFileAfterTranscription &&
+					transcription
+				) {
+					deleteRequested = true;
+				}
 			} catch (e) {
 				console.error(`${LOG} Automation "${automation.name}" failed for "${vaultPath}":`, e);
 				this.emitRun(vaultPath, automation, "error", e instanceof Error ? e.message : String(e));
@@ -249,6 +265,60 @@ export class AutomationEngine {
 				}
 			}
 		}
+
+		if (deleteRequested) {
+			// Only strip links here — the source file itself and its Drive copy are trashed by
+			// the caller (DriveSync), which alone holds the Drive token needed for that half.
+			await this.removeLinksToFile(vaultPath);
+		}
+
+		return { deleteRequested };
+	}
+
+	/**
+	 * Strip every wikilink/embed across the vault that resolves to `vaultPath` (e.g. the
+	 * `![[file.pdf]]` and `![[file.pdf#page=N]]` lines other automations inserted). Called
+	 * before a delete-after-transcription removal so those links don't end up dangling.
+	 */
+	async removeLinksToFile(vaultPath: string): Promise<void> {
+		const target = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (!(target instanceof TFile)) return;
+
+		const resolvedLinks = this.app.metadataCache.resolvedLinks;
+		for (const sourcePath of Object.keys(resolvedLinks)) {
+			if (!resolvedLinks[sourcePath]?.[vaultPath]) continue;
+			const note = this.app.vault.getAbstractFileByPath(sourcePath);
+			if (!(note instanceof TFile)) continue;
+
+			const content = await this.app.vault.read(note);
+			const next = this.stripLinksToFileFromContent(content, target, sourcePath);
+			if (next !== content) {
+				await this.app.vault.modify(note, next);
+				console.log(`${LOG} delete_after_transcription: removed link(s) to "${vaultPath}" from "${sourcePath}"`);
+			}
+		}
+	}
+
+	/**
+	 * Remove every [[...]] / ![[...]] occurrence in `content` that resolves to `target`
+	 * (aliases and #fragments included). A line left blank by the removal — i.e. it held
+	 * nothing but the link — is dropped entirely; links sharing a line with other text are
+	 * excised in place, leaving the surrounding prose untouched.
+	 */
+	private stripLinksToFileFromContent(content: string, target: TFile, sourcePath: string): string {
+		const linkRegex = /!?\[\[([^\]]+)\]\]/g;
+		return content
+			.split("\n")
+			.map((line) => {
+				const stripped = line.replace(linkRegex, (full, inner: string) => {
+					const linkPath = inner.split("|")[0].split("#")[0].trim();
+					const dest = this.app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath);
+					return dest && dest.path === target.path ? "" : full;
+				});
+				return stripped !== line && stripped.trim() === "" ? null : stripped;
+			})
+			.filter((line): line is string => line !== null)
+			.join("\n");
 	}
 
 	/**
