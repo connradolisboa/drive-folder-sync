@@ -15,6 +15,9 @@ const PAGE_INDEX_END = "<!-- drive-sync:page-index:end -->";
 // Sentinel markers wrapping an auto-managed "included results" composition block.
 const INCLUDED_RESULTS_START = "<!-- drive-sync:included-results:start -->";
 const INCLUDED_RESULTS_END = "<!-- drive-sync:included-results:end -->";
+// Prefix for the per-file sentinel wrapping an add_to_periodic_note entry, so a
+// re-run replaces that file's block in place instead of appending a duplicate.
+const PERIODIC_ENTRY_PREFIX = "drive-sync:periodic-entry:";
 
 export interface RunForFileOptions {
 	vaultPath: string;
@@ -244,12 +247,7 @@ export class AutomationEngine {
 						result: "success",
 					});
 				}
-				if (
-					(automation.action.type === "transcribe_to_companion" ||
-						automation.action.type === "transcribe_to_periodic_note") &&
-					automation.action.deleteFileAfterTranscription &&
-					transcription
-				) {
+				if (automation.action.deleteFileAfterTranscription && output?.transcriptionWritten) {
 					deleteRequested = true;
 				}
 			} catch (e) {
@@ -491,26 +489,16 @@ export class AutomationEngine {
 		transcription?: string,
 		report?: AutomationRunReport
 	): Promise<AutomationOutput | void> {
-		if (action.type === "embed_to_daily_note") {
-			await this.embedToDailyNote(vaultPath, companionPath, action, driveCreatedTime, transcription);
-		} else if (action.type === "embed_to_weekly_note") {
-			await this.embedToPeriodicNote("weekly", vaultPath, companionPath, action, driveCreatedTime, transcription);
-		} else if (action.type === "embed_to_monthly_note") {
-			await this.embedToPeriodicNote("monthly", vaultPath, companionPath, action, driveCreatedTime, transcription);
-		} else if (action.type === "embed_to_quarterly_note") {
-			await this.embedToPeriodicNote("quarterly", vaultPath, companionPath, action, driveCreatedTime, transcription);
-		} else if (action.type === "embed_to_yearly_note") {
-			await this.embedToPeriodicNote("yearly", vaultPath, companionPath, action, driveCreatedTime, transcription);
+		if (action.type === "add_to_periodic_note") {
+			return await this.runAddToPeriodicNote(vaultPath, companionPath, action, driveCreatedTime, transcription);
 		} else if (action.type === "append_to_note") {
 			await this.runAppendToNote(vaultPath, companionPath, action, report);
 		} else if (action.type === "add_tag_to_companion") {
 			await this.runAddTagToCompanion(companionPath, action);
 		} else if (action.type === "link_to_matching_note") {
 			await this.runLinkToMatchingNote(vaultPath, companionPath, action);
-		} else if (action.type === "transcribe_to_periodic_note") {
-			await this.runTranscribeToPeriodicNote(vaultPath, companionPath, action, driveCreatedTime, transcription);
 		} else if (action.type === "transcribe_to_companion") {
-			await this.runTranscribeToCompanion(companionPath, action, transcription);
+			return await this.runTranscribeToCompanion(vaultPath, companionPath, action, transcription);
 		} else if (action.type === "split_pages_to_daily_notes") {
 			return await this.splitPagesToDailyNotes(vaultPath, action);
 		}
@@ -663,15 +651,30 @@ export class AutomationEngine {
 
 	/**
 	 * Replace the content between `start` and `end` markers with `block`. When the markers are
-	 * absent, append `block` (which already includes the markers) to the end of the note.
+	 * absent, insert `block` (which already includes the markers) at `position` — appended at the
+	 * end (default), or right after frontmatter when `position` is "top".
 	 */
-	private replaceManagedBlock(content: string, start: string, end: string, block: string): string {
+	private replaceManagedBlock(
+		content: string,
+		start: string,
+		end: string,
+		block: string,
+		position: "top" | "bottom" = "bottom"
+	): string {
 		const startIdx = content.indexOf(start);
 		const endIdx = content.indexOf(end);
 		if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
 			const before = content.slice(0, startIdx);
 			const after = content.slice(endIdx + end.length);
 			return `${before}${block}${after}`;
+		}
+		if (position === "top") {
+			const fmEnd = content.indexOf("\n---\n", 3);
+			if (fmEnd !== -1) {
+				const insertPos = fmEnd + 5;
+				return content.slice(0, insertPos) + "\n" + block + "\n\n" + content.slice(insertPos);
+			}
+			return `${block}\n\n${content}`;
 		}
 		const sep = content.length === 0 ? "" : content.endsWith("\n") ? "\n" : "\n\n";
 		return `${content}${sep}${block}\n`;
@@ -801,117 +804,125 @@ export class AutomationEngine {
 		return null;
 	}
 
-	private async embedToDailyNote(
-		vaultPath: string,
-		companionPath: string | null | undefined,
-		action: AutomationAction,
-		driveCreatedTime?: string,
-		transcription?: string
-	): Promise<void> {
-		const fileName = vaultPath.split("/").pop();
-		if (!fileName) return;
-
-		const dateStr = this.resolveDate(fileName, driveCreatedTime);
-		if (!dateStr) {
-			console.log(`${LOG} No date found for daily note embed: ${fileName}`);
-			return;
-		}
-
-		// Prefer per-action pattern; fall back to periodicNotesPaths.daily
-		const pattern = action.dailyNoteNamePattern || this.settings.periodicNotesPaths.daily;
-
-		const dailyNote = pattern
-			? this.findNoteByPattern(dateStr, pattern)
-			: this.findDailyNoteByFrontmatter(dateStr);
-
-		if (!dailyNote) {
-			console.log(`${LOG} No daily note found for date: ${dateStr}`);
-			return;
-		}
-
-		console.log(`${LOG} Found daily note: ${dailyNote.path}`);
-		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
-		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
-		const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
-		await this.insertEmbed(dailyNote, line, action.insertPosition);
-		await this.applyEmbedExtras(action, vaultPath, companionPath, dailyNote, transcription);
-	}
-
-	private async embedToPeriodicNote(
-		period: PeriodicPeriod,
-		vaultPath: string,
-		companionPath: string | null | undefined,
-		action: AutomationAction,
-		driveCreatedTime?: string,
-		transcription?: string
-	): Promise<void> {
-		const fileName = vaultPath.split("/").pop();
-		if (!fileName) return;
-
-		const dateStr = this.resolveDate(fileName, driveCreatedTime);
-		if (!dateStr) {
-			console.log(`${LOG} No date found for ${period} note embed: ${fileName}`);
-			return;
-		}
-
-		const pathTemplate = this.settings.periodicNotesPaths[period];
-		if (!pathTemplate) {
-			console.log(`${LOG} No path configured for ${period} notes — skipping. Set it in Settings → Periodic Notes.`);
-			return;
-		}
-
-		const resolvedPath = this.resolveDatePattern(pathTemplate, dateStr);
-		const note = this.findNoteByPath(resolvedPath);
-
-		if (!note) {
-			console.log(`${LOG} No ${period} note found for date ${dateStr} (looked for "${resolvedPath}")`);
-			return;
-		}
-
-		console.log(`${LOG} Found ${period} note: ${note.path}`);
-		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
-		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
-		const line = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
-		await this.insertEmbed(note, line, action.insertPosition);
-		await this.applyEmbedExtras(action, vaultPath, companionPath, note, transcription);
-	}
-
 	/**
-	 * Optional embed extras (opt-in per action): after embedding, push the full PDF transcription
-	 * into the companion note's `## Transcription` section, and/or add a [[periodic note]] backlink
-	 * to the companion. No-op unless a flag is set and a companion note exists.
+	 * Unified "add to periodic note" action. Inserts a managed, per-file block into the matching
+	 * periodic note (daily/weekly/…) built from the template, and — when Run transcription is on —
+	 * OCRs the PDF (on demand if no text was handed in) and routes the text either into that same
+	 * periodic block (via the template's {{transcription}} handle) or into the companion note's
+	 * "## Transcription" section. Re-runs replace the block in place rather than duplicating.
 	 */
-	private async applyEmbedExtras(
-		action: AutomationAction,
+	private async runAddToPeriodicNote(
 		vaultPath: string,
 		companionPath: string | null | undefined,
-		periodicNote: TFile,
+		action: AutomationAction,
+		driveCreatedTime?: string,
 		transcription?: string
-	): Promise<void> {
-		if (!action.transcribeFullToCompanion && !action.companionLinkToPeriodicNote) return;
+	): Promise<AutomationOutput | void> {
+		const fileName = vaultPath.split("/").pop();
+		if (!fileName) return;
 
-		if (!companionPath) {
-			console.log(`${LOG} embed extras: no companion note for "${vaultPath}" — skipping extras`);
-			return;
-		}
-		const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
-		if (!(companionFile instanceof TFile)) {
-			console.log(`${LOG} embed extras: companion note not found: ${companionPath}`);
+		const dateStr = this.resolveDate(fileName, driveCreatedTime);
+		if (!dateStr) {
+			console.log(`${LOG} add_to_periodic_note: no date found for "${fileName}" — skipping`);
 			return;
 		}
 
-		if (action.transcribeFullToCompanion) {
-			const text = transcription ?? (await this.transcribeFullPdf(vaultPath)) ?? undefined;
-			if (text) {
-				await this.runTranscribeToCompanion(companionPath, action, text);
-			} else {
-				console.log(`${LOG} embed extras: no transcription available for "${vaultPath}" — skipping companion transcription`);
+		const period = action.periodicNoteType ?? "daily";
+		const note = this.resolvePeriodicNote(period, dateStr, action);
+		if (!note) {
+			console.log(`${LOG} add_to_periodic_note: no ${period} note found for date ${dateStr} — skipping`);
+			return;
+		}
+
+		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
+		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
+		const target = action.transcriptionTarget ?? "periodic";
+		const templateWantsTranscription = (action.embedTemplate ?? "").includes("{{transcription}}");
+
+		// Obtain the OCR text only when it's actually going to be used (companion target, or the
+		// template asks for it). Falls back to on-demand transcription when none was handed in.
+		let text: string | undefined;
+		if (action.runTranscription && (target === "companion" || templateWantsTranscription)) {
+			text = transcription ?? (await this.transcribeFullPdf(vaultPath)) ?? undefined;
+			if (!text) {
+				console.log(`${LOG} add_to_periodic_note: transcription requested but none available for "${vaultPath}"`);
 			}
 		}
 
-		if (action.companionLinkToPeriodicNote) {
-			await this.insertEmbed(companionFile, `[[${periodicNote.basename}]]`, "top");
+		let transcriptionWritten = false;
+
+		// Companion-target transcription goes into the companion's "## Transcription" section.
+		if (action.runTranscription && target === "companion" && text) {
+			transcriptionWritten = await this.writeCompanionTranscription(vaultPath, companionPath, action, text);
 		}
+
+		// Build the periodic-note block. {{transcription}} only renders text for the periodic target.
+		const periodicText = target === "periodic" ? text : undefined;
+		const inner = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr, periodicText);
+		const outcome = await this.insertManagedEntry(note, pdfStem, inner, action.insertPosition);
+		if (target === "periodic" && templateWantsTranscription && periodicText && outcome !== "skipped") {
+			transcriptionWritten = true;
+		}
+
+		return {
+			automationId: "",
+			type: "add_to_periodic_note",
+			transcriptionWritten,
+			outputs: [`add-to-periodic:${note.path}`],
+		};
+	}
+
+	/**
+	 * Locate the periodic note for a date. Daily notes honor the per-action filename pattern (or the
+	 * global daily path, or a frontmatter search); weekly→yearly resolve through periodicNotesPaths.
+	 */
+	private resolvePeriodicNote(
+		period: PeriodicPeriod,
+		dateStr: string,
+		action: AutomationAction
+	): TFile | null {
+		if (period === "daily") {
+			const pattern = action.dailyNoteNamePattern || this.settings.periodicNotesPaths.daily;
+			return pattern
+				? this.findNoteByPattern(dateStr, pattern)
+				: this.findDailyNoteByFrontmatter(dateStr);
+		}
+		const pathTemplate = this.settings.periodicNotesPaths[period];
+		if (!pathTemplate) {
+			console.log(`${LOG} add_to_periodic_note: no path configured for ${period} notes — set it in Settings → Notes.`);
+			return null;
+		}
+		return this.findNoteByPath(this.resolveDatePattern(pathTemplate, dateStr));
+	}
+
+	/**
+	 * Insert `inner` into `note` wrapped in this file's sentinel markers. When the markers already
+	 * exist, the block is replaced in place (idempotent re-transcription). When they don't but the
+	 * exact inner text is already present un-managed (e.g. an embed from before this feature), it's
+	 * left alone. Otherwise a fresh managed block is inserted at `position`.
+	 */
+	private async insertManagedEntry(
+		note: TFile,
+		markerId: string,
+		inner: string,
+		position: "top" | "bottom"
+	): Promise<"replaced" | "inserted" | "skipped"> {
+		const start = `<!-- ${PERIODIC_ENTRY_PREFIX}${markerId}:start -->`;
+		const end = `<!-- ${PERIODIC_ENTRY_PREFIX}${markerId}:end -->`;
+		const content = await this.app.vault.read(note);
+		const block = `${start}\n${inner}\n${end}`;
+
+		const hasMarkers = content.includes(start) && content.includes(end);
+		if (!hasMarkers && content.includes(inner.trim())) {
+			console.log(`${LOG} add_to_periodic_note: entry already present in ${note.path} — skipping`);
+			return "skipped";
+		}
+
+		const next = this.replaceManagedBlock(content, start, end, block, position);
+		if (next === content) return "skipped";
+		await this.app.vault.modify(note, next);
+		console.log(`${LOG} add_to_periodic_note: ${hasMarkers ? "replaced" : "inserted"} entry in ${note.path}`);
+		return hasMarkers ? "replaced" : "inserted";
 	}
 
 	/** Transcribe a full PDF with the configured provider. Returns null on failure / missing config. */
@@ -1120,70 +1131,6 @@ export class AutomationEngine {
 				}
 			}
 		}
-	}
-
-	private async runTranscribeToPeriodicNote(
-		vaultPath: string,
-		companionPath: string | null | undefined,
-		action: AutomationAction,
-		driveCreatedTime?: string,
-		transcription?: string
-	): Promise<void> {
-		if (!transcription) {
-			console.log(`${LOG} transcribe_to_periodic_note: no transcription available — skipping`);
-			return;
-		}
-
-		const fileName = vaultPath.split("/").pop();
-		if (!fileName) return;
-
-		const dateStr = this.resolveDate(fileName, driveCreatedTime);
-		if (!dateStr) {
-			console.log(`${LOG} transcribe_to_periodic_note: no date found for "${fileName}" — skipping`);
-			return;
-		}
-
-		const period = action.periodicNoteType ?? "daily";
-		const pathTemplate = this.settings.periodicNotesPaths[period];
-		if (!pathTemplate) {
-			console.log(`${LOG} transcribe_to_periodic_note: no path configured for ${period} notes — skipping`);
-			return;
-		}
-
-		const resolvedPath = this.resolveDatePattern(pathTemplate, dateStr);
-		const note = this.findNoteByPath(resolvedPath);
-		if (!note) {
-			console.log(`${LOG} transcribe_to_periodic_note: no ${period} note found for date ${dateStr} ("${resolvedPath}")`);
-			return;
-		}
-
-		const pdfStem = fileName.replace(/\.[^/.]+$/, "");
-		const embedTarget = this.resolveEmbedTarget(fileName, companionPath, action);
-		// {{embed}} goes through the same embedTemplate mechanism as embed_to_* actions,
-		// so "also embed the file" is templated the same way everywhere.
-		const embedLine = this.buildEmbedLine(action.embedTemplate, embedTarget, pdfStem, dateStr);
-
-		const header = `## Transcription from [[${pdfStem}]]\n\n{{transcription}}`;
-		let defaultTemplate: string;
-		if (action.embedFile) {
-			defaultTemplate =
-				action.transcriptionPosition === "above_embed"
-					? `\n${header}\n\n{{embed}}`
-					: `\n{{embed}}\n\n${header}`;
-		} else {
-			defaultTemplate = `\n${header}`;
-		}
-		const template = action.transcriptionTemplate ?? defaultTemplate;
-
-		const content = template
-			.replace(/\{\{transcription\}\}/g, transcription)
-			.replace(/\{\{title\}\}/g, pdfStem)
-			.replace(/\{\{date\}\}/g, dateStr)
-			.replace(/\{\{link\}\}/g, `[[${embedTarget}]]`)
-			.replace(/\{\{embed\}\}/g, embedLine);
-
-		console.log(`${LOG} transcribe_to_periodic_note: appending to ${note.path}`);
-		await this.insertEmbed(note, content, action.insertPosition);
 	}
 
 	private async createAndLinkNote(
@@ -1423,28 +1370,52 @@ export class AutomationEngine {
 	private resolveDate(fileName: string, driveCreatedTime?: string): string | null {
 		return (
 			this.extractDate(fileName) ??
+			resolvePageDate(fileName, parseContextFromFilename(fileName)).date ??
 			(driveCreatedTime ? this.extractDate(driveCreatedTime) ?? driveCreatedTime.substring(0, 10) : null)
 		);
 	}
 
+	/**
+	 * Standalone transcribe_to_companion action: OCR the PDF (on demand when no text was
+	 * handed in — this is what makes manual runs and re-syncs work) and write it to the
+	 * companion note's "## Transcription" section, creating the companion if none exists.
+	 */
 	private async runTranscribeToCompanion(
+		vaultPath: string,
 		companionPath: string | null | undefined,
 		action: AutomationAction,
 		transcription?: string
-	): Promise<void> {
-		if (!transcription) {
-			console.log(`${LOG} transcribe_to_companion: no transcription available — skipping`);
+	): Promise<AutomationOutput | void> {
+		const text = transcription ?? (await this.transcribeFullPdf(vaultPath)) ?? undefined;
+		if (!text) {
+			console.log(`${LOG} transcribe_to_companion: no transcription available for "${vaultPath}" — skipping`);
 			return;
 		}
-		if (!companionPath) {
-			console.log(`${LOG} transcribe_to_companion: no companion note for this file — skipping`);
-			return;
-		}
+		const written = await this.writeCompanionTranscription(vaultPath, companionPath, action, text);
+		return {
+			automationId: "",
+			type: "transcribe_to_companion",
+			transcriptionWritten: written,
+			outputs: written ? [`transcribe-to-companion:${vaultPath}`] : [],
+		};
+	}
 
-		const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
-		if (!(companionFile instanceof TFile)) {
-			console.log(`${LOG} transcribe_to_companion: companion note not found: ${companionPath}`);
-			return;
+	/**
+	 * Write `transcription` into a companion note's managed "## Transcription" section —
+	 * updating it in place when it already exists so re-transcription never duplicates.
+	 * Resolves the companion from `companionPath`, falling back to creating a sibling
+	 * "<stem>.md" next to the PDF when none is known. Returns true when text was written.
+	 */
+	private async writeCompanionTranscription(
+		vaultPath: string,
+		companionPath: string | null | undefined,
+		action: AutomationAction,
+		transcription: string
+	): Promise<boolean> {
+		const companionFile = await this.ensureCompanionNote(vaultPath, companionPath);
+		if (!companionFile) {
+			console.log(`${LOG} companion transcription: could not resolve or create a companion note for "${vaultPath}"`);
+			return false;
 		}
 
 		const content = await this.app.vault.read(companionFile);
@@ -1480,7 +1451,27 @@ export class AutomationEngine {
 		}
 
 		await this.app.vault.modify(companionFile, newContent);
-		console.log(`${LOG} transcribe_to_companion: transcription written to ${companionPath}`);
+		console.log(`${LOG} companion transcription: written to ${companionFile.path}`);
+		return true;
+	}
+
+	/**
+	 * Resolve the companion note for a PDF, creating a blank sibling "<stem>.md" next to it
+	 * when `companionPath` is unset or points at a missing file. Used when a companion-target
+	 * transcription needs somewhere to land but no companion exists yet.
+	 */
+	private async ensureCompanionNote(
+		vaultPath: string,
+		companionPath: string | null | undefined
+	): Promise<TFile | null> {
+		if (companionPath) {
+			const existing = this.app.vault.getAbstractFileByPath(companionPath);
+			if (existing instanceof TFile) return existing;
+		}
+		const dir = vaultPath.includes("/") ? vaultPath.slice(0, vaultPath.lastIndexOf("/") + 1) : "";
+		const stem = (vaultPath.split("/").pop() ?? vaultPath).replace(/\.[^/.]+$/, "");
+		const fallbackPath = `${dir}${stem}.md`;
+		return this.ensureNote(fallbackPath);
 	}
 
 	/**

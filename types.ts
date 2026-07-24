@@ -165,8 +165,10 @@ export interface PluginSettings {
 	pdfEmbedWindowHeight: number;
 	/** When true, add a clickable title bar to each PDF embed that collapses the embed, leaving the filename showing. */
 	pdfEmbedCollapsible: boolean;
+	/** When true (and pdfEmbedCollapsible is on), PDF embeds start collapsed by default; the user can expand each one. */
+	pdfEmbedCollapsedByDefault: boolean;
 
-	// Periodic notes paths (used by embed_to_weekly_note etc.)
+	// Periodic notes paths (used by add_to_periodic_note)
 	periodicNotesPaths: PeriodicNotesPaths;
 
 	// AI transcription
@@ -230,6 +232,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	pdfEmbedWindowed: false,
 	pdfEmbedWindowHeight: 400,
 	pdfEmbedCollapsible: false,
+	pdfEmbedCollapsedByDefault: false,
 	periodicNotesPaths: {
 		daily: "",
 		weekly: "",
@@ -263,17 +266,25 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 // ── Automations ───────────────────────────────────────────────────────────────
 
 export type AutomationActionType =
+	| "add_to_periodic_note"
+	| "append_to_note"
+	| "add_tag_to_companion"
+	| "link_to_matching_note"
+	| "transcribe_to_companion"
+	| "split_pages_to_daily_notes";
+
+/**
+ * Removed action types kept only so `migrateLegacySettings` can recognize and
+ * rewrite automations saved by older versions. Not selectable in the UI.
+ * `embed_to_*` and `transcribe_to_periodic_note` all fold into `add_to_periodic_note`.
+ */
+export type LegacyAutomationActionType =
 	| "embed_to_daily_note"
 	| "embed_to_weekly_note"
 	| "embed_to_monthly_note"
 	| "embed_to_quarterly_note"
 	| "embed_to_yearly_note"
-	| "append_to_note"
-	| "add_tag_to_companion"
-	| "link_to_matching_note"
-	| "transcribe_to_periodic_note"
-	| "transcribe_to_companion"
-	| "split_pages_to_daily_notes";
+	| "transcribe_to_periodic_note";
 
 export interface AutomationAction {
 	type: AutomationActionType;
@@ -290,15 +301,9 @@ export interface AutomationAction {
 	tagName?: string;
 	/** When true, embed the companion note instead of the PDF file. */
 	embedCompanion?: boolean;
-	/**
-	 * For embed_to_* actions: after embedding, transcribe the full PDF into the companion note's
-	 * `## Transcription` section. Requires a companion note and a configured transcription provider.
-	 */
+	/** @deprecated Legacy embed_to_* flag; read only by migrateLegacySettings → runTranscription + transcriptionTarget="companion". */
 	transcribeFullToCompanion?: boolean;
-	/**
-	 * For embed_to_* actions: insert a [[<periodic note basename>]] link into the companion note,
-	 * linking it back to the daily/weekly/etc. note the PDF was embedded into.
-	 */
+	/** @deprecated Legacy embed_to_* companion→periodic backlink; no longer honored (dropped in the add_to_periodic_note unification). */
 	companionLinkToPeriodicNote?: boolean;
 	/**
 	 * Template for the line inserted into the target note.
@@ -321,35 +326,42 @@ export interface AutomationAction {
 	matchOnAliases?: boolean;
 	/** For link_to_matching_note: also add a backlink in the companion note pointing to each matched note. */
 	bidirectionalLink?: boolean;
-	/** For transcribe_to_periodic_note: which periodic note type to append the transcription to. */
+	/** For add_to_periodic_note: which periodic note the entry (and optional transcription) is added to. */
 	periodicNoteType?: "daily" | "weekly" | "monthly" | "quarterly" | "yearly";
-	/** For transcribe_to_periodic_note: template for the content inserted. Supports {{transcription}}, {{title}}, {{date}}, {{link}}, {{embed}}. */
+	/**
+	 * For add_to_periodic_note: master switch — when true, OCR the PDF and make the
+	 * transcription available to the template / companion. When no transcription text
+	 * was handed in (manual runs, re-syncs), the action transcribes on demand.
+	 */
+	runTranscription?: boolean;
+	/**
+	 * For add_to_periodic_note: where the transcription text goes when runTranscription is on.
+	 * "periodic" → inserted into the periodic note via the template's {{transcription}} handle
+	 * (nothing is written if the handle is absent). "companion" → written to the companion note's
+	 * "## Transcription" section (companion created if missing); {{transcription}} in the periodic
+	 * template renders empty in this mode.
+	 */
+	transcriptionTarget?: "periodic" | "companion";
+	/**
+	 * Body of the companion note's "## Transcription" section, for transcribe_to_companion and
+	 * add_to_periodic_note with transcriptionTarget="companion". Supports {{transcription}}.
+	 * (Also read by migrateLegacySettings to seed the unified template.)
+	 */
 	transcriptionTemplate?: string;
-	/**
-	 * For transcribe_to_periodic_note: when true, also embed the PDF (or the companion note, if
-	 * embedCompanion is set) into the same periodic note via the {{embed}}/{{link}} placeholders —
-	 * the embed itself is built from embedTemplate, same as the embed_to_* actions.
-	 * Only affects the *default* transcriptionTemplate (see transcriptionPosition below); a custom
-	 * transcriptionTemplate can reference {{embed}} regardless of this flag.
-	 */
+	/** @deprecated Legacy transcribe_to_periodic_note flag; read only by migrateLegacySettings when synthesizing the unified template. */
 	embedFile?: boolean;
-	/**
-	 * For transcribe_to_periodic_note, when embedFile is true and transcriptionTemplate is left empty:
-	 * whether the transcription text is placed above or below the embed in the auto-built default.
-	 * Ignored once a custom transcriptionTemplate is set — order the {{embed}}/{{transcription}}
-	 * placeholders there instead.
-	 */
+	/** @deprecated Legacy transcribe_to_periodic_note ordering; read only by migrateLegacySettings when synthesizing the unified template. */
 	transcriptionPosition?: "above_embed" | "below_embed";
 	/**
-	 * For transcribe_to_companion (and transcribeFullToCompanion on embed_to_* actions): where the
+	 * For transcribe_to_companion / add_to_periodic_note (companion target): where the
 	 * "## Transcription" section is placed the first time it's inserted — "top" lands it right after
 	 * frontmatter (e.g. above a PDF embed placed later in the note), "bottom" (default) appends it at
 	 * the end. Once the section exists, later runs update it in place regardless of this setting.
 	 */
 	transcriptionInsertPosition?: "top" | "bottom";
 	/**
-	 * For transcribe_to_companion / transcribe_to_periodic_note: once the transcription has
-	 * actually been written for this run, delete the source PDF — trashed in the vault and
+	 * For transcribe_to_companion / add_to_periodic_note (with Run transcription on): once the
+	 * transcription has actually been written for this run, delete the source PDF — trashed in the vault and
 	 * trashed in Drive (recoverable ~30 days on both sides) — and strip any wikilinks/embeds
 	 * pointing at it left by other automations, since they'd otherwise point at a deleted file.
 	 * No-ops on runs where a transcription wasn't produced (e.g. skipped as already-run).
@@ -406,6 +418,12 @@ export interface AutomationOutput {
 	pageMappings?: Array<{ page: number; date: string | null; source: string }>;
 	/** Human-readable outputs (mirrors AutomationRunRecord.outputs). */
 	outputs?: string[];
+	/**
+	 * True when this run actually wrote a transcription somewhere. Used to gate
+	 * deleteFileAfterTranscription so a file is never deleted when OCR failed or the
+	 * target note wasn't found.
+	 */
+	transcriptionWritten?: boolean;
 }
 
 /** Per-file, in-memory accumulator letting later automations read earlier ones' results. */

@@ -30,7 +30,7 @@ import { checkDiskSpace } from "./sync/DiskSpaceCheck";
 import { lintAutomations } from "./automation/AutomationLinter";
 import { transcribeCurrentFile, openTranscribePickerForFile } from "./commands/TranscribeCurrentFile";
 import { runAudit, AuditModal } from "./commands/Audit";
-import { Automation, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
+import { Automation, AutomationAction, DEFAULT_SETTINGS, PluginSettings, SyncPair, SyncResult } from "./types";
 
 const LOG = "[DriveSync]";
 const PDF_EMBED_STYLE_ID = "drive-sync-pdf-embed-style";
@@ -686,6 +686,10 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		const pageMatch = raw.match(/#page=(\d+)/i);
 		const name = raw.replace(/#.*$/, "");
 		const label = pageMatch ? `${name} (p. ${pageMatch[1]})` : name;
+		// First enhancement of a fresh embed: start collapsed when that's the configured default.
+		if (this.settings.pdfEmbedCollapsedByDefault) {
+			embed.classList.add("drive-sync-pdf-collapsed");
+		}
 		const collapsed = embed.classList.contains("drive-sync-pdf-collapsed");
 
 		const bar = embed.createDiv({ cls: "drive-sync-pdf-bar" });
@@ -1112,6 +1116,67 @@ export default class DriveFolderSyncPlugin extends Plugin {
 				console.error(`${LOG} Failed to persist migration:`, e)
 			);
 		}
+
+		// Fold the old embed_to_* / transcribe_to_periodic_note actions into add_to_periodic_note.
+		if (this.migrateAutomationActions()) {
+			console.log(`${LOG} Migrated legacy automation actions to add_to_periodic_note`);
+			this.saveData(this.settings).catch((e) =>
+				console.error(`${LOG} Failed to persist automation migration:`, e)
+			);
+		}
+	}
+
+	/**
+	 * Rewrite automations saved with the removed action types onto the unified
+	 * `add_to_periodic_note`. Returns true when anything changed (so the caller persists).
+	 */
+	private migrateAutomationActions(): boolean {
+		const periodMap: Record<string, "daily" | "weekly" | "monthly" | "quarterly" | "yearly"> = {
+			embed_to_daily_note: "daily",
+			embed_to_weekly_note: "weekly",
+			embed_to_monthly_note: "monthly",
+			embed_to_quarterly_note: "quarterly",
+			embed_to_yearly_note: "yearly",
+		};
+		let changed = false;
+		for (const automation of this.settings.automations) {
+			const action = automation.action;
+			const type: string = action.type;
+			if (type in periodMap) {
+				action.type = "add_to_periodic_note";
+				action.periodicNoteType = periodMap[type];
+				// Old "also transcribe full PDF to companion" → companion-target transcription.
+				if (action.transcribeFullToCompanion) {
+					action.runTranscription = true;
+					action.transcriptionTarget = "companion";
+				}
+				changed = true;
+			} else if (type === "transcribe_to_periodic_note") {
+				action.type = "add_to_periodic_note";
+				action.periodicNoteType = action.periodicNoteType ?? "daily";
+				action.runTranscription = true;
+				action.transcriptionTarget = "periodic";
+				action.embedTemplate = this.synthesizePeriodicTemplate(action);
+				changed = true;
+			}
+		}
+		return changed;
+	}
+
+	/**
+	 * Build the single add_to_periodic_note template from a legacy transcribe_to_periodic_note's
+	 * fields: an explicit transcriptionTemplate wins; otherwise reproduce the old default, folding
+	 * in the {{embed}} when "Also embed the file" was on, ordered by the old transcriptionPosition.
+	 */
+	private synthesizePeriodicTemplate(action: AutomationAction): string {
+		if (action.transcriptionTemplate?.trim()) return action.transcriptionTemplate;
+		const header = "## Transcription from [[{{title}}]]\n\n{{transcription}}";
+		if (action.embedFile) {
+			return action.transcriptionPosition === "above_embed"
+				? `${header}\n\n{{embed}}`
+				: `{{embed}}\n\n${header}`;
+		}
+		return header;
 	}
 
 	private formatResult(result: SyncResult): string {

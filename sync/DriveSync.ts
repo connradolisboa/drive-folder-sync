@@ -133,7 +133,7 @@ export class DriveSync {
 			(a) =>
 				a.enabled &&
 				(a.action.type === "transcribe_to_companion" ||
-					a.action.type === "transcribe_to_periodic_note")
+					(a.action.type === "add_to_periodic_note" && a.action.runTranscription === true))
 		);
 
 		if (!this.settings.geminiEnabled && !hasTranscriptionAutomation) return null;

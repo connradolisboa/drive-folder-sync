@@ -5,6 +5,24 @@ import { AutomationDryRunModal } from "../ui/AutomationDryRunModal";
 
 type TabId = "account" | "sync" | "notes" | "automations" | "transcription" | "advanced";
 
+/**
+ * Stack a Setting vertically so its (often long) multi-line control — e.g. a template
+ * textarea — spans the full width below the description instead of being squeezed into
+ * the narrow right-hand control column.
+ */
+function stackSetting(setting: Setting): void {
+	setting.settingEl.style.display = "block";
+	const control = setting.settingEl.querySelector<HTMLElement>(".setting-item-control");
+	if (control) {
+		control.style.width = "100%";
+		control.style.paddingTop = "8px";
+		control.style.justifyContent = "flex-start";
+	}
+	setting.settingEl.querySelectorAll<HTMLTextAreaElement>("textarea").forEach((t) => {
+		t.style.width = "100%";
+	});
+}
+
 export class DriveSyncSettingTab extends PluginSettingTab {
 	private activeTab: TabId = "account";
 	private openCards = new Set<string>();
@@ -696,8 +714,27 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 					.onChange(async (val) => {
 						this.plugin.settings.pdfEmbedCollapsible = val;
 						await this.plugin.saveSettings();
+						collapseDefaultSetting.settingEl.toggle(val);
 					})
 			);
+
+		const collapseDefaultSetting = new Setting(el)
+			.setName("Default PDF embed state")
+			.setDesc(
+				"Whether PDF embeds start expanded or collapsed. Collapsed shows only the title bar until " +
+				"you click to expand each one. (This is the starting state, not remembered per embed.)"
+			)
+			.addDropdown((drop) =>
+				drop
+					.addOption("expanded",  "Expanded")
+					.addOption("collapsed", "Collapsed")
+					.setValue(this.plugin.settings.pdfEmbedCollapsedByDefault ? "collapsed" : "expanded")
+					.onChange(async (val) => {
+						this.plugin.settings.pdfEmbedCollapsedByDefault = val === "collapsed";
+						await this.plugin.saveSettings();
+					})
+			);
+		collapseDefaultSetting.settingEl.toggle(this.plugin.settings.pdfEmbedCollapsible);
 
 		// ── Conflict resolution ─────────────────────────────────────────────
 		el.createEl("h3", { text: "Conflict resolution" });
@@ -1375,7 +1412,7 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						name: `Automation ${this.plugin.settings.automations.length + 1}`,
 						enabled: true,
 						triggerFolderPath: "",
-						action: { type: "embed_to_daily_note", insertPosition: "bottom", dailyNoteNamePattern: "" },
+						action: { type: "add_to_periodic_note", insertPosition: "bottom", dailyNoteNamePattern: "", periodicNoteType: "daily" },
 					});
 					this.openCards.add(`automation-${id}`);
 					await this.plugin.saveSettings();
@@ -1885,25 +1922,21 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 			new Setting(bodyEl)
 				.setName("Action")
 				.setDesc(
-					"Periodic embeds insert a link into the matching periodic note (path configured in the Notes tab). " +
+					"add_to_periodic_note inserts an entry (built from one template) into the matching periodic " +
+					"note — daily/weekly/monthly/quarterly/yearly, path configured in the Notes tab — and can " +
+					"optionally run transcription, sending the text to that note or to the companion note. " +
 					"append_to_note appends to any named note. " +
 					"add_tag_to_companion adds a tag to the companion note's frontmatter. " +
 					"link_to_matching_note finds notes in a folder whose name contains all words of the PDF title and inserts an embed. " +
-					"transcribe_to_periodic_note appends the transcription to a periodic note (requires a transcription provider); " +
-					"turn on \"Also embed the file\" to embed the PDF into the same note too. " +
+					"transcribe_to_companion writes the transcription to the companion note only (no periodic note). " +
 					"split_pages_to_daily_notes OCRs each page of a multi-page PDF, reads the handwritten date on it, and inserts that page (as a PDF embed, its transcription, or both) into the matching daily note (requires Mistral OCR)."
 				)
 				.addDropdown((drop) =>
 					drop
-						.addOption("embed_to_daily_note",        "Embed to daily note")
-						.addOption("embed_to_weekly_note",       "Embed to weekly note")
-						.addOption("embed_to_monthly_note",      "Embed to monthly note")
-						.addOption("embed_to_quarterly_note",    "Embed to quarterly note")
-						.addOption("embed_to_yearly_note",       "Embed to yearly note")
+						.addOption("add_to_periodic_note",       "Add to periodic note")
 						.addOption("append_to_note",             "Append to note")
 						.addOption("add_tag_to_companion",       "Add tag to companion note")
 						.addOption("link_to_matching_note",      "Link to matching note")
-						.addOption("transcribe_to_periodic_note","Transcribe to periodic note")
 						.addOption("transcribe_to_companion",    "Transcribe to companion note")
 						.addOption("split_pages_to_daily_notes", "Split PDF pages to daily notes (handwritten date)")
 						.setValue(automation.action.type)
@@ -2074,10 +2107,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			// ── transcribe_to_periodic_note options ─────────────────────────
+			// ── add_to_periodic_note options ────────────────────────────────
 			const periodicNoteTypeSetting = new Setting(bodyEl)
 				.setName("Periodic note type")
-				.setDesc("Which periodic note to append the transcription to.")
+				.setDesc("Which periodic note the entry is added to. Paths are configured in the Notes tab.")
 				.addDropdown((drop) =>
 					drop
 						.addOption("daily",     "Daily")
@@ -2093,53 +2126,54 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			const embedFileSetting = new Setting(bodyEl)
-				.setName("Also embed the file")
+			const runTranscriptionSetting = new Setting(bodyEl)
+				.setName("Run transcription")
 				.setDesc(
-					"Also insert an embed of the PDF (or companion note, with \"Embed companion note instead of file\" below) " +
-					"into the same periodic note, formatted using the Embed template below. Off by default so existing " +
-					"transcribe-only automations keep their current output."
+					"OCR the PDF and make its text available to the template / companion. When no transcription " +
+					"was produced during sync (manual runs, re-syncs), it transcribes on demand. Requires a " +
+					"transcription provider (Settings → Transcription)."
 				)
 				.addToggle((toggle) =>
 					toggle
-						.setValue(automation.action.embedFile ?? false)
+						.setValue(automation.action.runTranscription ?? false)
 						.onChange(async (val) => {
-							this.plugin.settings.automations[i].action.embedFile = val;
+							this.plugin.settings.automations[i].action.runTranscription = val;
 							await this.plugin.saveSettings();
 							updateActionFieldVisibility(this.plugin.settings.automations[i].action.type);
 						})
 				);
 
-			const transcriptionPositionSetting = new Setting(bodyEl)
-				.setName("Transcription position")
+			const transcriptionTargetSetting = new Setting(bodyEl)
+				.setName("Transcription goes to")
 				.setDesc(
-					"Where the transcription text sits relative to the embed, within the block inserted at " +
-					"\"Insert position\" below — it never jumps above that block to the top of the whole note. " +
-					"Only affects the default template; ignored once a custom Transcription template is set."
+					"Where the transcription is written. \"Periodic note\" inserts it via the {{transcription}} " +
+					"placeholder in the Template below (omit the placeholder and nothing is inserted). " +
+					"\"Companion note\" writes it to the companion's \"## Transcription\" section, creating the " +
+					"companion note if none exists yet."
 				)
 				.addDropdown((drop) =>
 					drop
-						.addOption("below_embed", "Below the embed")
-						.addOption("above_embed", "Above the embed")
-						.setValue(automation.action.transcriptionPosition ?? "below_embed")
+						.addOption("periodic",  "Periodic note")
+						.addOption("companion", "Companion note")
+						.setValue(automation.action.transcriptionTarget ?? "periodic")
 						.onChange(async (val) => {
-							this.plugin.settings.automations[i].action.transcriptionPosition =
-								val as "above_embed" | "below_embed";
+							this.plugin.settings.automations[i].action.transcriptionTarget =
+								val as "periodic" | "companion";
 							await this.plugin.saveSettings();
+							updateActionFieldVisibility(this.plugin.settings.automations[i].action.type);
 						})
 				);
 
 			const transcriptionTemplateSetting = new Setting(bodyEl)
-				.setName("Transcription template")
+				.setName("Companion transcription template")
 				.setDesc(
-					"Template for the content inserted into the periodic note. " +
-					"Placeholders: {{transcription}}, {{title}}, {{date}}, {{link}} → [[file]], " +
-					"{{embed}} → the embed, built from the Embed template below. " +
-					"Leave empty to use the default (which honors \"Also embed the file\" and \"Transcription position\" above)."
+					"Body of the companion note's \"## Transcription\" section (used by \"Transcribe to companion\" " +
+					"and by \"Add to periodic note\" when the transcription goes to the companion). " +
+					"Placeholder: {{transcription}}. Leave empty to insert the transcription as-is."
 				)
 				.addTextArea((text) => {
 					text
-						.setPlaceholder("## Transcription from [[{{title}}]]\n\n{{transcription}}")
+						.setPlaceholder("{{transcription}}")
 						.setValue(automation.action.transcriptionTemplate ?? "")
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].action.transcriptionTemplate =
@@ -2147,10 +2181,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 							await this.plugin.saveSettings();
 						});
 					text.inputEl.rows = 4;
-					text.inputEl.style.width = "100%";
 					text.inputEl.style.fontFamily = "monospace";
 					text.inputEl.style.resize = "vertical";
 				});
+			stackSetting(transcriptionTemplateSetting);
 
 			const deleteAfterTranscriptionSetting = new Setting(bodyEl)
 				.setName("Delete file after transcription")
@@ -2237,10 +2271,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 							await this.plugin.saveSettings();
 						});
 					text.inputEl.rows = 4;
-					text.inputEl.style.width = "100%";
 					text.inputEl.style.fontFamily = "monospace";
 					text.inputEl.style.resize = "vertical";
 				});
+			stackSetting(pageEmbedTemplateSetting);
 
 			const pageIndexEnabledSetting = new Setting(bodyEl)
 				.setName("Write page-index note")
@@ -2315,12 +2349,13 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				);
 
 			const embedTemplateSetting = new Setting(bodyEl)
-				.setName("Embed template")
+				.setName("Template")
 				.setDesc(
-					"Template for the content inserted into the note. Supports multiple lines. " +
-					"Leave empty for the default (![[file]]). " +
-					"Placeholders: {{embed}} → ![[target]], {{link}} → [[target]], " +
-					"{{target}} → embed target name, {{title}} → PDF stem (no extension), {{date}} → YYYY-MM-DD."
+					"The single block inserted into the periodic note (or the target note). Supports multiple lines. " +
+					"Leave empty for the default (![[file]]). Placeholders: {{embed}} → ![[target]], " +
+					"{{link}} → [[target]], {{target}} → embed target name, {{title}} → PDF stem (no extension), " +
+					"{{date}} → YYYY-MM-DD, {{transcription}} → the transcription text (only when Run transcription " +
+					"is on and its target is the periodic note)."
 				)
 				.addTextArea((text) => {
 					text
@@ -2332,26 +2367,10 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 							await this.plugin.saveSettings();
 						});
 					text.inputEl.rows = 4;
-					text.inputEl.style.width = "100%";
 					text.inputEl.style.fontFamily = "monospace";
 					text.inputEl.style.resize = "vertical";
 				});
-
-			const transcribeToCompanionSetting = new Setting(bodyEl)
-				.setName("Also transcribe full PDF to companion")
-				.setDesc(
-					"After embedding, transcribe the whole PDF into the companion note's \"## Transcription\" section. " +
-					"Requires a companion note and a configured transcription provider (Settings → Transcription)."
-				)
-				.addToggle((toggle) =>
-					toggle
-						.setValue(automation.action.transcribeFullToCompanion ?? false)
-						.onChange(async (val) => {
-							this.plugin.settings.automations[i].action.transcribeFullToCompanion = val;
-							await this.plugin.saveSettings();
-							updateActionFieldVisibility(this.plugin.settings.automations[i].action.type);
-						})
-				);
+			stackSetting(embedTemplateSetting);
 
 			const transcriptionInsertPositionSetting = new Setting(bodyEl)
 				.setName("Transcription section position")
@@ -2369,21 +2388,6 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						.onChange(async (val) => {
 							this.plugin.settings.automations[i].action.transcriptionInsertPosition =
 								val as "top" | "bottom";
-							await this.plugin.saveSettings();
-						})
-				);
-
-			const companionLinkSetting = new Setting(bodyEl)
-				.setName("Link companion back to the note")
-				.setDesc(
-					"Insert a [[wikilink]] to the daily/periodic note into the companion note " +
-					"(e.g. [[2026-06-06 Friday]]). Requires a companion note."
-				)
-				.addToggle((toggle) =>
-					toggle
-						.setValue(automation.action.companionLinkToPeriodicNote ?? false)
-						.onChange(async (val) => {
-							this.plugin.settings.automations[i].action.companionLinkToPeriodicNote = val;
 							await this.plugin.saveSettings();
 						})
 				);
@@ -2446,33 +2450,24 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 						})
 				);
 
-			const isEmbedType = (type: AutomationActionType) =>
-				type === "embed_to_daily_note" ||
-				type === "embed_to_weekly_note" ||
-				type === "embed_to_monthly_note" ||
-				type === "embed_to_quarterly_note" ||
-				type === "embed_to_yearly_note" ||
-				type === "append_to_note" ||
-				type === "link_to_matching_note" ||
-				type === "transcribe_to_periodic_note";
-
 			const updateActionFieldVisibility = (type: AutomationActionType) => {
+				const action = this.plugin.settings.automations[i].action;
+				const isAddPeriodic = type === "add_to_periodic_note";
 				const isLinkToNote = type === "link_to_matching_note";
-				const isTranscribePeriodicAction = type === "transcribe_to_periodic_note";
 				const isTranscribeCompanionAction = type === "transcribe_to_companion";
-				const isAnyTranscribeAction = isTranscribePeriodicAction || isTranscribeCompanionAction;
 				const isSplitPages = type === "split_pages_to_daily_notes";
-				const createEnabled = this.plugin.settings.automations[i].action.createNoteIfNotFound ?? false;
-				const embedFileOn = this.plugin.settings.automations[i].action.embedFile ?? false;
-				const isPeriodicEmbed =
-					type === "embed_to_daily_note" ||
-					type === "embed_to_weekly_note" ||
-					type === "embed_to_monthly_note" ||
-					type === "embed_to_quarterly_note" ||
-					type === "embed_to_yearly_note";
-				const transcribeFullToCompanionOn = this.plugin.settings.automations[i].action.transcribeFullToCompanion ?? false;
-				dailyPatternSetting.settingEl.toggle(type === "embed_to_daily_note" || isSplitPages);
-				targetNoteSetting.settingEl.toggle(type === "append_to_note");
+				const isAppend = type === "append_to_note";
+				const createEnabled = action.createNoteIfNotFound ?? false;
+				const runTx = action.runTranscription ?? false;
+				const target = action.transcriptionTarget ?? "periodic";
+				const periodicType = action.periodicNoteType ?? "daily";
+				// A transcription actually lands in the companion note.
+				const companionTranscription = isTranscribeCompanionAction || (isAddPeriodic && runTx && target === "companion");
+				// The "## Transcription section" and delete-after apply whenever transcription runs.
+				const runsTranscription = isTranscribeCompanionAction || (isAddPeriodic && runTx);
+
+				dailyPatternSetting.settingEl.toggle((isAddPeriodic && periodicType === "daily") || isSplitPages);
+				targetNoteSetting.settingEl.toggle(isAppend);
 				tagNameSetting.settingEl.toggle(type === "add_tag_to_companion");
 				searchFolderSetting.settingEl.toggle(isLinkToNote);
 				createNoteIfNotFoundSetting.settingEl.toggle(isLinkToNote);
@@ -2481,39 +2476,27 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 				matchThresholdSetting.settingEl.toggle(isLinkToNote);
 				matchAliasesSetting.settingEl.toggle(isLinkToNote);
 				bidirectionalLinkSetting.settingEl.toggle(isLinkToNote);
-				periodicNoteTypeSetting.settingEl.toggle(isTranscribePeriodicAction);
-				embedFileSetting.settingEl.toggle(isTranscribePeriodicAction);
-				transcriptionPositionSetting.settingEl.toggle(isTranscribePeriodicAction && embedFileOn);
-				transcriptionTemplateSetting.settingEl.toggle(isAnyTranscribeAction);
-				deleteAfterTranscriptionSetting.settingEl.toggle(isAnyTranscribeAction);
+				periodicNoteTypeSetting.settingEl.toggle(isAddPeriodic);
+				runTranscriptionSetting.settingEl.toggle(isAddPeriodic);
+				transcriptionTargetSetting.settingEl.toggle(isAddPeriodic && runTx);
+				transcriptionTemplateSetting.settingEl.toggle(companionTranscription);
+				deleteAfterTranscriptionSetting.settingEl.toggle(runsTranscription);
+				transcriptionInsertPositionSetting.settingEl.toggle(companionTranscription);
 				createDailyNoteSetting.settingEl.toggle(isSplitPages);
 				dailyNoteTemplateSetting.settingEl.toggle(isSplitPages);
 				pageContentModeSetting.settingEl.toggle(isSplitPages);
 				pageEmbedTemplateSetting.settingEl.toggle(isSplitPages);
 				pageIndexEnabledSetting.settingEl.toggle(isSplitPages);
-				const pageIndexOn = this.plugin.settings.automations[i].action.pageIndexEnabled ?? false;
+				const pageIndexOn = action.pageIndexEnabled ?? false;
 				pageIndexPathSetting.settingEl.toggle(isSplitPages && pageIndexOn);
 				pageIndexHeadingSetting.settingEl.toggle(isSplitPages && pageIndexOn);
-				const isAppend = type === "append_to_note";
 				includeResultsIdsSetting.settingEl.toggle(isAppend);
 				includeResultsTypesSetting.settingEl.toggle(isAppend);
 				includeResultsHeadingSetting.settingEl.toggle(isAppend);
 				includeResultsTemplateSetting.settingEl.toggle(isAppend);
-				insertPositionSetting.settingEl.toggle(isEmbedType(type) || isSplitPages);
-				embedCompanionSetting.settingEl.toggle(
-					(isEmbedType(type) && !isLinkToNote && !isAnyTranscribeAction) ||
-					(isTranscribePeriodicAction && embedFileOn)
-				);
-				embedTemplateSetting.settingEl.toggle(
-					(isEmbedType(type) && !isAnyTranscribeAction) ||
-					(isTranscribePeriodicAction && embedFileOn)
-				);
-				// Embed extras only apply to the embed_to_<period> actions.
-				transcribeToCompanionSetting.settingEl.toggle(isPeriodicEmbed);
-				transcriptionInsertPositionSetting.settingEl.toggle(
-					isTranscribeCompanionAction || (isPeriodicEmbed && transcribeFullToCompanionOn)
-				);
-				companionLinkSetting.settingEl.toggle(isPeriodicEmbed);
+				insertPositionSetting.settingEl.toggle(isAddPeriodic || isAppend || isLinkToNote || isSplitPages);
+				embedCompanionSetting.settingEl.toggle(isAddPeriodic || isAppend);
+				embedTemplateSetting.settingEl.toggle(isAddPeriodic || isAppend || isLinkToNote);
 			};
 			updateActionFieldVisibility(automation.action.type);
 		});

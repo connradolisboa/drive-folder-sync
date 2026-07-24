@@ -59,34 +59,29 @@ export function lintAutomations(
 		if (action.pageContentMode && action.type !== "split_pages_to_daily_notes") {
 			push("warn", "pageContentMode only applies to split_pages_to_daily_notes — it will be ignored here.");
 		}
-		if (action.embedFile && action.type !== "transcribe_to_periodic_note") {
-			push("warn", "embedFile only applies to transcribe_to_periodic_note — it will be ignored here.");
-		}
-		if (action.transcriptionPosition && !(action.type === "transcribe_to_periodic_note" && action.embedFile)) {
-			push("warn", "transcriptionPosition only applies when transcribe_to_periodic_note has \"Also embed the file\" on — it will be ignored here.");
-		}
-		if (action.transcriptionPosition && action.transcriptionTemplate?.trim()) {
-			push("warn", "transcriptionPosition is ignored once a custom Transcription template is set — order {{embed}}/{{transcription}} in the template instead.");
-		}
-		const isPeriodicEmbed =
-			action.type === "embed_to_daily_note" ||
-			action.type === "embed_to_weekly_note" ||
-			action.type === "embed_to_monthly_note" ||
-			action.type === "embed_to_quarterly_note" ||
-			action.type === "embed_to_yearly_note";
+		const isAddToPeriodic = action.type === "add_to_periodic_note";
+		const runsTranscription =
+			action.type === "transcribe_to_companion" ||
+			(isAddToPeriodic && action.runTranscription === true);
+
 		if (
 			action.transcriptionInsertPosition &&
 			action.type !== "transcribe_to_companion" &&
-			!(isPeriodicEmbed && action.transcribeFullToCompanion)
+			!(isAddToPeriodic && action.runTranscription && action.transcriptionTarget === "companion")
 		) {
-			push("warn", "transcriptionInsertPosition only applies to transcribe_to_companion, or an embed action with \"Also transcribe full PDF to companion\" on — it will be ignored here.");
+			push("warn", "transcriptionInsertPosition only applies to transcribe_to_companion, or an add-to-periodic-note action transcribing to a companion — it will be ignored here.");
 		}
+		if (action.deleteFileAfterTranscription && !runsTranscription) {
+			push("warn", "deleteFileAfterTranscription only applies when a transcription actually runs (transcribe_to_companion, or add-to-periodic-note with Run transcription on) — it will be ignored here.");
+		}
+		// Run transcription → periodic, but the template can't place the text.
 		if (
-			action.deleteFileAfterTranscription &&
-			action.type !== "transcribe_to_companion" &&
-			action.type !== "transcribe_to_periodic_note"
+			isAddToPeriodic &&
+			action.runTranscription &&
+			(action.transcriptionTarget ?? "periodic") === "periodic" &&
+			!(action.embedTemplate ?? "").includes("{{transcription}}")
 		) {
-			push("warn", "deleteFileAfterTranscription only applies to transcribe_to_companion or transcribe_to_periodic_note — it will be ignored here.");
+			push("warn", "Run transcription is on with target \"periodic note\", but the template has no {{transcription}} placeholder — the transcription won't be inserted. Add {{transcription}} to the template, or switch the target to the companion note.");
 		}
 		if (
 			action.pageContentMode &&
