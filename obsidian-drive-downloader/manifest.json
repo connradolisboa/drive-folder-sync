@@ -1,0 +1,10 @@
+{
+  "id": "drive-downloader",
+  "name": "Drive Downloader",
+  "version": "1.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Download and synchronize PDF files from Google Drive into an Obsidian vault.",
+  "author": "connrado",
+  "authorUrl": "",
+  "isDesktopOnly": true
+}

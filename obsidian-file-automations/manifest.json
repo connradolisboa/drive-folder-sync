@@ -1,0 +1,10 @@
+{
+  "id": "file-automations",
+  "name": "File Automations",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Run companion-note, PDF transcription, periodic-note, and PDF display automations independently of any downloader.",
+  "author": "connrado",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
