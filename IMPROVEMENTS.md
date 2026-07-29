@@ -162,7 +162,15 @@ For tracked files (those present in the manifest):
 - [x] Run the same automation a second time on the same file → it runs again (no manifest = no matrix). This is intentional; document it in `AutomationEngine` as a comment.
 - [x] On a Drive-tracked file, the same flow respects the matrix unless force is set.
 
-**Decisions made:** Phase 9 was implemented in the `PHASE 9` commit; the checkboxes were ticked retroactively after confirming the code (`runForFileAdHoc`, `createForArbitraryFile`, the three command-palette entries) matches the spec. The §7.5 / §8.4 / §9.5 verification boxes were confirmed by code review, not a live Obsidian run.
+### 9.6 Automatically run for vault-side PDF changes
+
+- [x] Listen for PDF `create`, `modify`, and `rename` events and debounce duplicate filesystem events.
+- [x] Run every enabled automation whose trigger-folder and scope rules match, including for files not tracked by PDF Manager.
+- [x] Suppress vault events caused by PDF Manager's own downloads so the normal sync pipeline remains single-run.
+- [x] Keep vault mtimes out of the Drive automation-run matrix.
+- [x] Update the Automations settings description so "watched folder" behavior is explicit.
+
+**Decisions made:** Phase 9 was implemented in the `PHASE 9` commit; the checkboxes were ticked retroactively after confirming the code (`runForFileAdHoc`, `createForArbitraryFile`, the three command-palette entries) matches the spec. The §7.5 / §8.4 / §9.5 verification boxes were confirmed by code review, not a live Obsidian run. Vault-side automatic runs are limited to PDFs and do not honor "Delete file after transcription", because that option also requires deleting the Drive copy through the sync pipeline.
 
 **Files:** `automation/AutomationEngine.ts`, `sync/CompanionNoteManager.ts`, `main.ts`, plus the right-click hooks added in Phase 8.
 

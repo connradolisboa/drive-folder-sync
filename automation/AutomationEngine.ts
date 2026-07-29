@@ -29,6 +29,12 @@ export interface RunForFileOptions {
 	force?: boolean;
 	/** When true, skip the trigger-folder filter and consider every active automation a candidate. */
 	ignoreFolderTrigger?: boolean;
+	/**
+	 * When false, a matching "delete after transcription" action may write its
+	 * transcription but must not prepare the source for deletion. Vault-side
+	 * change events use this because they have no authority to remove a Drive copy.
+	 */
+	allowDeleteRequest?: boolean;
 }
 
 export interface RunForFileResult {
@@ -177,6 +183,7 @@ export class AutomationEngine {
 			driveModifiedTime,
 			force = false,
 			ignoreFolderTrigger = false,
+			allowDeleteRequest = true,
 		} = opts;
 
 		const matching = this.settings.automations.filter(
@@ -191,12 +198,13 @@ export class AutomationEngine {
 		if (companionPath) {
 			const companionFile = this.app.vault.getAbstractFileByPath(companionPath);
 			if (companionFile instanceof TFile) {
-				const cache = this.app.metadataCache.getFileCache(companionFile);
-				const fm = cache?.frontmatter;
-				if (fm?.["drive-sync-skip-all"] === true) skipAll = true;
-				if (Array.isArray(fm?.["drive-sync-skip-automations"])) {
-					skipList = fm["drive-sync-skip-automations"] as string[];
-				}
+					const cache = this.app.metadataCache.getFileCache(companionFile);
+					const fm = cache?.frontmatter;
+					if (fm?.["drive-sync-skip-all"] === true) skipAll = true;
+					const skippedAutomations = fm?.["drive-sync-skip-automations"];
+					if (Array.isArray(skippedAutomations)) {
+						skipList = skippedAutomations as string[];
+					}
 			}
 		}
 
@@ -247,7 +255,11 @@ export class AutomationEngine {
 						result: "success",
 					});
 				}
-				if (automation.action.deleteFileAfterTranscription && output?.transcriptionWritten) {
+				if (
+					allowDeleteRequest &&
+					automation.action.deleteFileAfterTranscription &&
+					output?.transcriptionWritten
+				) {
 					deleteRequested = true;
 				}
 			} catch (e) {
@@ -271,6 +283,50 @@ export class AutomationEngine {
 		}
 
 		return { deleteRequested };
+	}
+
+	/** True when at least one enabled automation's folder rule matches this vault path. */
+	hasMatchingAutomation(vaultPath: string): boolean {
+		return this.settings.automations.some(
+			(automation) => automation.enabled && this.matchesTrigger(automation, vaultPath)
+		);
+	}
+
+	/**
+	 * Run every folder-matched automation after a PDF was created or modified in
+	 * the vault by something other than PDF Manager.
+	 *
+	 * The local file mtime is deliberately not written into the Drive-version
+	 * decision matrix. A subsequent Drive sync must continue comparing automation
+	 * history with Drive's modifiedTime, not a vault filesystem timestamp.
+	 */
+	async runForVaultChange(vaultPath: string): Promise<RunForFileResult> {
+		const file = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (!(file instanceof TFile)) return { deleteRequested: false };
+
+		const tracked = this.manifest?.findByVaultPath(vaultPath)?.[1];
+		let companionPath = tracked?.companionPath ?? null;
+
+		// Untracked PDFs commonly use a sibling note as their companion. Supplying
+		// it here also makes the per-file frontmatter opt-out work for those PDFs.
+		if (!companionPath) {
+			const dir = vaultPath.includes("/")
+				? vaultPath.slice(0, vaultPath.lastIndexOf("/") + 1)
+				: "";
+			const stem = file.name.replace(/\.[^/.]+$/, "");
+			const siblingPath = `${dir}${stem}.md`;
+			if (this.app.vault.getAbstractFileByPath(siblingPath) instanceof TFile) {
+				companionPath = siblingPath;
+			}
+		}
+
+		return this.runForFile({
+			vaultPath,
+			companionPath,
+			driveCreatedTime: tracked?.driveCreatedTime ?? new Date(file.stat.ctime).toISOString(),
+			force: true,
+			allowDeleteRequest: false,
+		});
 	}
 
 	/**
@@ -362,13 +418,14 @@ export class AutomationEngine {
 				if (companionFile instanceof TFile) {
 					const cache = this.app.metadataCache.getFileCache(companionFile);
 					const fm = cache?.frontmatter;
-					if (fm?.["drive-sync-skip-all"] === true) {
-						return { ran: false, skippedReason: "drive-sync-skip-all: true" };
-					}
-					if (Array.isArray(fm?.["drive-sync-skip-automations"]) &&
-						(fm["drive-sync-skip-automations"] as string[]).includes(automationId)) {
-						return { ran: false, skippedReason: "in drive-sync-skip-automations" };
-					}
+						if (fm?.["drive-sync-skip-all"] === true) {
+							return { ran: false, skippedReason: "drive-sync-skip-all: true" };
+						}
+						const skippedAutomations = fm?.["drive-sync-skip-automations"];
+						if (Array.isArray(skippedAutomations) &&
+							(skippedAutomations as string[]).includes(automationId)) {
+							return { ran: false, skippedReason: "in drive-sync-skip-automations" };
+						}
 				}
 			}
 		} else {

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Vault-wide automation triggers** — PDFs created, modified, or moved into an
+  automation's watched folder now run matching automations even when the files
+  were added by Obsidian Sync, Syncthing, another plugin, or manually. PDF
+  Manager's own downloads are suppressed from this listener to avoid duplicate runs.
 - **Split journal pages to daily notes** — a new `split_pages_to_daily_notes` automation
   action. Per-page OCR (Mistral) reads the handwritten date at the top of each page of a
   multi-page PDF and embeds that exact page (`![[file.pdf#page=N]]`) into the matching daily

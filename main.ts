@@ -57,6 +57,14 @@ export default class DriveFolderSyncPlugin extends Plugin {
 	private syncLogger: SyncLogger;
 	private syncActivityLog: SyncActivityLog;
 	private syncing = false;
+	/** Debounced vault-side PDF changes waiting to run matching automations. */
+	private vaultAutomationTimers = new Map<string, number>();
+	/** Last vault version handled in this session, keyed as "mtime:size". */
+	private vaultAutomationFingerprints = new Map<string, string>();
+	private vaultAutomationsRunning = new Set<string>();
+	private vaultAutomationsPending = new Set<string>();
+	/** Paths PDF Manager is about to write; their vault events must not double-run automations. */
+	private recentlyDownloadedPaths = new Map<string, number>();
 	/** Watches for PDF embeds appearing in the DOM so collapse bars can be (re)attached. */
 	private pdfEmbedObserver: MutationObserver | null = null;
 	private pdfSweepScheduled = false;
@@ -92,7 +100,11 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		this.cacheManager = this.settings.downloadCacheEnabled
 			? new CacheManager(this.app, this.settings.downloadCacheMaxMb * 1024 * 1024)
 			: undefined;
-		const downloader = new DownloadManager(this.app, this.cacheManager);
+		const downloader = new DownloadManager(
+			this.app,
+			this.cacheManager,
+			(vaultPath) => this.markPdfManagerDownload(vaultPath)
+		);
 		this.heavyWorker = this.settings.offThreadHashing ? new HeavyWorkerClient() : undefined;
 		this.recycle = new Recycle(this.app, this.bus);
 		this.errorReporter = new ErrorReporter(this.settings, this.manifest.version);
@@ -413,14 +425,32 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		// Phase 12.3 — show the changelog once after an update.
 		this.maybeShowChangelog();
 
-		// Heal manifest when user manually moves/renames a synced file in the vault
+		// Run matching automations for PDFs created or changed by Obsidian Sync,
+		// Syncthing, another plugin, or a manual filesystem operation.
+		this.registerEvent(
+			this.app.vault.on("create", (file) => {
+				if (file instanceof TFile) this.scheduleVaultAutomations(file, "created");
+			})
+		);
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile) this.scheduleVaultAutomations(file, "modified");
+			})
+		);
+
+		// Heal manifest when user manually moves/renames a synced file in the vault,
+		// and treat a PDF moved into a watched folder as a new automation candidate.
 		this.registerEvent(
 			this.app.vault.on("rename", async (file, oldPath) => {
+				this.clearVaultAutomationState(oldPath);
 				const healed = this.manifestStore.healRename(oldPath, file.path);
 				if (healed) {
 					await this.manifestStore.save().catch((e) =>
 						console.error(`${LOG} Failed to save manifest after rename heal:`, e)
 					);
+				}
+				if (file instanceof TFile && !this.syncing) {
+					this.scheduleVaultAutomations(file, "renamed");
 				}
 			})
 		);
@@ -428,6 +458,7 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		// Detect user vault-side deletions — mark manifest entries so re-sync is skipped
 		this.registerEvent(
 			this.app.vault.on("delete", async (file) => {
+				this.clearVaultAutomationState(file.path);
 				const marked = this.manifestStore.markUserDeleted(file.path);
 				if (marked) {
 					console.log(`${LOG} User deleted tracked file: ${file.path}`);
@@ -565,6 +596,8 @@ export default class DriveFolderSyncPlugin extends Plugin {
 
 	onunload() {
 		console.log(`${LOG} Unloading plugin — stopping scheduler`);
+		for (const timer of this.vaultAutomationTimers.values()) window.clearTimeout(timer);
+		this.vaultAutomationTimers.clear();
 		this.scheduler.stop();
 		this.bus?.clear();
 		this.heavyWorker?.terminate();
@@ -572,6 +605,91 @@ export default class DriveFolderSyncPlugin extends Plugin {
 		this.stopPdfEmbedObserver();
 		document.getElementById(PDF_EMBED_STYLE_ID)?.remove();
 		this.removeAllPdfEmbedBars();
+	}
+
+	/** Suppress the vault create/modify events emitted by PDF Manager's own download. */
+	private markPdfManagerDownload(vaultPath: string): void {
+		const now = Date.now();
+		for (const [path, until] of this.recentlyDownloadedPaths) {
+			if (until < now) this.recentlyDownloadedPaths.delete(path);
+		}
+		this.recentlyDownloadedPaths.set(vaultPath, now + 2_000);
+	}
+
+	private wasRecentlyDownloadedByPdfManager(vaultPath: string): boolean {
+		const until = this.recentlyDownloadedPaths.get(vaultPath);
+		if (until === undefined) return false;
+		if (Date.now() <= until) return true;
+		this.recentlyDownloadedPaths.delete(vaultPath);
+		return false;
+	}
+
+	private clearVaultAutomationState(vaultPath: string): void {
+		const timer = this.vaultAutomationTimers.get(vaultPath);
+		if (timer !== undefined) window.clearTimeout(timer);
+		this.vaultAutomationTimers.delete(vaultPath);
+		this.vaultAutomationFingerprints.delete(vaultPath);
+		this.vaultAutomationsPending.delete(vaultPath);
+		this.recentlyDownloadedPaths.delete(vaultPath);
+	}
+
+	private scheduleVaultAutomations(file: TFile, reason: "created" | "modified" | "renamed"): void {
+		if (file.extension.toLowerCase() !== "pdf") return;
+		if (this.wasRecentlyDownloadedByPdfManager(file.path)) {
+			console.log(`${LOG} Ignoring vault ${reason} event from PDF Manager download: ${file.path}`);
+			return;
+		}
+		if (!this.automationEngine.hasMatchingAutomation(file.path)) return;
+
+		const previous = this.vaultAutomationTimers.get(file.path);
+		if (previous !== undefined) window.clearTimeout(previous);
+
+		const path = file.path;
+		const timer = window.setTimeout(() => {
+			this.vaultAutomationTimers.delete(path);
+			void this.runVaultAutomationsForChange(path, reason);
+		}, 750);
+		this.vaultAutomationTimers.set(path, timer);
+	}
+
+	private async runVaultAutomationsForChange(
+		vaultPath: string,
+		reason: "created" | "modified" | "renamed"
+	): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(vaultPath);
+		if (!(file instanceof TFile) || file.extension.toLowerCase() !== "pdf") return;
+		if (!this.automationEngine.hasMatchingAutomation(vaultPath)) return;
+
+		const fingerprint = `${file.stat.mtime}:${file.stat.size}`;
+		if (this.vaultAutomationFingerprints.get(vaultPath) === fingerprint) return;
+
+		if (this.vaultAutomationsRunning.has(vaultPath)) {
+			this.vaultAutomationsPending.add(vaultPath);
+			return;
+		}
+
+		this.vaultAutomationsRunning.add(vaultPath);
+		// Record before the potentially long transcription call. If several identical
+		// filesystem events arrive during OCR, they must still collapse into one run.
+		this.vaultAutomationFingerprints.set(vaultPath, fingerprint);
+		console.log(`${LOG} Vault PDF ${reason}; running matching automations: ${vaultPath}`);
+
+		try {
+			await this.automationEngine.runForVaultChange(vaultPath);
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			console.error(`${LOG} Vault-change automations failed for "${vaultPath}":`, e);
+			this.bus?.emit("error", {
+				message: `Vault-change automations failed for "${vaultPath}": ${message}`,
+				context: "vault-automation",
+			});
+		} finally {
+			this.vaultAutomationsRunning.delete(vaultPath);
+			if (this.vaultAutomationsPending.delete(vaultPath)) {
+				const current = this.app.vault.getAbstractFileByPath(vaultPath);
+				if (current instanceof TFile) this.scheduleVaultAutomations(current, "modified");
+			}
+		}
 	}
 
 	/**

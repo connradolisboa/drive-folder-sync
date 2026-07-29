@@ -1385,8 +1385,8 @@ export class DriveSyncSettingTab extends PluginSettingTab {
 		el.createEl("h3", { text: "Automations" });
 		el.createEl("p", {
 			text:
-				"Run actions automatically after a PDF is downloaded. " +
-				"Each automation matches a vault folder path and performs an action on the file.",
+				"Run actions automatically when a PDF is downloaded or when any PDF is created, " +
+				"changed, or moved into a matching vault folder. Files do not need to be managed by PDF Manager.",
 			cls: "setting-item-description",
 		});
 

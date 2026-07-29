@@ -11,7 +11,12 @@ export interface DownloadOutcome {
 }
 
 export class DownloadManager {
-	constructor(private app: App, private cache?: CacheManager) {}
+	constructor(
+		private app: App,
+		private cache?: CacheManager,
+		/** Called immediately before PDF Manager writes a downloaded file into the vault. */
+		private onWillWrite?: (vaultPath: string) => void
+	) {}
 
 	setCache(cache: CacheManager | undefined): void { this.cache = cache; }
 
@@ -36,6 +41,7 @@ export class DownloadManager {
 
 		// Phase 11.3 — content-addressed cache hit (zero bytes downloaded).
 		if (this.cache && file.md5Checksum && (await this.cache.has(file.md5Checksum))) {
+			this.onWillWrite?.(localPath);
 			const restored = await this.cache.restore(file.md5Checksum, localPath);
 			if (restored) {
 				console.log(`${LOG} Restored "${file.name}" from cache → ${localPath}`);
@@ -65,6 +71,7 @@ export class DownloadManager {
 		console.log(`${LOG} Received ${buffer.byteLength} bytes for "${file.name}"`);
 
 		const exists = await this.app.vault.adapter.exists(localPath);
+		this.onWillWrite?.(localPath);
 		if (exists) {
 			console.log(`${LOG} Overwriting existing file: ${localPath}`);
 			await this.app.vault.adapter.writeBinary(localPath, buffer);
